@@ -326,6 +326,41 @@ GroupByAndAggregate::GroupByAndAggregate(
     , row_set_mem_owner_(row_set_mem_owner)
     , device_type_(device_type)
     , group_cardinality_estimation_(group_cardinality_estimation) {
+  cudaMgr_ = executor->cudaMgr();
+  for (const auto& groupby_expr : ra_exe_unit_.groupby_exprs) {
+    if (!groupby_expr) {
+      continue;
+    }
+    const auto& groupby_ti = groupby_expr->get_type_info();
+    if (groupby_ti.is_bytes()) {
+      throw std::runtime_error(
+          "Cannot group by string columns which are not dictionary encoded.");
+    }
+    if (groupby_ti.is_buffer()) {
+      throw std::runtime_error("Group by buffer not supported");
+    }
+    if (groupby_ti.is_geometry()) {
+      throw std::runtime_error("Group by geometry not supported");
+    }
+  }
+}
+
+GroupByAndAggregate::GroupByAndAggregate(
+    Executor* executor,
+    const ExecutorDeviceType device_type,
+    const RelAlgExecutionUnit& ra_exe_unit,
+    const std::vector<InputTableInfo>& query_infos,
+    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+    const std::optional<int64_t>& group_cardinality_estimation,
+     ExecutorContext executorContext)
+    : executor_(executor)
+    , ra_exe_unit_(ra_exe_unit)
+    , query_infos_(query_infos)
+    , row_set_mem_owner_(row_set_mem_owner)
+    , device_type_(device_type)
+    , group_cardinality_estimation_(group_cardinality_estimation) {
+  cudaMgr_ = executorContext.cudaMgr;
+
   for (const auto& groupby_expr : ra_exe_unit_.groupby_exprs) {
     if (!groupby_expr) {
       continue;
@@ -348,7 +383,7 @@ int64_t GroupByAndAggregate::getShardedTopBucket(const ColRangeInfo& col_range_i
                                                  const size_t shard_count) const {
   size_t device_count{0};
   if (device_type_ == ExecutorDeviceType::GPU) {
-    device_count = executor_->cudaMgr()->getDeviceCount();
+    device_count = cudaMgr_->getDeviceCount();
     CHECK_GT(device_count, 0u);
   }
 

@@ -58,6 +58,10 @@ struct KeylessInfo {
   const int32_t target_index;
 };
 
+struct ExecutorContext {
+  CudaMgr_Namespace::CudaMgr* cudaMgr;
+};
+
 class GroupByAndAggregate {
  public:
   GroupByAndAggregate(Executor* executor,
@@ -66,6 +70,13 @@ class GroupByAndAggregate {
                       const std::vector<InputTableInfo>& query_infos,
                       std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
                       const std::optional<int64_t>& group_cardinality_estimation);
+
+  GroupByAndAggregate(Executor* executor,
+                      const ExecutorDeviceType device_type,
+                      const RelAlgExecutionUnit& ra_exe_unit,
+                      const std::vector<InputTableInfo>& query_infos,
+                      std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+                      const std::optional<int64_t>& group_cardinality_estimation,
 
   // returns true iff checking the error code after every row
   // is required -- slow path group by queries for now
@@ -208,6 +219,9 @@ class GroupByAndAggregate {
   const ExecutorDeviceType device_type_;
 
   const std::optional<int64_t> group_cardinality_estimation_;
+
+  // Added by Cider
+  CudaMgr_Namespace::CudaMgr* cudaMgr_;
 
   friend class Executor;
   friend class QueryMemoryDescriptor;

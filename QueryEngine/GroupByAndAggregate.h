@@ -77,6 +77,7 @@ class GroupByAndAggregate {
                       const std::vector<InputTableInfo>& query_infos,
                       std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
                       const std::optional<int64_t>& group_cardinality_estimation,
+                      ExecutorContext executorContext);
 
   // returns true iff checking the error code after every row
   // is required -- slow path group by queries for now

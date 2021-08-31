@@ -352,7 +352,7 @@ GroupByAndAggregate::GroupByAndAggregate(
     const std::vector<InputTableInfo>& query_infos,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
     const std::optional<int64_t>& group_cardinality_estimation,
-     ExecutorContext executorContext)
+    ExecutorContext executorContext)
     : executor_(executor)
     , ra_exe_unit_(ra_exe_unit)
     , query_infos_(query_infos)

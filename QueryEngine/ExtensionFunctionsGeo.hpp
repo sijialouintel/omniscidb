@@ -942,34 +942,6 @@ double ST_Y_Point(int8_t* p, int64_t psize, int32_t ic, int32_t isr, int32_t osr
 }
 
 EXTENSION_NOINLINE
-double ST_X_LineString(int8_t* l,
-                       int64_t lsize,
-                       int32_t lindex,
-                       int32_t ic,
-                       int32_t isr,
-                       int32_t osr) {
-  auto l_num_points = lsize / (2 * compression_unit_size(ic));
-  if (lindex < 0 || lindex > l_num_points) {
-    lindex = l_num_points;  // Endpoint
-  }
-  return coord_x(l, 2 * (lindex - 1), ic, isr, osr);
-}
-
-EXTENSION_NOINLINE
-double ST_Y_LineString(int8_t* l,
-                       int64_t lsize,
-                       int32_t lindex,
-                       int32_t ic,
-                       int32_t isr,
-                       int32_t osr) {
-  auto l_num_points = lsize / (2 * compression_unit_size(ic));
-  if (lindex < 0 || lindex > l_num_points) {
-    lindex = l_num_points;  // Endpoint
-  }
-  return coord_y(l, 2 * (lindex - 1) + 1, ic, isr, osr);
-}
-
-EXTENSION_NOINLINE
 double ST_XMin(int8_t* coords, int64_t size, int32_t ic, int32_t isr, int32_t osr) {
   auto num_coords = size / compression_unit_size(ic);
   double xmin = 0.0;
@@ -1046,7 +1018,7 @@ double ST_YMax_Bounds(double* bounds, int64_t size, int32_t isr, int32_t osr) {
 //
 
 DEVICE ALWAYS_INLINE double length_linestring(int8_t* l,
-                                              int64_t lsize,
+                                              int32_t lsize,
                                               int32_t ic,
                                               int32_t isr,
                                               int32_t osr,
@@ -1101,9 +1073,9 @@ double ST_Length_LineString_Geodesic(int8_t* coords,
 
 EXTENSION_NOINLINE
 double ST_Perimeter_Polygon(int8_t* poly,
-                            int64_t polysize,
-                            int32_t* poly_ring_sizes,
-                            int64_t poly_num_rings,
+                            int32_t polysize,
+                            int8_t* poly_ring_sizes,
+                            int32_t poly_num_rings,
                             int32_t ic,
                             int32_t isr,
                             int32_t osr) {
@@ -1119,9 +1091,9 @@ double ST_Perimeter_Polygon(int8_t* poly,
 
 EXTENSION_NOINLINE
 double ST_Perimeter_Polygon_Geodesic(int8_t* poly,
-                                     int64_t polysize,
-                                     int32_t* poly_ring_sizes,
-                                     int64_t poly_num_rings,
+                                     int32_t polysize,
+                                     int8_t* poly_ring_sizes_in,
+                                     int32_t poly_num_rings,
                                      int32_t ic,
                                      int32_t isr,
                                      int32_t osr) {
@@ -1129,6 +1101,7 @@ double ST_Perimeter_Polygon_Geodesic(int8_t* poly,
     return 0.0;
   }
 
+  auto poly_ring_sizes = reinterpret_cast<int32_t*>(poly_ring_sizes_in);
   auto exterior_ring_num_coords = poly_ring_sizes[0] * 2;
   auto exterior_ring_coords_size = exterior_ring_num_coords * compression_unit_size(ic);
 
@@ -1136,11 +1109,11 @@ double ST_Perimeter_Polygon_Geodesic(int8_t* poly,
 }
 
 DEVICE ALWAYS_INLINE double perimeter_multipolygon(int8_t* mpoly_coords,
-                                                   int64_t mpoly_coords_size,
-                                                   int32_t* mpoly_ring_sizes,
-                                                   int64_t mpoly_num_rings,
-                                                   int32_t* mpoly_poly_sizes,
-                                                   int64_t mpoly_num_polys,
+                                                   int32_t mpoly_coords_size,
+                                                   int8_t* mpoly_ring_sizes_in,
+                                                   int32_t mpoly_num_rings,
+                                                   int8_t* mpoly_poly_sizes,
+                                                   int32_t mpoly_num_polys,
                                                    int32_t ic,
                                                    int32_t isr,
                                                    int32_t osr,
@@ -1151,6 +1124,8 @@ DEVICE ALWAYS_INLINE double perimeter_multipolygon(int8_t* mpoly_coords,
 
   double perimeter = 0.0;
 
+  auto mpoly_ring_sizes = reinterpret_cast<int32_t*>(mpoly_ring_sizes_in);
+
   // Set specific poly pointers as we move through the coords/ringsizes/polyrings arrays.
   auto next_poly_coords = mpoly_coords;
   auto next_poly_ring_sizes = mpoly_ring_sizes;
@@ -1158,7 +1133,7 @@ DEVICE ALWAYS_INLINE double perimeter_multipolygon(int8_t* mpoly_coords,
   for (auto poly = 0; poly < mpoly_num_polys; poly++) {
     auto poly_coords = next_poly_coords;
     auto poly_ring_sizes = next_poly_ring_sizes;
-    auto poly_num_rings = mpoly_poly_sizes[poly];
+    auto poly_num_rings = reinterpret_cast<int32_t*>(mpoly_poly_sizes)[poly];
     // Count number of coords in all of poly's rings, advance ring size pointer.
     int32_t poly_num_coords = 0;
     for (auto ring = 0; ring < poly_num_rings; ring++) {
@@ -1179,11 +1154,11 @@ DEVICE ALWAYS_INLINE double perimeter_multipolygon(int8_t* mpoly_coords,
 
 EXTENSION_NOINLINE
 double ST_Perimeter_MultiPolygon(int8_t* mpoly_coords,
-                                 int64_t mpoly_coords_size,
-                                 int32_t* mpoly_ring_sizes,
-                                 int64_t mpoly_num_rings,
-                                 int32_t* mpoly_poly_sizes,
-                                 int64_t mpoly_num_polys,
+                                 int32_t mpoly_coords_size,
+                                 int8_t* mpoly_ring_sizes,
+                                 int32_t mpoly_num_rings,
+                                 int8_t* mpoly_poly_sizes,
+                                 int32_t mpoly_num_polys,
                                  int32_t ic,
                                  int32_t isr,
                                  int32_t osr) {
@@ -1201,11 +1176,11 @@ double ST_Perimeter_MultiPolygon(int8_t* mpoly_coords,
 
 EXTENSION_NOINLINE
 double ST_Perimeter_MultiPolygon_Geodesic(int8_t* mpoly_coords,
-                                          int64_t mpoly_coords_size,
-                                          int32_t* mpoly_ring_sizes,
-                                          int64_t mpoly_num_rings,
-                                          int32_t* mpoly_poly_sizes,
-                                          int64_t mpoly_num_polys,
+                                          int32_t mpoly_coords_size,
+                                          int8_t* mpoly_ring_sizes,
+                                          int32_t mpoly_num_rings,
+                                          int8_t* mpoly_poly_sizes,
+                                          int32_t mpoly_num_polys,
                                           int32_t ic,
                                           int32_t isr,
                                           int32_t osr) {
@@ -1262,9 +1237,9 @@ DEVICE ALWAYS_INLINE double area_ring(int8_t* ring,
 }
 
 DEVICE ALWAYS_INLINE double area_polygon(int8_t* poly_coords,
-                                         int64_t poly_coords_size,
-                                         int32_t* poly_ring_sizes,
-                                         int64_t poly_num_rings,
+                                         int32_t poly_coords_size,
+                                         int8_t* poly_ring_sizes_in,
+                                         int32_t poly_num_rings,
                                          int32_t ic,
                                          int32_t isr,
                                          int32_t osr) {
@@ -1274,6 +1249,7 @@ DEVICE ALWAYS_INLINE double area_polygon(int8_t* poly_coords,
 
   double area = 0.0;
   auto ring_coords = poly_coords;
+  auto poly_ring_sizes = reinterpret_cast<int32_t*>(poly_ring_sizes_in);
 
   // Add up the areas of all rings.
   // External ring is CCW, open - positive area.
@@ -1289,9 +1265,9 @@ DEVICE ALWAYS_INLINE double area_polygon(int8_t* poly_coords,
 
 EXTENSION_NOINLINE
 double ST_Area_Polygon(int8_t* poly_coords,
-                       int64_t poly_coords_size,
-                       int32_t* poly_ring_sizes,
-                       int64_t poly_num_rings,
+                       int32_t poly_coords_size,
+                       int8_t* poly_ring_sizes,
+                       int32_t poly_num_rings,
                        int32_t ic,
                        int32_t isr,
                        int32_t osr) {
@@ -1299,25 +1275,13 @@ double ST_Area_Polygon(int8_t* poly_coords,
       poly_coords, poly_coords_size, poly_ring_sizes, poly_num_rings, ic, isr, osr);
 }
 
-EXTENSION_INLINE
-double ST_Area_Polygon_Geodesic(int8_t* poly_coords,
-                                int64_t poly_coords_size,
-                                int32_t* poly_ring_sizes,
-                                int64_t poly_num_rings,
-                                int32_t ic,
-                                int32_t isr,
-                                int32_t osr) {
-  return ST_Area_Polygon(
-      poly_coords, poly_coords_size, poly_ring_sizes, poly_num_rings, ic, isr, osr);
-}
-
 EXTENSION_NOINLINE
 double ST_Area_MultiPolygon(int8_t* mpoly_coords,
-                            int64_t mpoly_coords_size,
-                            int32_t* mpoly_ring_sizes,
-                            int64_t mpoly_num_rings,
-                            int32_t* mpoly_poly_sizes,
-                            int64_t mpoly_num_polys,
+                            int32_t mpoly_coords_size,
+                            int8_t* mpoly_ring_sizes,
+                            int32_t mpoly_num_rings,
+                            int8_t* mpoly_poly_sizes_in,
+                            int32_t mpoly_num_polys,
                             int32_t ic,
                             int32_t isr,
                             int32_t osr) {
@@ -1327,9 +1291,11 @@ double ST_Area_MultiPolygon(int8_t* mpoly_coords,
 
   double area = 0.0;
 
+  auto mpoly_poly_sizes = reinterpret_cast<int32_t*>(mpoly_poly_sizes_in);
+
   // Set specific poly pointers as we move through the coords/ringsizes/polyrings arrays.
   auto next_poly_coords = mpoly_coords;
-  auto next_poly_ring_sizes = mpoly_ring_sizes;
+  auto next_poly_ring_sizes = reinterpret_cast<int32_t*>(mpoly_ring_sizes);
 
   for (auto poly = 0; poly < mpoly_num_polys; poly++) {
     auto poly_coords = next_poly_coords;
@@ -1343,31 +1309,15 @@ double ST_Area_MultiPolygon(int8_t* mpoly_coords,
     auto poly_coords_size = poly_num_coords * compression_unit_size(ic);
     next_poly_coords += poly_coords_size;
 
-    area += area_polygon(
-        poly_coords, poly_coords_size, poly_ring_sizes, poly_num_rings, ic, isr, osr);
+    area += area_polygon(poly_coords,
+                         poly_coords_size,
+                         reinterpret_cast<int8_t*>(poly_ring_sizes),
+                         poly_num_rings,
+                         ic,
+                         isr,
+                         osr);
   }
   return area;
-}
-
-EXTENSION_INLINE
-double ST_Area_MultiPolygon_Geodesic(int8_t* mpoly_coords,
-                                     int64_t mpoly_coords_size,
-                                     int32_t* mpoly_ring_sizes,
-                                     int64_t mpoly_num_rings,
-                                     int32_t* mpoly_poly_sizes,
-                                     int64_t mpoly_num_polys,
-                                     int32_t ic,
-                                     int32_t isr,
-                                     int32_t osr) {
-  return ST_Area_MultiPolygon(mpoly_coords,
-                              mpoly_coords_size,
-                              mpoly_ring_sizes,
-                              mpoly_num_rings,
-                              mpoly_poly_sizes,
-                              mpoly_num_polys,
-                              ic,
-                              isr,
-                              osr);
 }
 
 //
@@ -1375,7 +1325,7 @@ double ST_Area_MultiPolygon_Geodesic(int8_t* mpoly_coords,
 //
 
 // Point centroid
-// - calculate average coordinates for all points
+// - Single point - drop, otherwise calculate average coordinates for all points
 // LineString centroid
 // - take midpoint of each line segment
 // - calculate average coordinates of all midpoints weighted by segment length
@@ -1386,16 +1336,14 @@ double ST_Area_MultiPolygon_Geodesic(int8_t* mpoly_coords,
 // On zero length fall back to point centroid
 
 EXTENSION_NOINLINE
-double ST_Centroid_Point(int8_t* p,
-                         int64_t psize,
-                         int32_t ic,
-                         int32_t isr,
-                         int32_t osr,
-                         bool ycoord) {
-  if (ycoord) {
-    return coord_y(p, 1, ic, isr, osr);
-  }
-  return coord_x(p, 0, ic, isr, osr);
+void ST_Centroid_Point(int8_t* p,
+                       int32_t psize,
+                       int32_t ic,
+                       int32_t isr,
+                       int32_t osr,
+                       double* point_centroid) {
+  point_centroid[0] = coord_y(p, 0, ic, isr, osr);
+  point_centroid[1] = coord_x(p, 1, ic, isr, osr);
 }
 
 DEVICE ALWAYS_INLINE bool centroid_add_segment(double x1,
@@ -1450,12 +1398,12 @@ DEVICE ALWAYS_INLINE bool centroid_add_linestring(int8_t* l,
 }
 
 EXTENSION_NOINLINE
-double ST_Centroid_LineString(int8_t* coords,
-                              int64_t coords_sz,
-                              int32_t ic,
-                              int32_t isr,
-                              int32_t osr,
-                              bool ycoord) {
+void ST_Centroid_LineString(int8_t* coords,
+                            int32_t coords_sz,
+                            int32_t ic,
+                            int32_t isr,
+                            int32_t osr,
+                            double* linestring_centroid) {
   double length = 0.0;
   double linestring_centroid_sum[2] = {0.0, 0.0};
   int64_t num_points = 0;
@@ -1470,7 +1418,6 @@ double ST_Centroid_LineString(int8_t* coords,
                           &linestring_centroid_sum[0],
                           &num_points,
                           &point_centroid_sum[0]);
-  double linestring_centroid[2] = {0.0, 0.0};
   if (length > 0) {
     linestring_centroid[0] = linestring_centroid_sum[0] / length;
     linestring_centroid[1] = linestring_centroid_sum[1] / length;
@@ -1478,10 +1425,6 @@ double ST_Centroid_LineString(int8_t* coords,
     linestring_centroid[0] = point_centroid_sum[0] / num_points;
     linestring_centroid[1] = point_centroid_sum[1] / num_points;
   }
-  if (ycoord) {
-    return linestring_centroid[1];
-  }
-  return linestring_centroid[0];
 }
 
 DEVICE ALWAYS_INLINE bool centroid_add_triangle(double x1,
@@ -1587,16 +1530,17 @@ DEVICE ALWAYS_INLINE bool centroid_add_polygon(int8_t* poly_coords,
 }
 
 EXTENSION_NOINLINE
-double ST_Centroid_Polygon(int8_t* poly_coords,
-                           int64_t poly_coords_size,
-                           int32_t* poly_ring_sizes,
-                           int64_t poly_num_rings,
-                           int32_t ic,
-                           int32_t isr,
-                           int32_t osr,
-                           bool ycoord) {
+void ST_Centroid_Polygon(int8_t* poly_coords,
+                         int32_t poly_coords_size,
+                         int32_t* poly_ring_sizes,
+                         int32_t poly_num_rings,
+                         int32_t ic,
+                         int32_t isr,
+                         int32_t osr,
+                         double* poly_centroid) {
   if (poly_num_rings <= 0) {
-    return 0.0;
+    poly_centroid[0] = 0.0;
+    poly_centroid[1] = 0.0;
   }
   double total_area2 = 0.0;
   double cg3[2] = {0.0, 0.0};
@@ -1618,9 +1562,6 @@ double ST_Centroid_Polygon(int8_t* poly_coords,
                        &num_points,
                        &point_centroid_sum[0]);
 
-  double x1 = coord_x(poly_coords, 0, ic, isr, osr);
-  double y1 = coord_y(poly_coords, 1, ic, isr, osr);
-  double poly_centroid[2] = {x1, y1};
   if (total_area2 != 0.0) {
     poly_centroid[0] = cg3[0] / 3 / total_area2;
     poly_centroid[1] = cg3[1] / 3 / total_area2;
@@ -1632,27 +1573,26 @@ double ST_Centroid_Polygon(int8_t* poly_coords,
     // zero-area zero-length polygon, fall further back to point centroid
     poly_centroid[0] = point_centroid_sum[0] / num_points;
     poly_centroid[1] = point_centroid_sum[1] / num_points;
+  } else {
+    poly_centroid[0] = coord_x(poly_coords, 0, ic, isr, osr);
+    poly_centroid[1] = coord_y(poly_coords, 1, ic, isr, osr);
   }
-
-  if (ycoord) {
-    return poly_centroid[1];
-  }
-  return poly_centroid[0];
 }
 
 EXTENSION_NOINLINE
-double ST_Centroid_MultiPolygon(int8_t* mpoly_coords,
-                                int64_t mpoly_coords_size,
-                                int32_t* mpoly_ring_sizes,
-                                int64_t mpoly_num_rings,
-                                int32_t* mpoly_poly_sizes,
-                                int64_t mpoly_num_polys,
-                                int32_t ic,
-                                int32_t isr,
-                                int32_t osr,
-                                bool ycoord) {
+void ST_Centroid_MultiPolygon(int8_t* mpoly_coords,
+                              int32_t mpoly_coords_size,
+                              int32_t* mpoly_ring_sizes,
+                              int32_t mpoly_num_rings,
+                              int32_t* mpoly_poly_sizes,
+                              int32_t mpoly_num_polys,
+                              int32_t ic,
+                              int32_t isr,
+                              int32_t osr,
+                              double* mpoly_centroid) {
   if (mpoly_num_rings <= 0 || mpoly_num_polys <= 0) {
-    return 0.0;
+    mpoly_centroid[0] = 0.0;
+    mpoly_centroid[1] = 0.0;
   }
 
   double total_area2 = 0.0;
@@ -1693,9 +1633,6 @@ double ST_Centroid_MultiPolygon(int8_t* mpoly_coords,
                          &point_centroid_sum[0]);
   }
 
-  double x1 = coord_x(mpoly_coords, 0, ic, isr, osr);
-  double y1 = coord_y(mpoly_coords, 1, ic, isr, osr);
-  double mpoly_centroid[2] = {x1, y1};
   if (total_area2 != 0.0) {
     mpoly_centroid[0] = cg3[0] / 3 / total_area2;
     mpoly_centroid[1] = cg3[1] / 3 / total_area2;
@@ -1707,23 +1644,10 @@ double ST_Centroid_MultiPolygon(int8_t* mpoly_coords,
     // zero-area zero-length multipolygon, fall further back to point centroid
     mpoly_centroid[0] = point_centroid_sum[0] / num_points;
     mpoly_centroid[1] = point_centroid_sum[1] / num_points;
+  } else {
+    mpoly_centroid[0] = coord_x(mpoly_coords, 0, ic, isr, osr);
+    mpoly_centroid[1] = coord_y(mpoly_coords, 1, ic, isr, osr);
   }
-
-  if (ycoord) {
-    return mpoly_centroid[1];
-  }
-  return mpoly_centroid[0];
-}
-
-EXTENSION_INLINE
-int32_t ST_NPoints(int8_t* coords, int64_t coords_sz, int32_t ic) {
-  auto num_pts = coords_sz / compression_unit_size(ic);
-  return static_cast<int32_t>(num_pts / 2);
-}
-
-EXTENSION_INLINE
-int32_t ST_NRings(int32_t* poly_ring_sizes, int64_t poly_num_rings) {
-  return static_cast<int32_t>(poly_num_rings);
 }
 
 //
@@ -1786,7 +1710,6 @@ double ST_Distance_Point_LineString_Geodesic(int8_t* p,
                                              int64_t psize,
                                              int8_t* l,
                                              int64_t lsize,
-                                             int32_t lindex,
                                              int32_t ic1,
                                              int32_t isr1,
                                              int32_t ic2,
@@ -1795,19 +1718,15 @@ double ST_Distance_Point_LineString_Geodesic(int8_t* p,
   // Currently only statically indexed LineString is supported
   double px = coord_x(p, 0, ic1, 4326, 4326);
   double py = coord_y(p, 1, ic1, 4326, 4326);
-  auto lpoints = lsize / (2 * compression_unit_size(ic2));
-  if (lindex < 0 || lindex > lpoints) {
-    lindex = lpoints;  // Endpoint
-  }
-  double lx = coord_x(l, 2 * (lindex - 1), ic2, 4326, 4326);
-  double ly = coord_y(l, 2 * (lindex - 1) + 1, ic2, 4326, 4326);
+  const auto lpoints = lsize / (2 * compression_unit_size(ic2));
+  double lx = coord_x(l, 2 * (lpoints - 1), ic2, 4326, 4326);
+  double ly = coord_y(l, 2 * (lpoints - 1) + 1, ic2, 4326, 4326);
   return distance_in_meters(px, py, lx, ly);
 }
 
 EXTENSION_INLINE
 double ST_Distance_LineString_Point_Geodesic(int8_t* l,
                                              int64_t lsize,
-                                             int32_t lindex,
                                              int8_t* p,
                                              int64_t psize,
                                              int32_t ic1,
@@ -1817,42 +1736,13 @@ double ST_Distance_LineString_Point_Geodesic(int8_t* l,
                                              int32_t osr) {
   // Currently only statically indexed LineString is supported
   return ST_Distance_Point_LineString_Geodesic(
-      p, psize, l, lsize, lindex, ic2, isr2, ic1, isr1, osr);
-}
-
-EXTENSION_NOINLINE
-double ST_Distance_LineString_LineString_Geodesic(int8_t* l1,
-                                                  int64_t l1size,
-                                                  int32_t l1index,
-                                                  int8_t* l2,
-                                                  int64_t l2size,
-                                                  int32_t l2index,
-                                                  int32_t ic1,
-                                                  int32_t isr1,
-                                                  int32_t ic2,
-                                                  int32_t isr2,
-                                                  int32_t osr) {
-  // Currently only statically indexed LineStrings are supported
-  auto l1points = l1size / (2 * compression_unit_size(ic1));
-  if (l1index < 0 || l1index > l1points) {
-    l1index = l1points;  // Endpoint
-  }
-  double l1x = coord_x(l1, 2 * (l1index - 1), ic1, 4326, 4326);
-  double l1y = coord_y(l1, 2 * (l1index - 1) + 1, ic1, 4326, 4326);
-  auto l2points = l2size / (2 * compression_unit_size(ic2));
-  if (l2index < 0 || l2index > l2points) {
-    l2index = l2points;  // Endpoint
-  }
-  double l2x = coord_x(l2, 2 * (l2index - 1), ic2, 4326, 4326);
-  double l2y = coord_y(l2, 2 * (l2index - 1) + 1, ic2, 4326, 4326);
-  return distance_in_meters(l1x, l1y, l2x, l2y);
+      p, psize, l, lsize, ic2, isr2, ic1, isr1, osr);
 }
 
 DEVICE ALWAYS_INLINE double distance_point_linestring(int8_t* p,
                                                       int64_t psize,
                                                       int8_t* l,
                                                       int64_t lsize,
-                                                      int32_t lindex,
                                                       int32_t ic1,
                                                       int32_t isr1,
                                                       int32_t ic2,
@@ -1864,15 +1754,6 @@ DEVICE ALWAYS_INLINE double distance_point_linestring(int8_t* p,
   double py = coord_y(p, 1, ic1, isr1, osr);
 
   auto l_num_coords = lsize / compression_unit_size(ic2);
-  auto l_num_points = l_num_coords / 2;
-  if (lindex != 0) {  // Statically indexed linestring
-    if (lindex < 0 || lindex > l_num_points) {
-      lindex = l_num_points;  // Endpoint
-    }
-    double lx = coord_x(l, 2 * (lindex - 1), ic2, isr2, osr);
-    double ly = coord_y(l, 2 * (lindex - 1) + 1, ic2, isr2, osr);
-    return distance_point_point(px, py, lx, ly);
-  }
 
   double l1x = coord_x(l, 0, ic2, isr2, osr);
   double l1y = coord_y(l, 1, ic2, isr2, osr);
@@ -1910,7 +1791,6 @@ double ST_Distance_Point_ClosedLineString(int8_t* p,
                                           int64_t psize,
                                           int8_t* l,
                                           int64_t lsize,
-                                          int32_t lindex,
                                           int32_t ic1,
                                           int32_t isr1,
                                           int32_t ic2,
@@ -1918,7 +1798,7 @@ double ST_Distance_Point_ClosedLineString(int8_t* p,
                                           int32_t osr,
                                           double threshold) {
   return distance_point_linestring(
-      p, psize, l, lsize, lindex, ic1, isr1, ic2, isr2, osr, true, threshold);
+      p, psize, l, lsize, ic1, isr1, ic2, isr2, osr, true, threshold);
 }
 
 EXTENSION_NOINLINE
@@ -1926,28 +1806,14 @@ double ST_Distance_Point_LineString(int8_t* p,
                                     int64_t psize,
                                     int8_t* l,
                                     int64_t lsize,
-                                    int32_t lindex,
                                     int32_t ic1,
                                     int32_t isr1,
                                     int32_t ic2,
                                     int32_t isr2,
                                     int32_t osr,
                                     double threshold) {
-  if (lindex != 0) {  // Statically indexed linestring
-    auto l_num_coords = lsize / compression_unit_size(ic2);
-    auto l_num_points = l_num_coords / 2;
-    if (lindex < 0 || lindex > l_num_points) {
-      lindex = l_num_points;  // Endpoint
-    }
-    double px = coord_x(p, 0, ic1, isr1, osr);
-    double py = coord_y(p, 1, ic1, isr1, osr);
-    double lx = coord_x(l, 2 * (lindex - 1), ic2, isr2, osr);
-    double ly = coord_y(l, 2 * (lindex - 1) + 1, ic2, isr2, osr);
-    return distance_point_point(px, py, lx, ly);
-  }
-
   return distance_point_linestring(
-      p, psize, l, lsize, lindex, ic1, isr1, ic2, isr2, osr, false, threshold);
+      p, psize, l, lsize, ic1, isr1, ic2, isr2, osr, false, threshold);
 }
 
 EXTENSION_NOINLINE
@@ -1973,17 +1839,8 @@ double ST_Distance_Point_Polygon(int8_t* p,
   double py = coord_y(p, 1, ic1, isr1, osr);
   if (!polygon_contains_point(poly, exterior_ring_num_coords, px, py, ic2, isr2, osr)) {
     // Outside the exterior ring
-    return ST_Distance_Point_ClosedLineString(p,
-                                              psize,
-                                              poly,
-                                              exterior_ring_coords_size,
-                                              0,
-                                              ic1,
-                                              isr1,
-                                              ic2,
-                                              isr2,
-                                              osr,
-                                              threshold);
+    return ST_Distance_Point_ClosedLineString(
+        p, psize, poly, exterior_ring_coords_size, ic1, isr1, ic2, isr2, osr, threshold);
   }
   // Inside exterior ring
   // Advance to first interior ring
@@ -1999,7 +1856,6 @@ double ST_Distance_Point_Polygon(int8_t* p,
                                                 psize,
                                                 poly,
                                                 interior_ring_coords_size,
-                                                0,
                                                 ic1,
                                                 isr1,
                                                 ic2,
@@ -2077,7 +1933,6 @@ double ST_Distance_Point_MultiPolygon(int8_t* p,
 EXTENSION_INLINE
 double ST_Distance_LineString_Point(int8_t* l,
                                     int64_t lsize,
-                                    int32_t lindex,
                                     int8_t* p,
                                     int64_t psize,
                                     int32_t ic1,
@@ -2087,16 +1942,14 @@ double ST_Distance_LineString_Point(int8_t* l,
                                     int32_t osr,
                                     double threshold) {
   return ST_Distance_Point_LineString(
-      p, psize, l, lsize, lindex, ic2, isr2, ic1, isr1, osr, threshold);
+      p, psize, l, lsize, ic2, isr2, ic1, isr1, osr, threshold);
 }
 
 EXTENSION_NOINLINE
 double ST_Distance_LineString_LineString(int8_t* l1,
                                          int64_t l1size,
-                                         int32_t l1index,
                                          int8_t* l2,
                                          int64_t l2size,
-                                         int32_t l2index,
                                          int32_t ic1,
                                          int32_t isr1,
                                          int32_t ic2,
@@ -2104,30 +1957,7 @@ double ST_Distance_LineString_LineString(int8_t* l1,
                                          int32_t osr,
                                          double threshold) {
   auto l1_num_coords = l1size / compression_unit_size(ic1);
-  if (l1index != 0) {
-    // l1 is a statically indexed linestring
-    auto l1_num_points = l1_num_coords / 2;
-    if (l1index < 0 || l1index > l1_num_points) {
-      l1index = l1_num_points;
-    }
-    int8_t* p = l1 + 2 * (l1index - 1) * compression_unit_size(ic1);
-    int64_t psize = 2 * compression_unit_size(ic1);
-    return ST_Distance_Point_LineString(
-        p, psize, l2, l2size, l2index, ic1, isr1, ic2, isr2, osr, threshold);
-  }
-
   auto l2_num_coords = l2size / compression_unit_size(ic2);
-  if (l2index != 0) {
-    // l2 is a statically indexed linestring
-    auto l2_num_points = l2_num_coords / 2;
-    if (l2index < 0 || l2index > l2_num_points) {
-      l2index = l2_num_points;
-    }
-    int8_t* p = l2 + 2 * (l2index - 1) * compression_unit_size(ic2);
-    int64_t psize = 2 * compression_unit_size(ic2);
-    return ST_Distance_Point_LineString(
-        p, psize, l1, l1size, l1index, ic2, isr2, ic1, isr1, osr, threshold);
-  }
 
   double threshold_squared = threshold * threshold;
   double dist_squared = 0.0;
@@ -2177,7 +2007,6 @@ double ST_Distance_LineString_LineString(int8_t* l1,
 EXTENSION_NOINLINE
 double ST_Distance_LineString_Polygon(int8_t* l,
                                       int64_t lsize,
-                                      int32_t lindex,
                                       int8_t* poly_coords,
                                       int64_t poly_coords_size,
                                       int32_t* poly_ring_sizes,
@@ -2189,28 +2018,20 @@ double ST_Distance_LineString_Polygon(int8_t* l,
                                       int32_t osr,
                                       double threshold) {
   auto lnum_coords = lsize / compression_unit_size(ic1);
-  auto lnum_points = lnum_coords / 2;
-  if (lindex < 0 || lindex > lnum_points) {
-    lindex = lnum_points;
-  }
-  auto p = l + lindex * compression_unit_size(ic1);
   auto psize = 2 * compression_unit_size(ic1);
-  auto min_distance = ST_Distance_Point_Polygon(p,
-                                                psize,
-                                                poly_coords,
-                                                poly_coords_size,
-                                                poly_ring_sizes,
-                                                poly_num_rings,
-                                                ic1,
-                                                isr1,
-                                                ic2,
-                                                isr2,
-                                                osr,
-                                                threshold);
-  if (lindex != 0) {
-    // Statically indexed linestring: return distance from the indexed point to poly
-    return min_distance;
-  }
+  auto min_distance =
+      ST_Distance_Point_Polygon(l,  // pointer to start of linestring for first point
+                                psize,
+                                poly_coords,
+                                poly_coords_size,
+                                poly_ring_sizes,
+                                poly_num_rings,
+                                ic1,
+                                isr1,
+                                ic2,
+                                isr2,
+                                osr,
+                                threshold);
   if (tol_zero(min_distance)) {
     // Linestring's first point is inside the poly
     return 0.0;
@@ -2255,7 +2076,6 @@ double ST_Distance_LineString_Polygon(int8_t* l,
 EXTENSION_NOINLINE
 double ST_Distance_LineString_MultiPolygon(int8_t* l,
                                            int64_t lsize,
-                                           int32_t lindex,
                                            int8_t* mpoly_coords,
                                            int64_t mpoly_coords_size,
                                            int32_t* mpoly_ring_sizes,
@@ -2269,32 +2089,6 @@ double ST_Distance_LineString_MultiPolygon(int8_t* l,
                                            int32_t osr,
                                            double threshold) {
   // TODO: revisit implementation, cover all cases
-
-  auto lnum_coords = lsize / compression_unit_size(ic1);
-  auto lnum_points = lnum_coords / 2;
-  if (lindex != 0) {
-    // Statically indexed linestring
-    if (lindex < 0 || lindex > lnum_points) {
-      lindex = lnum_points;
-    }
-    auto p = l + lindex * compression_unit_size(ic1);
-    auto psize = 2 * compression_unit_size(ic1);
-    return ST_Distance_Point_MultiPolygon(p,
-                                          psize,
-                                          mpoly_coords,
-                                          mpoly_coords_size,
-                                          mpoly_ring_sizes,
-                                          mpoly_num_rings,
-                                          mpoly_poly_sizes,
-                                          mpoly_num_polys,
-                                          ic1,
-                                          isr1,
-                                          ic2,
-                                          isr2,
-                                          osr,
-                                          threshold);
-  }
-
   double min_distance = 0.0;
 
   // Set specific poly pointers as we move through the coords/ringsizes/polyrings arrays.
@@ -2314,7 +2108,6 @@ double ST_Distance_LineString_MultiPolygon(int8_t* l,
     next_poly_coords += poly_coords_size;
     double distance = ST_Distance_LineString_Polygon(l,
                                                      lsize,
-                                                     lindex,
                                                      poly_coords,
                                                      poly_coords_size,
                                                      poly_ring_sizes,
@@ -2374,7 +2167,6 @@ double ST_Distance_Polygon_LineString(int8_t* poly_coords,
                                       int64_t poly_num_rings,
                                       int8_t* l,
                                       int64_t lsize,
-                                      int32_t li,
                                       int32_t ic1,
                                       int32_t isr1,
                                       int32_t ic2,
@@ -2383,7 +2175,6 @@ double ST_Distance_Polygon_LineString(int8_t* poly_coords,
                                       double threshold) {
   return ST_Distance_LineString_Polygon(l,
                                         lsize,
-                                        li,
                                         poly_coords,
                                         poly_coords_size,
                                         poly_ring_sizes,
@@ -2584,7 +2375,6 @@ double ST_Distance_MultiPolygon_LineString(int8_t* mpoly_coords,
                                            int64_t mpoly_num_polys,
                                            int8_t* l,
                                            int64_t lsize,
-                                           int32_t lindex,
                                            int32_t ic1,
                                            int32_t isr1,
                                            int32_t ic2,
@@ -2593,7 +2383,6 @@ double ST_Distance_MultiPolygon_LineString(int8_t* mpoly_coords,
                                            double threshold) {
   return ST_Distance_LineString_MultiPolygon(l,
                                              lsize,
-                                             lindex,
                                              mpoly_coords,
                                              mpoly_coords_size,
                                              mpoly_ring_sizes,
@@ -2738,7 +2527,6 @@ bool ST_DWithin_Point_LineString(int8_t* p1,
                                  int64_t l2size,
                                  double* l2bounds,
                                  int64_t l2bounds_size,
-                                 int32_t l2index,
                                  int32_t ic1,
                                  int32_t isr1,
                                  int32_t ic2,
@@ -2756,7 +2544,7 @@ bool ST_DWithin_Point_LineString(int8_t* p1,
   // May need to adjust the threshold by TOLERANCE_DEFAULT
   const double threshold = distance_within;
   return ST_Distance_Point_LineString(
-             p1, p1size, l2, l2size, l2index, ic1, isr1, ic2, isr2, osr, threshold) <=
+             p1, p1size, l2, l2size, ic1, isr1, ic2, isr2, osr, threshold) <=
          distance_within;
 }
 
@@ -2859,12 +2647,10 @@ bool ST_DWithin_LineString_LineString(int8_t* l1,
                                       int64_t l1size,
                                       double* l1bounds,
                                       int64_t l1bounds_size,
-                                      int32_t l1index,
                                       int8_t* l2,
                                       int64_t l2size,
                                       double* l2bounds,
                                       int64_t l2bounds_size,
-                                      int32_t l2index,
                                       int32_t ic1,
                                       int32_t isr1,
                                       int32_t ic2,
@@ -2887,18 +2673,9 @@ bool ST_DWithin_LineString_LineString(int8_t* l1,
 
   // May need to adjust the threshold by TOLERANCE_DEFAULT
   const double threshold = distance_within;
-  return ST_Distance_LineString_LineString(l1,
-                                           l1size,
-                                           l1index,
-                                           l2,
-                                           l2size,
-                                           l2index,
-                                           ic1,
-                                           isr1,
-                                           ic2,
-                                           isr2,
-                                           osr,
-                                           threshold) <= distance_within;
+  return ST_Distance_LineString_LineString(
+             l1, l1size, l2, l2size, ic1, isr1, ic2, isr2, osr, threshold) <=
+         distance_within;
 }
 
 EXTENSION_INLINE
@@ -2906,7 +2683,6 @@ bool ST_DWithin_LineString_Polygon(int8_t* l1,
                                    int64_t l1size,
                                    double* l1bounds,
                                    int64_t l1bounds_size,
-                                   int32_t l1index,
                                    int8_t* poly_coords,
                                    int64_t poly_coords_size,
                                    int32_t* poly_ring_sizes,
@@ -2937,7 +2713,6 @@ bool ST_DWithin_LineString_Polygon(int8_t* l1,
   const double threshold = distance_within;
   return ST_Distance_LineString_Polygon(l1,
                                         l1size,
-                                        l1index,
                                         poly_coords,
                                         poly_coords_size,
                                         poly_ring_sizes,
@@ -2955,7 +2730,6 @@ bool ST_DWithin_LineString_MultiPolygon(int8_t* l1,
                                         int64_t l1size,
                                         double* l1bounds,
                                         int64_t l1bounds_size,
-                                        int32_t l1index,
                                         int8_t* mpoly_coords,
                                         int64_t mpoly_coords_size,
                                         int32_t* mpoly_ring_sizes,
@@ -2988,7 +2762,6 @@ bool ST_DWithin_LineString_MultiPolygon(int8_t* l1,
   const double threshold = distance_within;
   return ST_Distance_LineString_MultiPolygon(l1,
                                              l1size,
-                                             l1index,
                                              mpoly_coords,
                                              mpoly_coords_size,
                                              mpoly_ring_sizes,
@@ -3193,7 +2966,6 @@ DEVICE ALWAYS_INLINE double max_distance_point_linestring(int8_t* p,
                                                           int64_t psize,
                                                           int8_t* l,
                                                           int64_t lsize,
-                                                          int32_t lindex,
                                                           int32_t ic1,
                                                           int32_t isr1,
                                                           int32_t ic2,
@@ -3205,15 +2977,6 @@ DEVICE ALWAYS_INLINE double max_distance_point_linestring(int8_t* p,
   double py = coord_y(p, 1, ic1, isr1, osr);
 
   auto l_num_coords = lsize / compression_unit_size(ic2);
-  auto l_num_points = l_num_coords / 2;
-  if (lindex != 0) {  // Statically indexed linestring
-    if (lindex < 0 || lindex > l_num_points) {
-      lindex = l_num_points;  // Endpoint
-    }
-    double lx = coord_x(l, 2 * (lindex - 1), ic2, isr2, osr);
-    double ly = coord_y(l, 2 * (lindex - 1) + 1, ic2, isr2, osr);
-    return distance_point_point(px, py, lx, ly);
-  }
 
   double l1x = coord_x(l, 0, ic2, isr2, osr);
   double l1y = coord_y(l, 1, ic2, isr2, osr);
@@ -3248,20 +3011,18 @@ double ST_MaxDistance_Point_LineString(int8_t* p,
                                        int64_t psize,
                                        int8_t* l,
                                        int64_t lsize,
-                                       int32_t lindex,
                                        int32_t ic1,
                                        int32_t isr1,
                                        int32_t ic2,
                                        int32_t isr2,
                                        int32_t osr) {
   return max_distance_point_linestring(
-      p, psize, l, lsize, lindex, ic1, isr1, ic2, isr2, osr, false);
+      p, psize, l, lsize, ic1, isr1, ic2, isr2, osr, false);
 }
 
 EXTENSION_NOINLINE
 double ST_MaxDistance_LineString_Point(int8_t* l,
                                        int64_t lsize,
-                                       int32_t lindex,
                                        int8_t* p,
                                        int64_t psize,
                                        int32_t ic1,
@@ -3270,7 +3031,7 @@ double ST_MaxDistance_LineString_Point(int8_t* l,
                                        int32_t isr2,
                                        int32_t osr) {
   return max_distance_point_linestring(
-      p, psize, l, lsize, lindex, ic2, isr2, ic1, isr1, osr, false);
+      p, psize, l, lsize, ic2, isr2, ic1, isr1, osr, false);
 }
 
 // TODO: add ST_MaxDistance_LineString_LineString (with short-circuit threshold)
@@ -3304,7 +3065,6 @@ bool ST_Contains_Point_LineString(int8_t* p,
                                   int64_t lsize,
                                   double* lbounds,
                                   int64_t lbounds_size,
-                                  int32_t li,
                                   int32_t ic1,
                                   int32_t isr1,
                                   int32_t ic2,
@@ -3358,7 +3118,6 @@ bool ST_Contains_Point_Polygon(int8_t* p,
                                       exterior_ring_coords_size,
                                       poly_bounds,
                                       poly_bounds_size,
-                                      0,
                                       ic1,
                                       isr1,
                                       ic2,
@@ -3371,7 +3130,6 @@ bool ST_Contains_LineString_Point(int8_t* l,
                                   int64_t lsize,
                                   double* lbounds,
                                   int64_t lbounds_size,
-                                  int32_t li,
                                   int8_t* p,
                                   int64_t psize,
                                   int32_t ic1,
@@ -3379,37 +3137,8 @@ bool ST_Contains_LineString_Point(int8_t* l,
                                   int32_t ic2,
                                   int32_t isr2,
                                   int32_t osr) {
-  return tol_zero(ST_Distance_Point_LineString(
-      p, psize, l, lsize, li, ic2, isr2, ic1, isr1, osr, 0.0));
-}
-
-EXTENSION_NOINLINE
-bool ST_Contains_LineString_LineString(int8_t* l1,
-                                       int64_t l1size,
-                                       double* l1bounds,
-                                       int64_t l1bounds_size,
-                                       int32_t l1i,
-                                       int8_t* l2,
-                                       int64_t l2size,
-                                       double* l2bounds,
-                                       int64_t l2bounds_size,
-                                       int32_t l2i,
-                                       int32_t ic1,
-                                       int32_t isr1,
-                                       int32_t ic2,
-                                       int32_t isr2,
-                                       int32_t osr) {
-  if (l1i != 0 || l2i != 0) {
-    // At least one linestring is indexed, can rely on distance
-    return tol_zero(ST_Distance_LineString_LineString(
-        l1, l1size, l1i, l2, l2size, l2i, ic1, isr1, ic2, isr2, osr, 0.0));
-  }
-
-  // TODO: sublinestring
-  // For each line segment in l2 check if there is a segment in l1
-  // that it's colinear with and both l2 vertices are on l1 segment.
-  // Bail if any line segment deviates from the path.
-  return false;
+  return tol_zero(
+      ST_Distance_Point_LineString(p, psize, l, lsize, ic2, isr2, ic1, isr1, osr, 0.0));
 }
 
 EXTENSION_NOINLINE
@@ -3417,7 +3146,6 @@ bool ST_Contains_LineString_Polygon(int8_t* l,
                                     int64_t lsize,
                                     double* lbounds,
                                     int64_t lbounds_size,
-                                    int32_t li,
                                     int8_t* poly_coords,
                                     int64_t poly_coords_size,
                                     int32_t* poly_ring_sizes,
@@ -3572,7 +3300,6 @@ bool ST_Contains_Polygon_LineString(int8_t* poly_coords,
                                     int64_t lsize,
                                     double* lbounds,
                                     int64_t lbounds_size,
-                                    int32_t li,
                                     int32_t ic1,
                                     int32_t isr1,
                                     int32_t ic2,
@@ -3582,33 +3309,15 @@ bool ST_Contains_Polygon_LineString(int8_t* poly_coords,
     return false;  // TODO: support polygons with interior rings
   }
 
-  auto poly_num_coords = poly_coords_size / compression_unit_size(ic1);
-  auto lnum_coords = lsize / compression_unit_size(ic2);
-  auto lnum_points = lnum_coords / 2;
-  if (li != 0) {
-    // Statically indexed linestring
-    if (li < 0 || li > lnum_points) {
-      li = lnum_points;
-    }
-    double lx = coord_x(l, 2 * (li - 1), ic2, isr2, osr);
-    double ly = coord_y(l, 2 * (li - 1) + 1, ic2, isr2, osr);
-
-    if (poly_bounds) {
-      if (!box_contains_point(poly_bounds, poly_bounds_size, lx, ly)) {
-        return false;
-      }
-    }
-    // TODO: should be exclude
-    return point_in_polygon_winding_number<double, EdgeBehavior::kIncludePointOnEdge>(
-        poly_coords, poly_num_coords, lx, ly, ic1, isr1, osr);
-  }
-
   // Bail out if poly bounding box doesn't contain linestring bounding box
   if (poly_bounds && lbounds) {
     if (!box_contains_box(poly_bounds, poly_bounds_size, lbounds, lbounds_size)) {
       return false;
     }
   }
+
+  const auto poly_num_coords = poly_coords_size / compression_unit_size(ic1);
+  const auto lnum_coords = lsize / compression_unit_size(ic2);
 
   return polygon_contains_linestring(
       poly_coords, poly_num_coords, l, lnum_coords, ic1, isr1, ic2, isr2, osr);
@@ -3660,7 +3369,6 @@ bool ST_Contains_Polygon_Polygon(int8_t* poly1_coords,
                                         poly2_exterior_ring_coords_size,
                                         poly2_bounds,
                                         poly2_bounds_size,
-                                        0,
                                         ic1,
                                         isr1,
                                         ic2,
@@ -3817,7 +3525,6 @@ bool ST_Contains_MultiPolygon_LineString(int8_t* mpoly_coords,
                                          int64_t lsize,
                                          double* lbounds,
                                          int64_t lbounds_size,
-                                         int32_t li,
                                          int32_t ic1,
                                          int32_t isr1,
                                          int32_t ic2,
@@ -3825,40 +3532,6 @@ bool ST_Contains_MultiPolygon_LineString(int8_t* mpoly_coords,
                                          int32_t osr) {
   if (mpoly_num_polys <= 0) {
     return false;
-  }
-
-  auto lnum_coords = lsize / compression_unit_size(ic2);
-  auto lnum_points = lnum_coords / 2;
-  if (li != 0) {
-    // Statically indexed linestring
-    if (li < 0 || li > lnum_points) {
-      li = lnum_points;
-    }
-    double lx = coord_x(l, 2 * (li - 1), ic2, isr2, osr);
-    double ly = coord_y(l, 2 * (li - 1) + 1, ic2, isr2, osr);
-
-    if (mpoly_bounds) {
-      if (!box_contains_point(mpoly_bounds, mpoly_bounds_size, lx, ly)) {
-        return false;
-      }
-    }
-    auto p = l + li * compression_unit_size(ic2);
-    auto psize = 2 * compression_unit_size(ic2);
-    return ST_Contains_MultiPolygon_Point(mpoly_coords,
-                                          mpoly_coords_size,
-                                          mpoly_ring_sizes,
-                                          mpoly_num_rings,
-                                          mpoly_poly_sizes,
-                                          mpoly_num_polys,
-                                          mpoly_bounds,
-                                          mpoly_bounds_size,
-                                          p,
-                                          psize,
-                                          ic1,
-                                          isr1,
-                                          ic2,
-                                          isr2,
-                                          osr);
   }
 
   if (mpoly_bounds && lbounds) {
@@ -3893,7 +3566,6 @@ bool ST_Contains_MultiPolygon_LineString(int8_t* mpoly_coords,
                                        lsize,
                                        nullptr,
                                        0,
-                                       li,
                                        ic1,
                                        isr1,
                                        ic2,
@@ -3931,7 +3603,6 @@ bool ST_Intersects_Point_LineString(int8_t* p,
                                     int64_t lsize,
                                     double* lbounds,
                                     int64_t lbounds_size,
-                                    int32_t li,
                                     int32_t ic1,
                                     int32_t isr1,
                                     int32_t ic2,
@@ -3940,26 +3611,13 @@ bool ST_Intersects_Point_LineString(int8_t* p,
   double px = coord_x(p, 0, ic1, isr1, osr);
   double py = coord_y(p, 1, ic1, isr1, osr);
 
-  auto lnum_coords = lsize / compression_unit_size(ic2);
-  auto lnum_points = lnum_coords / 2;
-  if (li != 0) {
-    // Statically indexed linestring
-    if (li < 0 || li > lnum_points) {
-      li = lnum_points;
-    }
-    auto p2 = l + li * compression_unit_size(ic2);
-    auto p2size = 2 * compression_unit_size(ic2);
-    return tol_zero(
-        ST_Distance_Point_Point(p2, p2size, p, psize, ic2, isr2, ic1, isr1, osr));
-  }
-
   if (lbounds) {
     if (!box_contains_point(lbounds, lbounds_size, px, py)) {
       return false;
     }
   }
-  return tol_zero(ST_Distance_Point_LineString(
-      p, psize, l, lsize, li, ic1, isr1, ic2, isr2, osr, 0.0));
+  return tol_zero(
+      ST_Distance_Point_LineString(p, psize, l, lsize, ic1, isr1, ic2, isr2, osr, 0.0));
 }
 
 EXTENSION_INLINE
@@ -4030,7 +3688,6 @@ bool ST_Intersects_LineString_Point(int8_t* l,
                                     int64_t lsize,
                                     double* lbounds,
                                     int64_t lbounds_size,
-                                    int32_t li,
                                     int8_t* p,
                                     int64_t psize,
                                     int32_t ic1,
@@ -4039,7 +3696,7 @@ bool ST_Intersects_LineString_Point(int8_t* l,
                                     int32_t isr2,
                                     int32_t osr) {
   return ST_Intersects_Point_LineString(
-      p, psize, l, lsize, lbounds, lbounds_size, li, ic2, isr2, ic1, isr1, osr);
+      p, psize, l, lsize, lbounds, lbounds_size, ic2, isr2, ic1, isr1, osr);
 }
 
 EXTENSION_NOINLINE
@@ -4047,42 +3704,15 @@ bool ST_Intersects_LineString_Linestring(int8_t* l1,
                                          int64_t l1size,
                                          double* l1bounds,
                                          int64_t l1bounds_size,
-                                         int32_t l1i,
                                          int8_t* l2,
                                          int64_t l2size,
                                          double* l2bounds,
                                          int64_t l2bounds_size,
-                                         int32_t l2i,
                                          int32_t ic1,
                                          int32_t isr1,
                                          int32_t ic2,
                                          int32_t isr2,
                                          int32_t osr) {
-  auto l2num_coords = l2size / compression_unit_size(ic2);
-  auto l2num_points = l2num_coords / 2;
-  if (l2i != 0) {
-    // Statically indexed linestring
-    if (l2i < 0 || l2i > l2num_points) {
-      l2i = l2num_points;
-    }
-    auto p2 = l2 + l2i * compression_unit_size(ic2);
-    auto p2size = 2 * compression_unit_size(ic2);
-    return ST_Intersects_LineString_Point(
-        l1, l1size, l1bounds, l1bounds_size, l1i, p2, p2size, ic1, isr1, ic2, isr2, osr);
-  }
-  auto l1num_coords = l1size / compression_unit_size(ic1);
-  auto l1num_points = l1num_coords / 2;
-  if (l1i != 0) {
-    // Statically indexed linestring
-    if (l1i < 0 || l1i > l1num_points) {
-      l1i = l1num_points;
-    }
-    auto p1 = l1 + l1i * compression_unit_size(ic1);
-    auto p1size = 2 * compression_unit_size(ic1);
-    return ST_Intersects_LineString_Point(
-        l2, l2size, l2bounds, l2bounds_size, l2i, p1, p1size, ic2, isr2, ic1, isr1, osr);
-  }
-
   if (l1bounds && l2bounds) {
     if (!box_overlaps_box(l1bounds, l1bounds_size, l2bounds, l2bounds_size)) {
       return false;
@@ -4090,7 +3720,7 @@ bool ST_Intersects_LineString_Linestring(int8_t* l1,
   }
 
   return tol_zero(ST_Distance_LineString_LineString(
-      l1, l1size, l1i, l2, l2size, l2i, ic1, isr1, ic2, isr2, osr, 0.0));
+      l1, l1size, l2, l2size, ic1, isr1, ic2, isr2, osr, 0.0));
 }
 
 EXTENSION_NOINLINE
@@ -4098,7 +3728,6 @@ bool ST_Intersects_LineString_Polygon(int8_t* l,
                                       int64_t lsize,
                                       double* lbounds,
                                       int64_t lbounds_size,
-                                      int32_t li,
                                       int8_t* poly,
                                       int64_t polysize,
                                       int32_t* poly_ring_sizes,
@@ -4110,31 +3739,6 @@ bool ST_Intersects_LineString_Polygon(int8_t* l,
                                       int32_t ic2,
                                       int32_t isr2,
                                       int32_t osr) {
-  auto lnum_coords = lsize / compression_unit_size(ic1);
-  auto lnum_points = lnum_coords / 2;
-  if (li != 0) {
-    // Statically indexed linestring
-    if (li < 0 || li > lnum_points) {
-      li = lnum_points;
-    }
-    auto p = l + li * compression_unit_size(ic1);
-    auto psize = 2 * compression_unit_size(ic1);
-    return Contains_Polygon_Point_Impl<double, EdgeBehavior::kIncludePointOnEdge>(
-        poly,
-        polysize,
-        poly_ring_sizes,
-        poly_num_rings,
-        poly_bounds,
-        poly_bounds_size,
-        p,
-        psize,
-        ic2,
-        isr2,
-        ic1,
-        isr1,
-        osr);
-  }
-
   if (lbounds && poly_bounds) {
     if (!box_overlaps_box(lbounds, lbounds_size, poly_bounds, poly_bounds_size)) {
       return false;
@@ -4150,7 +3754,6 @@ bool ST_Intersects_LineString_Polygon(int8_t* l,
   // Or, alternatively, just measure the distance:
   return tol_zero(ST_Distance_LineString_Polygon(l,
                                                  lsize,
-                                                 li,
                                                  poly,
                                                  polysize,
                                                  poly_ring_sizes,
@@ -4168,7 +3771,6 @@ bool ST_Intersects_LineString_MultiPolygon(int8_t* l,
                                            int64_t lsize,
                                            double* lbounds,
                                            int64_t lbounds_size,
-                                           int32_t li,
                                            int8_t* mpoly_coords,
                                            int64_t mpoly_coords_size,
                                            int32_t* mpoly_ring_sizes,
@@ -4182,32 +3784,6 @@ bool ST_Intersects_LineString_MultiPolygon(int8_t* l,
                                            int32_t ic2,
                                            int32_t isr2,
                                            int32_t osr) {
-  auto lnum_coords = lsize / compression_unit_size(ic1);
-  auto lnum_points = lnum_coords / 2;
-  if (li != 0) {
-    // Statically indexed linestring
-    if (li < 0 || li > lnum_points) {
-      li = lnum_points;
-    }
-    auto p = l + li * compression_unit_size(ic1);
-    auto psize = 2 * compression_unit_size(ic1);
-    return ST_Contains_MultiPolygon_Point(mpoly_coords,
-                                          mpoly_coords_size,
-                                          mpoly_ring_sizes,
-                                          mpoly_num_rings,
-                                          mpoly_poly_sizes,
-                                          mpoly_num_polys,
-                                          mpoly_bounds,
-                                          mpoly_bounds_size,
-                                          p,
-                                          psize,
-                                          ic2,
-                                          isr2,
-                                          ic1,
-                                          isr1,
-                                          osr);
-  }
-
   if (lbounds && mpoly_bounds) {
     if (!box_overlaps_box(lbounds, lbounds_size, mpoly_bounds, mpoly_bounds_size)) {
       return false;
@@ -4223,7 +3799,6 @@ bool ST_Intersects_LineString_MultiPolygon(int8_t* l,
   // Or, alternatively, just measure the distance:
   return tol_zero(ST_Distance_LineString_MultiPolygon(l,
                                                       lsize,
-                                                      li,
                                                       mpoly_coords,
                                                       mpoly_coords_size,
                                                       mpoly_ring_sizes,
@@ -4279,7 +3854,6 @@ bool ST_Intersects_Polygon_LineString(int8_t* poly,
                                       int64_t lsize,
                                       double* lbounds,
                                       int64_t lbounds_size,
-                                      int32_t li,
                                       int32_t ic1,
                                       int32_t isr1,
                                       int32_t ic2,
@@ -4289,7 +3863,6 @@ bool ST_Intersects_Polygon_LineString(int8_t* poly,
                                           lsize,
                                           lbounds,
                                           lbounds_size,
-                                          li,
                                           poly,
                                           polysize,
                                           poly_ring_sizes,
@@ -4436,7 +4009,6 @@ bool ST_Intersects_MultiPolygon_LineString(int8_t* mpoly_coords,
                                            int64_t lsize,
                                            double* lbounds,
                                            int64_t lbounds_size,
-                                           int32_t li,
                                            int32_t ic1,
                                            int32_t isr1,
                                            int32_t ic2,
@@ -4446,7 +4018,6 @@ bool ST_Intersects_MultiPolygon_LineString(int8_t* mpoly_coords,
                                                lsize,
                                                lbounds,
                                                lbounds_size,
-                                               li,
                                                mpoly_coords,
                                                mpoly_coords_size,
                                                mpoly_ring_sizes,

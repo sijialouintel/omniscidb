@@ -631,12 +631,9 @@ InternalTargetValue ResultSet::getVarlenOrderEntry(const int64_t str_ptr,
     cpu_buffer.resize(str_len);
     const auto executor = query_mem_desc_.getExecutor();
     CHECK(executor);
-    auto& data_mgr = executor->catalog_->getDataMgr();
-    copy_from_gpu(&data_mgr,
-                  &cpu_buffer[0],
-                  static_cast<CUdeviceptr>(str_ptr),
-                  str_len,
-                  device_id_);
+    auto data_mgr = executor->getDataMgr();
+    copy_from_gpu(
+        data_mgr, &cpu_buffer[0], static_cast<CUdeviceptr>(str_ptr), str_len, device_id_);
     host_str_ptr = reinterpret_cast<char*>(&cpu_buffer[0]);
   } else {
     CHECK(device_type_ == ExecutorDeviceType::CPU);
@@ -976,7 +973,13 @@ struct GeoQueryOutputFetchHandler {
 
       std::array<VarlenDatumPtr, num_vals / 2> ad_arr;
       size_t ctr = 0;
-      for (size_t i = 0; i < vals_vector.size(); i += 2) {
+      for (size_t i = 0; i < vals_vector.size(); i += 2, ctr++) {
+        if (vals_vector[i] == 0) {
+          // projected null
+          CHECK(!geo_ti.get_notnull());
+          ad_arr[ctr] = std::make_unique<ArrayDatum>(0, nullptr, true);
+          continue;
+        }
         ad_arr[ctr] = datum_fetcher(vals_vector[i], vals_vector[i + 1]);
         // All fetched datums come in with is_null set to false
         if (!geo_ti.get_notnull()) {
@@ -994,7 +997,6 @@ struct GeoQueryOutputFetchHandler {
           }
           ad_arr[ctr]->is_null = is_null;
         }
-        ctr++;
       }
       return ad_arr;
     };
@@ -1101,6 +1103,12 @@ const std::vector<const int8_t*>& ResultSet::getColumnFrag(const size_t storage_
     CHECK_EQ(size_t(1), col_buffers_[storage_idx].size());
     return col_buffers_[storage_idx][0];
   }
+}
+
+const VarlenOutputInfo* ResultSet::getVarlenOutputInfo(const size_t entry_idx) const {
+  auto storage_lookup_result = findStorage(entry_idx);
+  CHECK(storage_lookup_result.storage_ptr);
+  return storage_lookup_result.storage_ptr->getVarlenOutputInfo();
 }
 
 /**
@@ -1401,8 +1409,8 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
     cpu_buffer.resize(length);
     const auto executor = query_mem_desc_.getExecutor();
     CHECK(executor);
-    auto& data_mgr = executor->catalog_->getDataMgr();
-    copy_from_gpu(&data_mgr,
+    auto data_mgr = executor->getDataMgr();
+    copy_from_gpu(data_mgr,
                   &cpu_buffer[0],
                   static_cast<CUdeviceptr>(varlen_ptr),
                   length,
@@ -1524,8 +1532,7 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
   auto getDataMgr = [&]() {
     auto executor = query_mem_desc_.getExecutor();
     CHECK(executor);
-    auto& data_mgr = executor->catalog_->getDataMgr();
-    return &data_mgr;
+    return executor->getDataMgr();
   };
 
   auto getSeparateVarlenStorage = [&]() -> decltype(auto) {
@@ -1548,7 +1555,22 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
 
   switch (target_info.sql_type.get_type()) {
     case kPOINT: {
-      if (separate_varlen_storage_valid_ && !target_info.is_agg) {
+      if (query_mem_desc_.slotIsVarlenOutput(slot_idx)) {
+        auto varlen_output_info = getVarlenOutputInfo(entry_buff_idx);
+        CHECK(varlen_output_info);
+        auto geo_data_ptr = read_int_from_buff(
+            geo_target_ptr, query_mem_desc_.getPaddedSlotWidthBytes(slot_idx));
+        auto cpu_data_ptr =
+            reinterpret_cast<int64_t>(varlen_output_info->computeCpuOffset(geo_data_ptr));
+        return GeoTargetValueBuilder<kPOINT, GeoQueryOutputFetchHandler>::build(
+            target_info.sql_type,
+            geo_return_type_,
+            /*data_mgr=*/nullptr,
+            /*is_gpu_fetch=*/false,
+            device_id_,
+            cpu_data_ptr,
+            target_info.sql_type.get_compression() == kENCODING_GEOINT ? 8 : 16);
+      } else if (separate_varlen_storage_valid_ && !target_info.is_agg) {
         const auto& varlen_buffer = getSeparateVarlenStorage();
         CHECK_LT(static_cast<size_t>(getCoordsDataPtr(geo_target_ptr)),
                  varlen_buffer.size());
@@ -1777,11 +1799,10 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
     }
   }
   if (chosen_type.is_fp()) {
-    if (target_info.agg_kind == kAPPROX_MEDIAN) {
+    if (target_info.agg_kind == kAPPROX_QUANTILE) {
       return *reinterpret_cast<double const*>(ptr) == NULL_DOUBLE
                  ? NULL_DOUBLE  // sql_validate / just_validate
-                 : calculateQuantile(*reinterpret_cast<quantile::TDigest* const*>(ptr),
-                                     0.5);
+                 : calculateQuantile(*reinterpret_cast<quantile::TDigest* const*>(ptr));
     }
     switch (actual_compact_sz) {
       case 8: {
@@ -2176,8 +2197,7 @@ bool ResultSet::isNull(const SQLTypeInfo& ti,
     return val.i1 == null_val_bit_pattern(ti, float_argument_input);
   }
   if (val.isPair()) {
-    return !val.i2 ||
-           pair_to_double({val.i1, val.i2}, ti, float_argument_input) == NULL_DOUBLE;
+    return !val.i2;
   }
   if (val.isStr()) {
     return !val.i1;

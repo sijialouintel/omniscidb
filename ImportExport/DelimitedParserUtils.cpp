@@ -24,6 +24,7 @@
 
 #include <string_view>
 
+#include "ImportExport/CopyParams.h"
 #include "Logger/Logger.h"
 #include "StringDictionary/StringDictionary.h"
 
@@ -134,7 +135,7 @@ size_t find_end(const char* buffer,
   return last_line_delim_pos + 1;
 }
 
-static size_t max_buffer_resize = 1024 * 1024 * 1024;
+static size_t max_buffer_resize = max_import_buffer_resize_byte_size;
 
 size_t get_max_buffer_resize() {
   return max_buffer_resize;
@@ -151,12 +152,12 @@ size_t find_row_end_pos(size_t& alloc_size,
                         const size_t buffer_first_row_index,
                         unsigned int& num_rows_in_buffer,
                         FILE* file,
-                        foreign_storage::CsvReader* csv_reader) {
+                        foreign_storage::FileReader* file_reader) {
   bool found_end_pos{false};
   bool in_quote{false};
   size_t offset{0};
   size_t end_pos;
-  CHECK(file != nullptr || csv_reader != nullptr);
+  CHECK(file != nullptr || file_reader != nullptr);
   const auto max_buffer_resize = get_max_buffer_resize();
   while (!found_end_pos) {
     try {
@@ -172,7 +173,7 @@ size_t find_row_end_pos(size_t& alloc_size,
       if (alloc_size >= max_buffer_resize) {
         throw;
       }
-      if (file == nullptr && csv_reader->isScanFinished()) {
+      if (file == nullptr && file_reader->isScanFinished()) {
         throw;
       }
       auto old_buffer = std::move(buffer);
@@ -187,7 +188,7 @@ size_t find_row_end_pos(size_t& alloc_size,
         fread_size = fread(buffer.get() + buffer_size, 1, alloc_size - buffer_size, file);
       } else {
         fread_size =
-            csv_reader->read(buffer.get() + buffer_size, alloc_size - buffer_size);
+            file_reader->read(buffer.get() + buffer_size, alloc_size - buffer_size);
       }
       offset = buffer_size;
       buffer_size += fread_size;
@@ -266,6 +267,11 @@ const char* get_row(const char* buf,
           // We are at the end of the row. Skip the line endings now.
           if (filter_empty_lines) {
             while (p + 1 < buf_end && is_eol(*(p + 1), copy_params)) {
+              p++;
+            }
+          } else {
+            // skip DOS carriage return line feed only
+            if (p + 1 < buf_end && *p == '\r' && *(p + 1) == '\n') {
               p++;
             }
           }

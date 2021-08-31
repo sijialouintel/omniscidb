@@ -17,6 +17,134 @@
 #include "Geospatial/Compression.h"
 #include "QueryEngine/CodeGenerator.h"
 #include "QueryEngine/Execute.h"
+#include "QueryEngine/GeoOperators/API.h"
+#include "QueryEngine/GeoOperators/Codegen.h"
+
+ArrayLoadCodegen CodeGenerator::codegenGeoArrayLoadAndNullcheck(llvm::Value* byte_stream,
+                                                                llvm::Value* pos,
+                                                                const SQLTypeInfo& ti,
+                                                                CgenState* cgen_state) {
+  CHECK(byte_stream);
+
+  const auto key = std::make_pair(byte_stream, pos);
+  auto cache_itr = cgen_state->array_load_cache_.find(key);
+  if (cache_itr != cgen_state->array_load_cache_.end()) {
+    return cache_itr->second;
+  }
+  const bool is_nullable = !ti.get_notnull();
+  CHECK(ti.get_type() == kPOINT);  // TODO: lift this
+
+  auto pt_arr_buf =
+      cgen_state->emitExternalCall("array_buff",
+                                   llvm::Type::getInt8PtrTy(cgen_state->context_),
+                                   {key.first, key.second});
+  llvm::Value* pt_is_null{nullptr};
+  if (is_nullable) {
+    pt_is_null = cgen_state->emitExternalCall("point_coord_array_is_null",
+                                              llvm::Type::getInt1Ty(cgen_state->context_),
+                                              {key.first, key.second});
+  }
+  ArrayLoadCodegen arr_load{pt_arr_buf, nullptr, pt_is_null};
+  cgen_state->array_load_cache_.insert(std::make_pair(key, arr_load));
+  return arr_load;
+}
+
+std::vector<llvm::Value*> CodeGenerator::codegenGeoColumnVar(
+    const Analyzer::GeoColumnVar* geo_col_var,
+    const bool fetch_columns,
+    const CompilationOptions& co) {
+  const auto& ti = geo_col_var->get_type_info();
+  if (ti.get_type() == kPOINT) {
+    // create a new operand which is just the coords and codegen it
+    const auto catalog = executor()->getCatalog();
+    CHECK(catalog);
+    const auto coords_column_id = geo_col_var->get_column_id() + 1;  // + 1 for coords
+    auto coords_cd =
+        get_column_descriptor(coords_column_id, geo_col_var->get_table_id(), *catalog);
+    CHECK(coords_cd);
+
+    const auto coords_col_var = Analyzer::ColumnVar(coords_cd->columnType,
+                                                    geo_col_var->get_table_id(),
+                                                    coords_column_id,
+                                                    geo_col_var->get_rte_idx());
+    const auto coords_lv = codegen(&coords_col_var, /*fetch_columns=*/true, co);
+    CHECK_EQ(coords_lv.size(), size_t(1));  // ptr
+    return coords_lv;
+  } else {
+    UNREACHABLE() << geo_col_var->toString();
+  }
+  return {};
+}
+
+std::vector<llvm::Value*> CodeGenerator::codegenGeoExpr(const Analyzer::GeoExpr* expr,
+                                                        const CompilationOptions& co) {
+  auto geo_constant = dynamic_cast<const Analyzer::GeoConstant*>(expr);
+  if (geo_constant) {
+    return codegenGeoConstant(geo_constant, co);
+  }
+  auto geo_operator = dynamic_cast<const Analyzer::GeoOperator*>(expr);
+  if (geo_operator) {
+    return codegenGeoOperator(geo_operator, co);
+  }
+  UNREACHABLE() << expr->toString();
+  return {};
+}
+
+std::vector<llvm::Value*> CodeGenerator::codegenGeoConstant(
+    const Analyzer::GeoConstant* geo_constant,
+    const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
+
+  std::vector<llvm::Value*> ret;
+  for (size_t i = 0; i < geo_constant->physicalCols(); i++) {
+    auto physical_constant = geo_constant->makePhysicalConstant(i);
+    auto operand_lvs = codegen(physical_constant.get(), /*fetch_columns=*/true, co);
+    CHECK_EQ(operand_lvs.size(), size_t(2));
+    auto array_buff_lv = operand_lvs[0];
+    if (i > 0) {
+      array_buff_lv = cgen_state_->ir_builder_.CreateBitCast(
+          operand_lvs[0], llvm::Type::getInt8PtrTy(cgen_state_->context_));
+    }
+    ret.push_back(array_buff_lv);
+    ret.push_back(operand_lvs[1]);
+  }
+  return ret;
+}
+
+std::vector<llvm::Value*> CodeGenerator::codegenGeoOperator(
+    const Analyzer::GeoOperator* geo_operator,
+    const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
+
+  if (geo_operator->getName() == "ST_X" || geo_operator->getName() == "ST_Y") {
+    const auto key = geo_operator->toString();
+    auto geo_target_cache_it = cgen_state_->geo_target_cache_.find(key);
+    if (geo_target_cache_it != cgen_state_->geo_target_cache_.end()) {
+      return {geo_target_cache_it->second};
+    }
+  }
+
+  const auto catalog = executor()->getCatalog();
+  CHECK(catalog);
+
+  auto op_codegen = spatial_type::Codegen::init(geo_operator, catalog);
+  CHECK(op_codegen);
+
+  std::vector<llvm::Value*> load_lvs;
+  std::vector<llvm::Value*> pos_lvs;
+  for (size_t i = 0; i < op_codegen->size(); i++) {
+    auto intermediate_lvs =
+        codegen(op_codegen->getOperand(i), /*fetch_columns=*/true, co);
+    load_lvs.insert(load_lvs.end(), intermediate_lvs.begin(), intermediate_lvs.end());
+    pos_lvs.push_back(posArg(op_codegen->getOperand(i)));
+  }
+
+  auto [arg_lvs, null_lv] = op_codegen->codegenLoads(load_lvs, pos_lvs, cgen_state_);
+
+  std::unique_ptr<CodeGenerator::NullCheckCodegen> nullcheck_codegen =
+      op_codegen->getNullCheckCodegen(null_lv, cgen_state_, executor());
+  return op_codegen->codegen(arg_lvs, nullcheck_codegen.get(), cgen_state_, co);
+}
 
 std::vector<llvm::Value*> CodeGenerator::codegenGeoUOper(
     const Analyzer::GeoUOper* geo_expr,

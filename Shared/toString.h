@@ -51,6 +51,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "sqldefs.h"
 
 #ifdef ENABLE_TOSTRING_RAPIDJSON
 #if __has_include(<rapidjson/document.h> )
@@ -66,8 +67,10 @@
 #if __has_include(<llvm/Support/raw_os_ostream.h> )
 #include <llvm/IR/Value.h>
 #include <llvm/Support/raw_os_ostream.h>
+#include "clang/Driver/Job.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Option/ArgList.h"
 #else
 #undefine ENABLE_TOSTRING_LLVM
 #endif
@@ -129,6 +132,15 @@ template <class T>
 inline constexpr bool has_str_v = has_str<T>::value;
 #endif
 
+template <typename T, typename = void>
+struct has_printTo : std::false_type {};
+template <typename T>
+struct has_printTo<T,
+                   decltype(std::declval<T>().printTo(std::declval<std::ostream&>()),
+                            void())> : std::true_type {};
+template <class T>
+inline constexpr bool has_printTo_v = has_printTo<T>::value;
+
 }  // namespace
 
 template <typename T>
@@ -165,6 +177,29 @@ std::string toString(const T& v) {
     return "(" + rso.str() + ")";
   } else if constexpr (std::is_same_v<T, llvm::Triple>) {
     return v.str();
+  } else if constexpr (std::is_same_v<T, llvm::opt::ArgStringList>) {
+    std::string r;
+    for (unsigned i = 0; i < v.size(); i++) {
+      if (i) {
+        r += ", ";
+      }
+      r += v[i];
+    }
+    return "[" + r + "]";
+  } else if constexpr (std::is_same_v<T, llvm::opt::DerivedArgList>) {
+    std::string r;
+    for (unsigned i = 0; i < v.getNumInputArgStrings(); i++) {
+      if (i) {
+        r += ", ";
+      }
+      r += v.getArgString(i);
+    }
+    return "[" + r + "]";
+  } else if constexpr (std::is_same_v<T, clang::driver::JobList>) {
+    std::string type_str;
+    llvm::raw_string_ostream rso(type_str);
+    v.Print(rso, nullptr, true);
+    return rso.str();
 #endif
   } else if constexpr (std::is_same_v<T, bool>) {
     return v ? "True" : "False";
@@ -196,8 +231,27 @@ std::string toString(const T& v) {
     std::strftime(&s[0], s.size(), "%Y-%m-%d %H:%M:%S", std::localtime(&ts));
     return s + "." +
            std::to_string((converted_v.time_since_epoch().count() / 1000) % 1000000);
+  } else if constexpr (std::is_same_v<T, JoinType>) {
+    switch (v) {
+      case JoinType::INNER:
+        return "INNER";
+      case JoinType::LEFT:
+        return "LEFT";
+      case JoinType::SEMI:
+        return "SEMI";
+      case JoinType::ANTI:
+        return "ANTI";
+      case JoinType::INVALID:
+        return "INVALID";
+    }
+    UNREACHABLE();
+    return "";
   } else if constexpr (std::is_pointer_v<T>) {
     return (v == NULL ? "NULL" : "&" + toString(*v));
+  } else if constexpr (has_printTo_v<T>) {
+    std::ostringstream ss;
+    v.printTo(ss);
+    return ss.str();
   } else {
     return typeName(&v);
   }

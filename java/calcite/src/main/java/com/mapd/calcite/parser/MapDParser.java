@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2021 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import static org.apache.calcite.sql.parser.SqlParserPos.ZERO;
 import com.google.common.collect.ImmutableList;
 import com.mapd.calcite.parser.MapDParserOptions.FilterPushDownInfo;
 import com.mapd.common.SockTransportProperties;
+import com.mapd.metadata.MetaConnect;
 import com.mapd.parser.extension.ddl.ExtendedSqlParser;
 import com.mapd.parser.extension.ddl.JsonSerializableDdl;
 import com.mapd.parser.hint.OmniSciHintStrategyTable;
@@ -207,7 +208,7 @@ public final class MapDParser {
   };
 
   private MapDPlanner getPlanner() {
-    return getPlanner(true, true);
+    return getPlanner(true);
   }
 
   private boolean isCorrelated(SqlNode expression) {
@@ -232,12 +233,7 @@ public final class MapDParser {
     return false;
   }
 
-  private MapDPlanner getPlanner(final boolean allowSubQueryExpansion,
-          final boolean allowPushdownJoinCondition) {
-    final MapDSchema mapd =
-            new MapDSchema(dataDir, this, mapdPort, mapdUser, sock_transport_properties);
-    final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
-
+  private MapDPlanner getPlanner(final boolean allowSubQueryExpansion) {
     BiPredicate<SqlNode, SqlNode> expandPredicate = new BiPredicate<SqlNode, SqlNode>() {
       @Override
       public boolean test(SqlNode root, SqlNode expression) {
@@ -314,31 +310,36 @@ public final class MapDParser {
       }
     };
 
-    BiPredicate<SqlNode, Join> pushdownJoinPredicate = new BiPredicate<SqlNode, Join>() {
-      @Override
-      public boolean test(SqlNode t, Join u) {
-        if (!allowPushdownJoinCondition) {
-          return false;
+    // create the default schema
+    final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+    final MapDSchema defaultSchema =
+            new MapDSchema(dataDir, this, mapdPort, mapdUser, sock_transport_properties);
+    final SchemaPlus defaultSchemaPlus = rootSchema.add(mapdUser.getDB(), defaultSchema);
+
+    // add the other potential schemas
+    // this is where the systyem schema would be added
+    final MetaConnect mc =
+            new MetaConnect(mapdPort, dataDir, mapdUser, this, sock_transport_properties);
+
+    // TODO MAT for this checkin we are not going to actually allow any additional schemas
+    // Eveything should work and perform as it ever did
+    if (false) {
+      for (String db : mc.getDatabases()) {
+        if (!db.toUpperCase().equals(mapdUser.getDB().toUpperCase())) {
+          rootSchema.add(db,
+                  new MapDSchema(dataDir,
+                          this,
+                          mapdPort,
+                          mapdUser,
+                          sock_transport_properties,
+                          db));
         }
-
-        return !hasGeoColumns(u.getRowType());
       }
-
-      private boolean hasGeoColumns(RelDataType type) {
-        for (RelDataTypeField f : type.getFieldList()) {
-          if ("any".equalsIgnoreCase(f.getType().getFamily().toString())) {
-            // any indicates geo types at the moment
-            return true;
-          }
-        }
-
-        return false;
-      }
-    };
+    }
 
     final FrameworkConfig config =
             Frameworks.newConfigBuilder()
-                    .defaultSchema(rootSchema.add(mapdUser.getDB(), mapd))
+                    .defaultSchema(defaultSchemaPlus)
                     .operatorTable(mapDSqlOperatorTable.get())
                     .parserConfig(SqlParser.configBuilder()
                                           .setConformance(SqlConformanceEnum.LENIENT)
@@ -355,7 +356,6 @@ public final class MapDParser {
                                     .withExpandPredicate(expandPredicate)
                                     // allow as many as possible IN operator values
                                     .withInSubQueryThreshold(Integer.MAX_VALUE)
-                                    .withPushdownJoinCondition(pushdownJoinPredicate)
                                     .withHintStrategyTable(
                                             OmniSciHintStrategyTable.HINT_STRATEGY_TABLE)
                                     .build())
@@ -374,7 +374,7 @@ public final class MapDParser {
   public Pair<String, SqlIdentifierCapturer> process(
           String sql, final MapDParserOptions parserOptions)
           throws SqlParseException, ValidationException, RelConversionException {
-    final MapDPlanner planner = getPlanner(true, true);
+    final MapDPlanner planner = getPlanner(true);
     final SqlNode sqlNode = parseSql(sql, parserOptions.isLegacySyntax(), planner);
     String res = processSql(sqlNode, parserOptions);
     SqlIdentifierCapturer capture = captureIdentifiers(sqlNode);
@@ -385,7 +385,7 @@ public final class MapDParser {
           throws IOException {
     MapDSchema schema =
             new MapDSchema(dataDir, this, mapdPort, mapdUser, sock_transport_properties);
-    MapDPlanner planner = getPlanner(true, true);
+    MapDPlanner planner = getPlanner(true);
 
     planner.setFilterPushDownInfo(parserOptions.getFilterPushDownInfo());
     RelRoot optRel = planner.optimizeRaQuery(query, schema);
@@ -397,7 +397,7 @@ public final class MapDParser {
           throws SqlParseException, ValidationException, RelConversionException {
     callCount++;
 
-    final MapDPlanner planner = getPlanner(true, true);
+    final MapDPlanner planner = getPlanner(true);
     final SqlNode sqlNode = parseSql(sql, parserOptions.isLegacySyntax(), planner);
 
     return processSql(sqlNode, parserOptions);
@@ -415,7 +415,7 @@ public final class MapDParser {
       return sqlNode.toString();
     }
 
-    final MapDPlanner planner = getPlanner(true, true);
+    final MapDPlanner planner = getPlanner(true);
     planner.advanceToValidate();
 
     final RelRoot sqlRel = convertSqlToRelNode(sqlNode, planner, parserOptions);
@@ -435,22 +435,23 @@ public final class MapDParser {
     return getPlanner().getCompletionHints(sql, cursor, visible_tables);
   }
 
-  public Set<String> resolveSelectIdentifiers(SqlIdentifierCapturer capturer) {
+  public HashSet<ImmutableList<String>> resolveSelectIdentifiers(
+          SqlIdentifierCapturer capturer) {
     MapDSchema schema =
             new MapDSchema(dataDir, this, mapdPort, mapdUser, sock_transport_properties);
-    HashSet<String> resolved = new HashSet<>();
+    HashSet<ImmutableList<String>> resolved = new HashSet<ImmutableList<String>>();
 
-    for (String name : capturer.selects) {
-      MapDTable table = (MapDTable) schema.getTable(name);
+    for (ImmutableList<String> names : capturer.selects) {
+      MapDTable table = (MapDTable) schema.getTable(names.get(0));
       if (null == table) {
-        throw new RuntimeException("table/view not found: " + name);
+        throw new RuntimeException("table/view not found: " + names.get(0));
       }
 
       if (table instanceof MapDView) {
         MapDView view = (MapDView) table;
         resolved.addAll(resolveSelectIdentifiers(view.getAccessedObjects()));
       } else {
-        resolved.add(name);
+        resolved.add(names);
       }
     }
 
@@ -606,7 +607,6 @@ public final class MapDParser {
               null);
     }
 
-    boolean allowPushdownJoinCondition = false;
     SqlNodeList sourceExpression = new SqlNodeList(SqlParserPos.ZERO);
     LogicalTableModify dummyModify = getDummyUpdate(update);
     RelOptTable targetTable = dummyModify.getTable();
@@ -689,7 +689,7 @@ public final class MapDParser {
               null);
     }
 
-    MapDPlanner planner = getPlanner(true, allowPushdownJoinCondition);
+    MapDPlanner planner = getPlanner(true);
     SqlNode node = null;
     try {
       node = planner.parse(select.toSqlString(CalciteSqlDialect.DEFAULT).getSql());
@@ -759,7 +759,7 @@ public final class MapDParser {
 
   RelRoot queryToRelNode(final String sql, final MapDParserOptions parserOptions)
           throws SqlParseException, ValidationException, RelConversionException {
-    final MapDPlanner planner = getPlanner(true, true);
+    final MapDPlanner planner = getPlanner(true);
     final SqlNode sqlNode = parseSql(sql, parserOptions.isLegacySyntax(), planner);
     return convertSqlToRelNode(sqlNode, planner, parserOptions);
   }
@@ -771,7 +771,6 @@ public final class MapDParser {
     SqlNode node = sqlNode;
     MapDPlanner planner = mapDPlanner;
     boolean allowCorrelatedSubQueryExpansion = true;
-    boolean allowPushdownJoinCondition = true;
     boolean patchUpdateToDelete = false;
 
     if (node.isA(DELETE)) {
@@ -813,7 +812,7 @@ public final class MapDParser {
       // close original planner
       planner.close();
       // create a new one
-      planner = getPlanner(allowCorrelatedSubQueryExpansion, allowPushdownJoinCondition);
+      planner = getPlanner(allowCorrelatedSubQueryExpansion);
       node = parseSql(
               node.toSqlString(CalciteSqlDialect.DEFAULT).toString(), false, planner);
     }
@@ -832,10 +831,10 @@ public final class MapDParser {
       MapDSchema schema = new MapDSchema(
               dataDir, this, mapdPort, mapdUser, sock_transport_properties);
       SqlIdentifierCapturer capturer = captureIdentifiers(sqlNode);
-      for (String name : capturer.selects) {
-        MapDTable table = (MapDTable) schema.getTable(name);
+      for (ImmutableList<String> names : capturer.selects) {
+        MapDTable table = (MapDTable) schema.getTable(names.get(0));
         if (null == table) {
-          throw new RuntimeException("table/view not found: " + name);
+          throw new RuntimeException("table/view not found: " + names.get(0));
         }
         if (table instanceof MapDView) {
           foundView = true;

@@ -15,7 +15,9 @@ set(datamgr_source_files
     FileMgr/FileMgr.cpp
     FileMgr/FileBuffer.cpp
     FileMgr/FileInfo.cpp
+    ForeignStorage/AbstractTextFileDataWrapper.cpp
     ForeignStorage/ArrowForeignStorage.cpp
+    ForeignStorage/CacheEvictionAlgorithms/LRUEvictionAlgorithm.cpp
     ForeignStorage/CsvDataWrapper.cpp
     ForeignStorage/CachingForeignStorageMgr.cpp
     ForeignStorage/DummyForeignStorage.cpp
@@ -23,9 +25,11 @@ set(datamgr_source_files
     ForeignStorage/ForeignStorageBuffer.cpp
     ForeignStorage/ForeignStorageMgr.cpp
     ForeignStorage/ForeignStorageCache.cpp
+    ForeignStorage/FsiChunkUtils.cpp
     ForeignStorage/FsiJsonUtils.cpp
-    ForeignStorage/CsvReader.cpp
-    ForeignStorage/CsvShared.cpp
+    ForeignStorage/FileReader.cpp
+    ForeignStorage/FileRegions.cpp
+    ForeignStorage/TextFileBufferParser.cpp
     ForeignStorage/CsvFileBufferParser.cpp
     BufferMgr/GpuCudaBufferMgr/GpuCudaBufferMgr.cpp
     BufferMgr/GpuCudaBufferMgr/GpuCudaBuffer.cpp
@@ -35,7 +39,6 @@ set(datamgr_source_files
     BufferMgr/Buffer.cpp
     PersistentStorageMgr/MutableCachePersistentStorageMgr.cpp
     PersistentStorageMgr/PersistentStorageMgr.cpp
-    ForeignStorage/LazyParquetChunkLoader.cpp
     ForeignStorage/ForeignTableRefresh.cpp
     ForeignStorage/AbstractFileStorageDataWrapper.cpp
     ForeignStorage/ForeignDataWrapperFactory.cpp
@@ -43,7 +46,7 @@ set(datamgr_source_files
 
 if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
 if(ENABLE_AWS_S3)
-  list(APPEND datamgr_source_files ForeignStorage/ee/CsvReaderS3.cpp)
+  list(APPEND datamgr_source_files ForeignStorage/ee/FileReaderS3.cpp)
   list(APPEND datamgr_source_files ForeignStorage/ee/S3Utils.cpp)
   list(APPEND datamgr_source_files ForeignStorage/ee/S3SelectClient.cpp)
   list(APPEND datamgr_source_files ForeignStorage/ee/S3SelectDataWrapper.cpp)
@@ -53,6 +56,7 @@ endif()
 if(ENABLE_IMPORT_PARQUET)
   list(APPEND datamgr_source_files ForeignStorage/ParquetDataWrapper.cpp)
   list(APPEND datamgr_source_files ForeignStorage/ParquetShared.cpp)
+  list(APPEND datamgr_source_files ForeignStorage/LazyParquetChunkLoader.cpp)
 endif()
 
 # On Linux, Arrow internally links symbols for its dependency libraries (such as the C++ AWS SDK)
@@ -76,7 +80,7 @@ endif()
 
 add_library(DataMgr ${datamgr_source_files})
 
-target_link_libraries(DataMgr CudaMgr Shared ${Boost_THREAD_LIBRARY} ${TBB_LIBS})
+target_link_libraries(DataMgr CudaMgr $<$<BOOL:${ENABLE_FOLLY}>:${Folly_LIBRARIES}> Shared ${Boost_THREAD_LIBRARY} ${TBB_LIBS} ${CMAKE_DL_LIBS})
 
 option(ENABLE_CRASH_CORRUPTION_TEST "Enable crash using SIGUSR2 during page deletion to faster and affirmative test/repro db corruption" OFF)
 if(ENABLE_CRASH_CORRUPTION_TEST)

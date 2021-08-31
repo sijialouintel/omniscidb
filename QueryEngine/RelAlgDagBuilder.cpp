@@ -214,7 +214,7 @@ RANodeOutput get_node_output(const RelAlgNode* ra_node) {
   if (logical_union_node) {
     return n_outputs(logical_union_node, logical_union_node->size());
   }
-  LOG(FATAL) << "Unhandled ra_node type: " << ra_node->toString();
+  LOG(FATAL) << "Unhandled ra_node type: " << ::toString(ra_node);
   return {};
 }
 
@@ -608,6 +608,14 @@ std::string RelLogicalUnion::toString() const {
   return cat(::typeName(this), "(is_all(", is_all_, "))");
 }
 
+size_t RelLogicalUnion::toHash() const {
+  if (!hash_) {
+    hash_ = typeid(RelLogicalUnion).hash_code();
+    boost::hash_combine(*hash_, is_all_);
+  }
+  return *hash_;
+}
+
 std::string RelLogicalUnion::getFieldName(const size_t i) const {
   if (auto const* input = dynamic_cast<RelCompound const*>(inputs_[0].get())) {
     return input->getFieldName(i);
@@ -623,7 +631,7 @@ std::string RelLogicalUnion::getFieldName(const size_t i) const {
                  dynamic_cast<RelTableFunction const*>(inputs_[0].get())) {
     return input->getFieldName(i);
   }
-  UNREACHABLE() << "Unhandled input type: " << inputs_.front()->toString();
+  UNREACHABLE() << "Unhandled input type: " << ::toString(inputs_.front());
   return {};
 }
 
@@ -1028,7 +1036,8 @@ std::unique_ptr<const RexAgg> parse_aggregate_expr(const rapidjson::Value& expr)
   const auto distinct = json_bool(field(expr, "distinct"));
   const auto agg_ti = parse_type(field(expr, "type"));
   const auto operands = indices_from_json_array(field(expr, "operands"));
-  if (operands.size() > 1 && (operands.size() != 2 || agg != kAPPROX_COUNT_DISTINCT)) {
+  if (operands.size() > 1 && (operands.size() != 2 || (agg != kAPPROX_COUNT_DISTINCT &&
+                                                       agg != kAPPROX_QUANTILE))) {
     throw QueryNotSupported("Multiple arguments for aggregates aren't supported");
   }
   return std::unique_ptr<const RexAgg>(new RexAgg(agg, distinct, agg_ti, operands));
@@ -1065,6 +1074,12 @@ JoinType to_join_type(const std::string& join_type_name) {
   }
   if (join_type_name == "left") {
     return JoinType::LEFT;
+  }
+  if (join_type_name == "semi") {
+    return JoinType::SEMI;
+  }
+  if (join_type_name == "anti") {
+    return JoinType::ANTI;
   }
   throw QueryNotSupported("Join type (" + join_type_name + ") not supported");
 }
@@ -2108,7 +2123,7 @@ int64_t get_int_literal_field(const rapidjson::Value& obj,
   std::unique_ptr<RexLiteral> lit(parse_literal(it->value));
   CHECK_EQ(kDECIMAL, lit->getType());
   CHECK_EQ(unsigned(0), lit->getScale());
-  CHECK_EQ(unsigned(0), lit->getTypeScale());
+  CHECK_EQ(unsigned(0), lit->getTargetScale());
   return lit->getVal<int64_t>();
 }
 
@@ -2697,7 +2712,7 @@ void RelAlgDagBuilder::resetQueryExecutionState() {
 
 // Return tree with depth represented by indentations.
 std::string tree_string(const RelAlgNode* ra, const size_t depth) {
-  std::string result = std::string(2 * depth, ' ') + ra->toString() + '\n';
+  std::string result = std::string(2 * depth, ' ') + ::toString(ra) + '\n';
   for (size_t i = 0; i < ra->inputCount(); ++i) {
     result += tree_string(ra->getInput(i), depth + 1);
   }
@@ -2706,6 +2721,14 @@ std::string tree_string(const RelAlgNode* ra, const size_t depth) {
 
 std::string RexSubQuery::toString() const {
   return cat(::typeName(this), "(", ::toString(ra_.get()), ")");
+}
+
+size_t RexSubQuery::toHash() const {
+  if (!hash_) {
+    hash_ = typeid(RexSubQuery).hash_code();
+    boost::hash_combine(*hash_, ra_->toHash());
+  }
+  return *hash_;
 }
 
 std::string RexInput::toString() const {
@@ -2721,6 +2744,15 @@ std::string RexInput::toString() const {
              ", in_index=",
              std::to_string(getIndex()),
              ")");
+}
+
+size_t RexInput::toHash() const {
+  if (!hash_) {
+    hash_ = typeid(RexInput).hash_code();
+    boost::hash_combine(*hash_, node_->toHash());
+    boost::hash_combine(*hash_, getIndex());
+  }
+  return *hash_;
 }
 
 std::string RelCompound::toString() const {
@@ -2740,4 +2772,27 @@ std::string RelCompound::toString() const {
              ", is_agg=",
              std::to_string(is_agg_),
              ")");
+}
+
+size_t RelCompound::toHash() const {
+  if (!hash_) {
+    hash_ = typeid(RelCompound).hash_code();
+    boost::hash_combine(*hash_,
+                        filter_expr_ ? filter_expr_->toHash() : boost::hash_value("n"));
+    boost::hash_combine(*hash_, is_agg_);
+    for (auto& target_expr : target_exprs_) {
+      if (auto rex_scalar = dynamic_cast<const RexScalar*>(target_expr)) {
+        boost::hash_combine(*hash_, rex_scalar->toHash());
+      }
+    }
+    for (auto& agg_expr : agg_exprs_) {
+      boost::hash_combine(*hash_, agg_expr->toHash());
+    }
+    for (auto& scalar_source : scalar_sources_) {
+      boost::hash_combine(*hash_, scalar_source->toHash());
+    }
+    boost::hash_combine(*hash_, groupby_count_);
+    boost::hash_combine(*hash_, ::toString(fields_));
+  }
+  return *hash_;
 }

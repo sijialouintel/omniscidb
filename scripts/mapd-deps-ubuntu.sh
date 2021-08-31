@@ -6,6 +6,7 @@ set -x
 # Parse inputs
 TSAN=false
 COMPRESS=false
+NOCUDA=false
 
 while (( $# )); do
   case "$1" in
@@ -14,6 +15,9 @@ while (( $# )); do
       ;;
     --tsan)
       TSAN=true
+      ;;
+    --nocuda)
+      NOCUDA=true
       ;;
     *)
       break
@@ -144,8 +148,8 @@ make -j $(nproc)
 make install
 popd
 
-VERS=3.52.14
-CFLAGS="-fPIC" CXXFLAGS="-fPIC" download_make_install https://github.com/openlink/iODBC/releases/download/v${VERS}/libiodbc-${VERS}.tar.gz
+VERS=3.52.15
+CFLAGS="-fPIC" CXXFLAGS="-fPIC" download_make_install ${HTTP_DEPS}/libiodbc-${VERS}.tar.gz
 
 #c-blosc
 VERS=1.14.4

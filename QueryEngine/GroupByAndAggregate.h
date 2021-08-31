@@ -75,11 +75,6 @@ class GroupByAndAggregate {
                const CompilationOptions& co,
                const GpuSharedMemoryContext& gpu_smem_context);
 
-  static void addTransientStringLiterals(
-      const RelAlgExecutionUnit& ra_exe_unit,
-      Executor* executor,
-      std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner);
-
   static size_t shard_count_for_top_groups(const RelAlgExecutionUnit& ra_exe_unit,
                                            const Catalog_Namespace::Catalog& catalog);
 
@@ -105,8 +100,6 @@ class GroupByAndAggregate {
   int64_t getShardedTopBucket(const ColRangeInfo& col_range_info,
                               const size_t shard_count) const;
 
-  void addTransientStringLiterals();
-
   llvm::Value* codegenOutputSlot(llvm::Value* groups_buffer,
                                  const QueryMemoryDescriptor& query_mem_desc,
                                  const CompilationOptions& co,
@@ -116,6 +109,8 @@ class GroupByAndAggregate {
       const QueryMemoryDescriptor& query_mem_desc,
       const CompilationOptions& co,
       DiamondCodegen& codegen);
+
+  llvm::Value* codegenVarlenOutputBuffer(const QueryMemoryDescriptor& query_mem_desc);
 
   std::tuple<llvm::Value*, llvm::Value*> codegenSingleColumnPerfectHash(
       const QueryMemoryDescriptor& query_mem_desc,
@@ -151,6 +146,7 @@ class GroupByAndAggregate {
                                 llvm::Value* target);
 
   bool codegenAggCalls(const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx,
+                       llvm::Value* varlen_output_buffer,
                        const std::vector<llvm::Value*>& agg_out_vec,
                        const QueryMemoryDescriptor& query_mem_desc,
                        const CompilationOptions& co,
@@ -182,11 +178,11 @@ class GroupByAndAggregate {
                             const QueryMemoryDescriptor&,
                             const ExecutorDeviceType);
 
-  void codegenApproxMedian(const size_t target_idx,
-                           const Analyzer::Expr* target_expr,
-                           std::vector<llvm::Value*>& agg_args,
-                           const QueryMemoryDescriptor& query_mem_desc,
-                           const ExecutorDeviceType device_type);
+  void codegenApproxQuantile(const size_t target_idx,
+                             const Analyzer::Expr* target_expr,
+                             std::vector<llvm::Value*>& agg_args,
+                             const QueryMemoryDescriptor& query_mem_desc,
+                             const ExecutorDeviceType device_type);
 
   llvm::Value* getAdditionalLiteral(const int32_t off);
 

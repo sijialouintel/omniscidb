@@ -46,7 +46,7 @@ DataMgr::DataMgr(const std::string& dataDir,
                  const bool useGpus,
                  const size_t reservedGpuMem,
                  const size_t numReaderThreads,
-                 const DiskCacheConfig cache_config)
+                 const File_Namespace::DiskCacheConfig cache_config)
     : cudaMgr_{std::move(cudaMgr)}
     , dataDir_{dataDir}
     , hasGpus_{false}
@@ -162,7 +162,7 @@ size_t DataMgr::getTotalSystemMemory() {
 }
 
 // This function exists for testing purposes so that we can test a reset of the cache.
-void DataMgr::resetPersistentStorage(const DiskCacheConfig& cache_config,
+void DataMgr::resetPersistentStorage(const File_Namespace::DiskCacheConfig& cache_config,
                                      const size_t num_reader_threads,
                                      const SystemParameters& sys_params) {
   int numLevels = bufferMgrs_.size();
@@ -178,7 +178,7 @@ void DataMgr::resetPersistentStorage(const DiskCacheConfig& cache_config,
 
 void DataMgr::populateMgrs(const SystemParameters& system_parameters,
                            const size_t userSpecifiedNumReaderThreads,
-                           const DiskCacheConfig& cache_config) {
+                           const File_Namespace::DiskCacheConfig& cache_config) {
   // no need for locking, as this is only called in the constructor
   bufferMgrs_.resize(2);
   bufferMgrs_[0].push_back(PersistentStorageMgr::createPersistentStorageMgr(
@@ -390,13 +390,19 @@ void DataMgr::clearMemory(const MemoryLevel memLevel) {
       int numGpus = cudaMgr_->getDeviceCount();
       for (int gpuNum = 0; gpuNum < numGpus; ++gpuNum) {
         LOG(INFO) << "clear slabs on gpu " << gpuNum;
-        bufferMgrs_[memLevel][gpuNum]->clearSlabs();
+        auto buffer_mgr_for_gpu =
+            dynamic_cast<Buffer_Namespace::BufferMgr*>(bufferMgrs_[memLevel][gpuNum]);
+        CHECK(buffer_mgr_for_gpu);
+        buffer_mgr_for_gpu->clearSlabs();
       }
     } else {
       LOG(WARNING) << "Unable to clear GPU memory: No GPUs detected";
     }
   } else {
-    bufferMgrs_[memLevel][0]->clearSlabs();
+    auto buffer_mgr_for_cpu =
+        dynamic_cast<Buffer_Namespace::BufferMgr*>(bufferMgrs_[memLevel][0]);
+    CHECK(buffer_mgr_for_cpu);
+    buffer_mgr_for_cpu->clearSlabs();
   }
 }
 

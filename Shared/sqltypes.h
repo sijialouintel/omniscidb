@@ -29,6 +29,7 @@
 #include <cassert>
 #include <ctime>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -139,6 +140,11 @@ inline std::string toString(const SQLTypes& type) {
   return "";
 }
 
+inline std::ostream& operator<<(std::ostream& os, SQLTypes const sql_type) {
+  os << toString(sql_type);
+  return os;
+}
+
 #endif
 
 struct VarlenDatum {
@@ -202,7 +208,7 @@ using ArrayDatum =
     std::conditional_t<is_cuda_compiler(), DeviceArrayDatum, HostArrayDatum>;
 
 union Datum {
-  bool boolval;
+  int8_t boolval;
   int8_t tinyintval;
   int16_t smallintval;
   int32_t intval;
@@ -280,6 +286,15 @@ class SQLTypeInfo {
       , notnull(n)
       , compression(kENCODING_NONE)
       , comp_param(0)
+      , size(get_storage_size()) {}
+  SQLTypeInfo(SQLTypes t, EncodingType c, int p, SQLTypes st)
+      : type(t)
+      , subtype(st)
+      , dimension(0)
+      , scale(0)
+      , notnull(false)
+      , compression(c)
+      , comp_param(p)
       , size(get_storage_size()) {}
   SQLTypeInfo(SQLTypes t, int d, int s) : SQLTypeInfo(t, d, s, false) {}
   SQLTypeInfo(SQLTypes t, bool n)
@@ -525,6 +540,10 @@ class SQLTypeInfo {
 
   inline bool is_dict_encoded_string() const {
     return is_string() && compression == kENCODING_DICT;
+  }
+
+  inline bool is_subtype_dict_encoded_string() const {
+    return IS_STRING(subtype) && compression == kENCODING_DICT;
   }
 
   inline bool is_dict_encoded_type() const {
@@ -782,6 +801,7 @@ class SQLTypeInfo {
             return sizeof(int32_t);
           case kENCODING_FIXED:
           case kENCODING_SPARSE:
+          case kENCODING_GEOINT:
             return comp_param / 8;
           case kENCODING_RL:
           case kENCODING_DIFF:
@@ -940,8 +960,8 @@ using ArrayOffsetT = int32_t;
 inline int8_t* appendDatum(int8_t* buf, Datum d, const SQLTypeInfo& ti) {
   switch (ti.get_type()) {
     case kBOOLEAN:
-      *(bool*)buf = d.boolval;
-      return buf + sizeof(bool);
+      *(int8_t*)buf = d.boolval;
+      return buf + sizeof(int8_t);
     case kNUMERIC:
     case kDECIMAL:
     case kBIGINT:
@@ -981,6 +1001,14 @@ inline auto generate_array_type(const SQLTypes subtype) {
 inline auto generate_column_type(const SQLTypes subtype) {
   auto ti = SQLTypeInfo(kCOLUMN, false);
   ti.set_subtype(subtype);
+  return ti;
+}
+
+inline auto generate_column_type(const SQLTypes subtype, EncodingType c, int p) {
+  auto ti = SQLTypeInfo(kCOLUMN, false);
+  ti.set_subtype(subtype);
+  ti.set_compression(c);
+  ti.set_comp_param(p);
   return ti;
 }
 

@@ -204,6 +204,16 @@ class DBObject {
       , objectPrivs_(privs)
       , ownerId_(owner){};
   DBObject(const DBObject& object);
+  DBObject(const std::string& name,
+           DBObjectType type,
+           DBObjectKey key,
+           AccessPrivileges privs,
+           int32_t owner)
+      : objectName_(name)
+      , objectType_(type)
+      , objectKey_(key)
+      , objectPrivs_(privs)
+      , ownerId_(owner){};
   ~DBObject() {}
 
   void setObjectType(const DBObjectType& objectType);
@@ -229,7 +239,7 @@ class DBObject {
   void loadKey();
   void loadKey(const Catalog_Namespace::Catalog& catalog);
 
-  bool valid() {
+  bool valid() const {
     return (objectType_ != AbstractDBObjectType && objectKey_.permissionType != -1 &&
             objectKey_.dbId != -1);
   }

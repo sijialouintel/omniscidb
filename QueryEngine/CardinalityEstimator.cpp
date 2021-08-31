@@ -34,12 +34,19 @@ size_t ResultSet::getNDVEstimator() const {
   CHECK(dynamic_cast<const Analyzer::NDVEstimator*>(estimator_.get()));
   CHECK(host_estimator_buffer_);
   auto bits_set = bitmap_set_size(host_estimator_buffer_, estimator_->getBufferSize());
+  if (bits_set == 0) {
+    // empty result set, return 1 for a groups buffer size of 1
+    return 1;
+  }
   const auto total_bits = estimator_->getBufferSize() * 8;
   CHECK_LE(bits_set, total_bits);
   const auto unset_bits = total_bits - bits_set;
   const auto ratio = static_cast<double>(unset_bits) / total_bits;
   if (ratio == 0.) {
-    throw std::runtime_error("Failed to get a high quality cardinality estimation");
+    LOG(WARNING)
+        << "Failed to get a high quality cardinality estimation, falling back to "
+           "approximate group by buffer size guess.";
+    return 0;
   }
   return -static_cast<double>(total_bits) * log(ratio);
 }
@@ -65,9 +72,9 @@ size_t RelAlgExecutor::getNDVEstimation(const WorkUnit& work_unit,
                                    false,
                                    column_cache);
     if (!estimator_result) {
-      return 1;
+      return 1;  // empty row set, only needs one slot
     }
-    return std::max(estimator_result->getNDVEstimator(), size_t(1));
+    return estimator_result->getNDVEstimator();
   } catch (const QueryExecutionError& e) {
     if (e.getErrorCode() == Executor::ERR_OUT_OF_TIME) {
       throw std::runtime_error("Cardinality estimation query ran out of time");
@@ -79,11 +86,13 @@ size_t RelAlgExecutor::getNDVEstimation(const WorkUnit& work_unit,
                              getErrorMessageFromCode(e.getErrorCode()));
   }
   UNREACHABLE();
-  return 1;
+  return 0;
 }
 
 RelAlgExecutionUnit create_ndv_execution_unit(const RelAlgExecutionUnit& ra_exe_unit,
                                               const int64_t range) {
+  const bool use_large_estimator =
+      range > g_large_ndv_threshold || ra_exe_unit.groupby_exprs.size() > 1;
   return {ra_exe_unit.input_descs,
           ra_exe_unit.input_col_descs,
           ra_exe_unit.simple_quals,
@@ -91,12 +100,14 @@ RelAlgExecutionUnit create_ndv_execution_unit(const RelAlgExecutionUnit& ra_exe_
           ra_exe_unit.join_quals,
           {},
           {},
-          range > g_large_ndv_threshold
+          use_large_estimator
               ? makeExpr<Analyzer::LargeNDVEstimator>(ra_exe_unit.groupby_exprs)
               : makeExpr<Analyzer::NDVEstimator>(ra_exe_unit.groupby_exprs),
           SortInfo{{}, SortAlgorithm::Default, 0, 0},
           0,
           ra_exe_unit.query_hint,
+          ra_exe_unit.query_plan_dag,
+          ra_exe_unit.hash_table_build_plan_dag,
           false,
           ra_exe_unit.union_all,
           ra_exe_unit.query_state};
@@ -116,6 +127,8 @@ RelAlgExecutionUnit create_count_all_execution_unit(
           SortInfo{{}, SortAlgorithm::Default, 0, 0},
           0,
           ra_exe_unit.query_hint,
+          ra_exe_unit.query_plan_dag,
+          ra_exe_unit.hash_table_build_plan_dag,
           false,
           ra_exe_unit.union_all,
           ra_exe_unit.query_state};

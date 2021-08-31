@@ -183,7 +183,7 @@ TEST_F(LowerFunctionTest, MixedFilters) {
 TEST_F(LowerFunctionTest, LowercaseGroupBy) {
   auto result_set =
       sql("select lower(first_name), count(*) from lower_function_test_people "
-          "group by lower(first_name);");
+          "group by lower(first_name) order by 2 desc;");
   std::vector<std::vector<ScalarTargetValue>> expected_result_set{{"john", int64_t(3)},
                                                                   {"sue", int64_t(1)}};
   compare_result_set(expected_result_set, result_set);
@@ -207,28 +207,6 @@ TEST_F(LowerFunctionTest, SelectLowercaseLiteral) {
       sql("select first_name, lower('SMiTH') from lower_function_test_people;");
   std::vector<std::vector<ScalarTargetValue>> expected_result_set{
       {"JOHN", "smith"}, {"John", "smith"}, {"JOHN", "smith"}, {"Sue", "smith"}};
-  compare_result_set(expected_result_set, result_set);
-}
-
-TEST_F(LowerFunctionTest, InsertIntoSelectLowercase_SameTable) {
-  auto result_set = multi_sql(R"(
-    insert into lower_function_test_people (first_name, last_name, age, country_code)
-    (select first_name, last_name, age, lower(country_code) from lower_function_test_people where first_name = 'Sue');
-    select first_name, last_name, country_code from lower_function_test_people where first_name = 'Sue';
-  )");
-  std::vector<std::vector<ScalarTargetValue>> expected_result_set{{"Sue", "Smith", "CA"},
-                                                                  {"Sue", "Smith", "ca"}};
-  compare_result_set(expected_result_set, result_set);
-}
-
-TEST_F(LowerFunctionTest, InsertIntoSelectLowercase_DifferentTables) {
-  auto result_set = multi_sql(R"(
-    insert into lower_function_test_people (first_name, last_name, age, country_code)
-    (select lower(name), capital, 100, code from lower_function_test_countries where code = 'US');
-    select first_name, last_name, country_code from lower_function_test_people where first_name = 'united states';
-  )");
-  std::vector<std::vector<ScalarTargetValue>> expected_result_set{
-      {"united states", "Washington", "US"}};
   compare_result_set(expected_result_set, result_set);
 }
 

@@ -174,6 +174,7 @@ class HashJoin {
       const std::shared_ptr<Analyzer::BinOper> qual_bin_oper,
       const std::vector<InputTableInfo>& query_infos,
       const Data_Namespace::MemoryLevel memory_level,
+      const JoinType join_type,
       const HashType preferred_hash_type,
       const int device_count,
       ColumnCacheMap& column_cache,
@@ -210,6 +211,19 @@ class HashJoin {
   static void checkHashJoinReplicationConstraint(const int table_id,
                                                  const size_t shard_count,
                                                  const Executor* executor);
+
+  // Swap the columns if needed and make the inner column the first component.
+  static InnerOuter normalizeColumnPair(const Analyzer::Expr* lhs,
+                                        const Analyzer::Expr* rhs,
+                                        const Catalog_Namespace::Catalog& cat,
+                                        const TemporaryTables* temporary_tables,
+                                        const bool is_overlaps_join = false);
+
+  // Normalize each expression tuple
+  static std::vector<InnerOuter> normalizeColumnPairs(
+      const Analyzer::BinOper* condition,
+      const Catalog_Namespace::Catalog& cat,
+      const TemporaryTables* temporary_tables);
 
   HashTable* getHashTableForDevice(const size_t device_id) const {
     CHECK_LT(device_id, hash_tables_for_device_.size());
@@ -283,15 +297,3 @@ size_t get_shard_count(const Analyzer::BinOper* join_condition, const Executor* 
 size_t get_shard_count(
     std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*> equi_pair,
     const Executor* executor);
-
-// Swap the columns if needed and make the inner column the first component.
-InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
-                                 const Analyzer::Expr* rhs,
-                                 const Catalog_Namespace::Catalog& cat,
-                                 const TemporaryTables* temporary_tables,
-                                 const bool is_overlaps_join = false);
-
-// Normalize each expression tuple
-std::vector<InnerOuter> normalize_column_pairs(const Analyzer::BinOper* condition,
-                                               const Catalog_Namespace::Catalog& cat,
-                                               const TemporaryTables* temporary_tables);

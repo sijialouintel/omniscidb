@@ -464,6 +464,8 @@ class TypedImportBuffer : boost::noncopyable {
 
   void add_value(const ColumnDescriptor* cd, const TDatum& val, const bool is_null);
 
+  void addDefaultValues(const ColumnDescriptor* cd, size_t num_rows);
+
   void pop_value();
 
   template <typename DATA_TYPE>
@@ -737,25 +739,8 @@ class Detector : public DataStreamSink {
 class ImporterUtils {
  public:
   static ArrayDatum composeNullArray(const SQLTypeInfo& ti);
-};
-
-class RenderGroupAnalyzer {
- public:
-  RenderGroupAnalyzer() : _rtree(std::make_unique<RTree>()), _numRenderGroups(0) {}
-  void seedFromExistingTableContents(Catalog_Namespace::Catalog& cat,
-                                     const std::string& tableName,
-                                     const std::string& geoColumnBaseName);
-  int insertBoundsAndReturnRenderGroup(const std::vector<double>& bounds);
-
- private:
-  using Point = boost::geometry::model::point<double, 2, boost::geometry::cs::cartesian>;
-  using BoundingBox = boost::geometry::model::box<Point>;
-  using Node = std::pair<BoundingBox, int>;
-  using RTree =
-      boost::geometry::index::rtree<Node, boost::geometry::index::quadratic<16>>;
-  std::unique_ptr<RTree> _rtree;
-  std::mutex _rtreeMutex;
-  int _numRenderGroups;
+  static ArrayDatum composeNullPointCoords(const SQLTypeInfo& coords_ti,
+                                           const SQLTypeInfo& geo_ti);
 };
 
 class Importer : public DataStreamSink {

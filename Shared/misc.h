@@ -18,9 +18,11 @@
 #define SHARED_MISC_H
 
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <iterator>
 #include <list>
+#include <map>
 #include <set>
 #include <unordered_set>
 #include <vector>
@@ -39,9 +41,30 @@ constexpr std::array<T, sizeof...(Indices)> powersOfImpl(
   return {power(a, static_cast<T>(Indices))...};
 }
 
+template <size_t... Indices>
+constexpr std::array<double, sizeof...(Indices)> inversePowersOfImpl(
+    double const a,
+    std::index_sequence<Indices...>) {
+  return {(1.0 / power(a, static_cast<double>(Indices)))...};
+}
+
 }  // namespace
 
 namespace shared {
+
+template <typename K, typename V>
+V& get_from_map(std::map<K, V>& map, const K& key) {
+  auto find_it = map.find(key);
+  CHECK(find_it != map.end());
+  return find_it->second;
+}
+
+template <typename K, typename V>
+const V& get_from_map(const std::map<K, V>& map, const K& key) {
+  auto find_it = map.find(key);
+  CHECK(find_it != map.end());
+  return find_it->second;
+}
 
 // source is destructively appended to the back of destination.
 // source.empty() is true after call. Return number of elements appended.
@@ -168,20 +191,24 @@ inline bool contains(const T& container, const U& element) {
   }
 }
 
-// Return constexpr std::array<T, N> of {1, 10, 100, 1000, ..., 10^(N-1)}.
+// Return constexpr std::array<T, N> of {1, a, a^2, a^3, ..., a^(N-1)}.
 template <typename T, size_t N>
 constexpr std::array<T, N> powersOf(T const a) {
   return powersOfImpl<T>(a, std::make_index_sequence<N>{});
 }
 
+// Return constexpr std::array<double, N> of {1, 1/a, 1/a^2, 1/a^3, ..., 1/a^(N-1)}.
+template <size_t N>
+constexpr std::array<double, N> inversePowersOf(double const a) {
+  return inversePowersOfImpl(a, std::make_index_sequence<N>{});
+}
+
 // May be constexpr in C++20.
 template <typename TO, typename FROM>
-TO reinterpretBits(FROM const from) {
-  union {
-    FROM const from;
-    TO const to;
-  } const u{.from = from};
-  return u.to;
+inline TO reinterpret_bits(FROM const from) {
+  TO to{0};
+  memcpy(&to, &from, sizeof(TO) < sizeof(FROM) ? sizeof(TO) : sizeof(FROM));
+  return to;
 }
 
 }  // namespace shared

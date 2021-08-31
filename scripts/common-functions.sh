@@ -11,6 +11,11 @@ elif [ "$TSAN" = "false" ]; then
   TBB_TSAN=""
 fi
 
+ARROW_USE_CUDA="-DARROW_CUDA=ON"
+if [ "$NOCUDA" = "true" ]; then
+  ARROW_USE_CUDA="-DARROW_CUDA=OFF"
+fi
+
 function download() {
     wget --continue "$1"
 }
@@ -69,16 +74,12 @@ function install_cmake() {
   CXXFLAGS="-pthread" CFLAGS="-pthread" download_make_install ${HTTP_DEPS}/cmake-${CMAKE_VERSION}.tar.gz
 }
 
-ARROW_VERSION=apache-arrow-2.0.0
+ARROW_VERSION=apache-arrow-3.0.0
 
 function install_arrow() {
   download https://github.com/apache/arrow/archive/$ARROW_VERSION.tar.gz
   extract $ARROW_VERSION.tar.gz
-
-  pushd arrow-$ARROW_VERSION
-  patch -p1 < ${SCRIPTS_DIR}/ARROW-10651-fix-alloc-dealloc-mismatch.patch
-  popd
-
+  
   mkdir -p arrow-$ARROW_VERSION/cpp/build
   pushd arrow-$ARROW_VERSION/cpp/build
   cmake \
@@ -100,8 +101,8 @@ function install_arrow() {
     -DARROW_PARQUET=ON \
     -DARROW_FILESYSTEM=ON \
     -DARROW_S3=ON \
-    -DARROW_CUDA=ON \
     -DTHRIFT_HOME=${THRIFT_HOME:-$PREFIX} \
+    ${ARROW_USE_CUDA} \
     ${ARROW_TSAN} \
     ..
   makej
@@ -207,10 +208,13 @@ function install_llvm() {
     popd
 }
 
-PROJ_VERSION=5.2.0
-GDAL_VERSION=2.4.2
+PROJ_VERSION=7.2.1
+GDAL_VERSION=3.2.2
 
 function install_gdal() {
+    # sqlite3
+    download_make_install https://sqlite.org/2021/sqlite-autoconf-3350500.tar.gz
+
     # expat
     download_make_install https://github.com/libexpat/libexpat/releases/download/R_2_2_5/expat-2.2.5.tar.bz2
 
@@ -225,10 +229,10 @@ function install_gdal() {
     popd
 
     # proj
-    download_make_install ${HTTP_DEPS}/proj-${PROJ_VERSION}.tar.gz
+    download_make_install ${HTTP_DEPS}/proj-${PROJ_VERSION}.tar.gz "" "--disable-tiff"
 
     # gdal
-    download_make_install ${HTTP_DEPS}/gdal-${GDAL_VERSION}.tar.gz "" "--without-geos --with-libkml=$PREFIX --with-proj=$PREFIX"
+    download_make_install ${HTTP_DEPS}/gdal-${GDAL_VERSION}.tar.gz "" "--without-geos --with-libkml=$PREFIX --with-proj=$PREFIX --with-libtiff=internal --with-libgeotiff=internal"
 }
 
 GEOS_VERSION=3.8.1

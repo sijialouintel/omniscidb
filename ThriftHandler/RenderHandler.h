@@ -89,7 +89,8 @@ class RenderHandler {
   void clear_gpu_memory();
   void clear_cpu_memory();
 
-  QueryRenderer::QueryRenderManager* get_render_manager();
+  std::string get_renderer_status_json() const;
+  bool validate_renderer_status_json(const std::string& other_renderer_status_json) const;
 
   void shutdown();
 

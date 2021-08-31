@@ -9,7 +9,7 @@ import org.apache.calcite.sql.parser.SqlParserPos;
 
 import java.util.List;
 
-public class SqlShowTableDetails extends SqlShowCommand {
+public class SqlShowTableDetails extends SqlCustomDdl {
   private static final SqlOperator OPERATOR =
           new SqlSpecialOperator("SHOW_TABLE_DETAILS", SqlKind.OTHER_DDL);
 

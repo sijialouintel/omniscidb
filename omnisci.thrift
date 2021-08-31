@@ -69,6 +69,7 @@ struct TColumnType {
   5: bool is_system;
   6: bool is_physical;
   7: i64 col_id;
+  8: optional string default_value;
 }
 
 struct TRow {
@@ -191,6 +192,7 @@ struct TCopyParams {
   23: bool geo_assign_render_groups=true;
   24: bool geo_explode_collections=false;
   25: i32 source_srid=0;
+  26: string s3_session_token;
 }
 
 struct TCreateParams {
@@ -226,6 +228,7 @@ struct TServerStatus {
   6: string host_name;
   7: bool poly_rendering_enabled;
   8: TRole role;
+  9: string renderer_status_json;
 }
 
 struct TPixel {
@@ -550,11 +553,14 @@ service OmniSci {
   list<TServerStatus> get_status(1: TSessionId session) throws (1: TOmniSciException e)
   TClusterHardwareInfo get_hardware_info(1: TSessionId session) throws (1: TOmniSciException e)
   list<string> get_tables(1: TSessionId session) throws (1: TOmniSciException e)
+  list<string> get_tables_for_database(1: TSessionId session, 2: string database_name) throws (1: TOmniSciException e)
   list<string> get_physical_tables(1: TSessionId session) throws (1: TOmniSciException e)
   list<string> get_views(1: TSessionId session) throws (1: TOmniSciException e)
   list<TTableMeta> get_tables_meta(1: TSessionId session) throws (1: TOmniSciException e)
   TTableDetails get_table_details(1: TSessionId session, 2: string table_name) throws (1: TOmniSciException e)
+  TTableDetails get_table_details_for_database(1: TSessionId session, 2: string table_name, 3: string database_name) throws (1: TOmniSciException e)
   TTableDetails get_internal_table_details(1: TSessionId session, 2: string table_name) throws (1: TOmniSciException e)
+  TTableDetails get_internal_table_details_for_database(1: TSessionId session, 2: string table_name, 3: string database_name) throws (1: TOmniSciException e)
   list<string> get_users(1: TSessionId session) throws (1: TOmniSciException e)
   list<TDBInfo> get_databases(1: TSessionId session) throws (1: TOmniSciException e)
   string get_version() throws (1: TOmniSciException e)
@@ -564,8 +570,8 @@ service OmniSci {
   list<TNodeMemoryInfo> get_memory(1: TSessionId session, 2: string memory_level) throws (1: TOmniSciException e)
   void clear_cpu_memory(1: TSessionId session) throws (1: TOmniSciException e)
   void clear_gpu_memory(1: TSessionId session) throws (1: TOmniSciException e)
-  void set_cur_session(1: TSessionId parent_session, 2: TSessionId leaf_session, 3: string start_time_str, 4: string label) throws (1: TOmniSciException e)
-  void invalidate_cur_session(1: TSessionId parent_session, 2: TSessionId leaf_session, 3: string start_time_str, 4: string label) throws (1: TOmniSciException e)
+  void set_cur_session(1: TSessionId parent_session, 2: TSessionId leaf_session, 3: string start_time_str, 4: string label, 5: bool for_running_query_kernel) throws (1: TOmniSciException e)
+  void invalidate_cur_session(1: TSessionId parent_session, 2: TSessionId leaf_session, 3: string start_time_str, 4: string label, 5: bool for_running_query_kernel) throws (1: TOmniSciException e)
   void set_table_epoch (1: TSessionId session, 2: i32 db_id, 3: i32 table_id, 4: i32 new_epoch) throws (1: TOmniSciException e)
   void set_table_epoch_by_name (1: TSessionId session, 2: string table_name, 3: i32 new_epoch) throws (1: TOmniSciException e)
   i32 get_table_epoch (1: TSessionId session, 2: i32 db_id, 3: i32 table_id)

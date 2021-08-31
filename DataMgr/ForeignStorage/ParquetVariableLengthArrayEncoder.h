@@ -35,12 +35,11 @@ class ParquetVariableLengthArrayEncoder : public ParquetArrayEncoder {
                   const int16_t* rep_levels,
                   const int64_t values_read,
                   const int64_t levels_read,
-                  const bool is_last_batch,
                   int8_t* values) override {
     CHECK(levels_read > 0);
     setFirstOffsetForBuffer(def_levels[0]);
     ParquetArrayEncoder::appendData(
-        def_levels, rep_levels, values_read, levels_read, is_last_batch, values);
+        def_levels, rep_levels, values_read, levels_read, values);
   }
 
  protected:
@@ -56,7 +55,8 @@ class ParquetVariableLengthArrayEncoder : public ParquetArrayEncoder {
  private:
   void setFirstOffsetForBuffer(const int16_t def_level) {
     if (data_buffer_bytes_.size() == 0 && buffer_->size() == 0) {  // first  element
-      if (def_level == ParquetArrayEncoder::list_null_def_level) {
+      if (def_level == ParquetArrayEncoder::list_null_def_level ||
+          def_level == ParquetArrayEncoder::empty_list_def_level) {
         // OmniSci variable array types have a special encoding for chunks in
         // which the first array is null: the first `DEFAULT_NULL_PADDING_SIZE`
         // bytes of the chunk are filled and the offset is set appropriately.
@@ -74,12 +74,14 @@ class ParquetVariableLengthArrayEncoder : public ParquetArrayEncoder {
 
   void appendLastArrayOffset() {
     int64_t last_offset = buffer_->size() + data_buffer_bytes_.size();
-    if (!isLastArrayNull()) {
-      // append array data offset
-      offsets_.push_back(last_offset);
-    } else {
+    if (isLastArrayNull()) {
       // append a null array offset
       offsets_.push_back(-last_offset);
+    } else if (isLastArrayEmpty()) {
+      offsets_.push_back(last_offset);
+    } else {
+      // append array data offset
+      offsets_.push_back(last_offset);
     }
   }
 

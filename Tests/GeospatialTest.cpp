@@ -16,6 +16,7 @@
 
 #include "TestHelpers.h"
 
+#include "../QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
 #include "../QueryRunner/QueryRunner.h"
 #include "../Shared/scope.h"
 
@@ -32,6 +33,8 @@ bool g_hoist_literals{true};
 extern size_t g_leaf_count;
 extern bool g_cluster;
 extern bool g_is_test_env;
+extern bool g_allow_cpu_retry;
+extern bool g_allow_query_step_cpu_retry;
 
 using QR = QueryRunner::QueryRunner;
 using namespace TestHelpers;
@@ -51,6 +54,12 @@ bool skip_tests(const ExecutorDeviceType device_type) {
     continue;                                                \
   }
 
+#define SKIP_ALL_ON_AGGREGATOR()                         \
+  if (g_aggregator) {                                    \
+    LOG(ERROR) << "Tests not valid in distributed mode"; \
+    return;                                              \
+  }
+
 #define SKIP_ON_AGGREGATOR(EXP) \
   if (!g_aggregator) {          \
     EXP;                        \
@@ -63,65 +72,14 @@ bool skip_tests(const ExecutorDeviceType device_type) {
     EXPECT_ANY_THROW(EXP);       \
   }
 
+#define EXPECT_GPU_THROW(EXP) \
+  if (skip_tests(dt)) {       \
+    EXPECT_ANY_THROW(EXP);    \
+  }
 namespace {
 
 inline void run_ddl_statement(const std::string& create_table_stmt) {
   QR::get()->runDDLStatement(create_table_stmt);
-}
-
-struct ShardInfo {
-  const std::string shard_col;
-  const size_t shard_count;
-};
-
-struct SharedDictionaryInfo {
-  const std::string col;
-  const std::string ref_table;
-  const std::string ref_col;
-};
-
-std::string build_create_table_statement(
-    const std::string& columns_definition,
-    const std::string& table_name,
-    const ShardInfo& shard_info,
-    const std::vector<SharedDictionaryInfo>& shared_dict_info,
-    const size_t fragment_size,
-    const bool use_temporary_tables,
-    const bool delete_support = true,
-    const bool replicated = false) {
-  const std::string shard_key_def{
-      shard_info.shard_col.empty() ? "" : ", SHARD KEY (" + shard_info.shard_col + ")"};
-
-  std::vector<std::string> shared_dict_def;
-  if (shared_dict_info.size() > 0) {
-    for (size_t idx = 0; idx < shared_dict_info.size(); ++idx) {
-      shared_dict_def.push_back(", SHARED DICTIONARY (" + shared_dict_info[idx].col +
-                                ") REFERENCES " + shared_dict_info[idx].ref_table + "(" +
-                                shared_dict_info[idx].ref_col + ")");
-    }
-  }
-
-  std::ostringstream with_statement_assembly;
-  if (!shard_info.shard_col.empty()) {
-    with_statement_assembly << "shard_count=" << shard_info.shard_count << ", ";
-  }
-  with_statement_assembly << "fragment_size=" << fragment_size;
-
-  if (delete_support) {
-    with_statement_assembly << ", vacuum='delayed'";
-  } else {
-    with_statement_assembly << ", vacuum='immediate'";
-  }
-
-  const std::string replicated_def{
-      (!replicated || !shard_info.shard_col.empty()) ? "" : ", PARTITIONS='REPLICATED' "};
-
-  const std::string create_def{use_temporary_tables ? "CREATE TEMPORARY TABLE "
-                                                    : "CREATE TABLE "};
-
-  return create_def + table_name + "(" + columns_definition + shard_key_def +
-         boost::algorithm::join(shared_dict_def, "") + ") WITH (" +
-         with_statement_assembly.str() + replicated_def + ");";
 }
 
 std::shared_ptr<ResultSet> run_multiple_agg(const std::string& query_str,
@@ -164,10 +122,7 @@ void import_geospatial_test(const bool use_temporary_tables) {
   const std::string geospatial_test("DROP TABLE IF EXISTS geospatial_test;");
   run_ddl_statement(geospatial_test);
   const auto create_ddl = build_create_table_statement(
-      "id INT, p POINT, l LINESTRING, poly POLYGON, mpoly MULTIPOLYGON, gp "
-      "GEOMETRY(POINT), gp4326 GEOMETRY(POINT,4326) ENCODING COMPRESSED(32), gp4326none "
-      "GEOMETRY(POINT,4326) ENCODING NONE, gp900913 GEOMETRY(POINT,900913), gl4326none "
-      "GEOMETRY(LINESTRING,4326) ENCODING NONE, gpoly4326 GEOMETRY(POLYGON,4326)",
+      R"(id INT, p POINT, l LINESTRING, poly POLYGON, mpoly MULTIPOLYGON, gp GEOMETRY(POINT), gp4326 GEOMETRY(POINT,4326) ENCODING COMPRESSED(32), gp4326none GEOMETRY(POINT,4326) ENCODING NONE, gp900913 GEOMETRY(POINT,900913), gl4326none GEOMETRY(LINESTRING,4326) ENCODING NONE, gpoly4326 GEOMETRY(POLYGON,4326), gpoly900913 GEOMETRY(POLYGON,900913))",
       "geospatial_test",
       {"", 0},
       {},
@@ -200,6 +155,7 @@ void import_geospatial_test(const bool use_temporary_tables) {
                          point,
                          point,
                          linestring,
+                         poly,
                          poly),
                      ExecutorDeviceType::CPU);
   }
@@ -413,7 +369,7 @@ TEST_P(GeoSpatialTestTablesFixture, Basics) {
       const auto rows =
           run_multiple_agg("SELECT * FROM geospatial_test WHERE id = 1", dt);
       const auto row = rows->getNextRow(false, false);
-      ASSERT_EQ(row.size(), size_t(11));
+      ASSERT_EQ(row.size(), size_t(12));
     }
 
     // Projection (return GeoTargetValue)
@@ -597,27 +553,6 @@ TEST_P(GeoSpatialTestTablesFixture, Basics) {
                                    "ST_Distance(ST_GeomFromText('POINT(0 0)'), p) < 1;",
                                    dt,
                                    false))));
-    ASSERT_EQ(
-        "POINT (2 2)",
-        boost::get<std::string>(v<NullableString>(run_simple_agg(
-            "SELECT ST_GeomFromText('POINT(2 2)') FROM geospatial_test WHERE id = 2;",
-            dt,
-            false))));
-    ASSERT_EQ(
-        "POINT (2 2)",
-        boost::get<std::string>(v<NullableString>(run_simple_agg(
-            "SELECT ST_Point(2,2) FROM geospatial_test WHERE id = 2;", dt, false))));
-    // requires punt to CPU
-    SKIP_ON_AGGREGATOR(ASSERT_EQ(
-        "POINT (2 2)",
-        boost::get<std::string>(v<NullableString>(run_simple_agg(
-            "SELECT ST_Point(id,id) FROM geospatial_test WHERE id = 2;", dt, false)))));
-    SKIP_ON_AGGREGATOR(ASSERT_EQ(
-        "POINT (2 2)",
-        boost::get<std::string>(v<NullableString>(run_simple_agg(
-            "SELECT ST_SetSRID(ST_Point(id,id),4326) FROM geospatial_test WHERE id = 2;",
-            dt,
-            false)))));
 
     // more distance
     ASSERT_NEAR(
@@ -883,6 +818,11 @@ TEST_P(GeoSpatialTestTablesFixture, Basics) {
         v<int64_t>(run_simple_agg(
             R"(SELECT COUNT(*) FROM geospatial_test WHERE ST_Distance(ST_Transform(ST_GeomFromText('POINT(0 0)', 4326), 900913), ST_Transform(gp4326, 900913)) < 500000.0;)",
             dt)));
+    ASSERT_DOUBLE_EQ(
+        static_cast<double>(111319.4841946785),
+        v<double>(run_simple_agg(
+            R"(SELECT conv_4326_900913_x(ST_X(gp4326)) FROM geospatial_test WHERE id = 1;)",
+            dt)));
 
     // ST_NRings
     ASSERT_EQ(static_cast<int64_t>(1),
@@ -944,10 +884,208 @@ TEST_P(GeoSpatialTestTablesFixture, Basics) {
             R"(SELECT COUNT(*) FROM geospatial_test WHERE ST_Contains(poly, ST_Point(0.1 + ST_NRings(poly)/10.0, 0.1));)",
             dt)));
 
+    // perimeter and area
+    EXPECT_ANY_THROW(run_simple_agg(
+        R"(SELECT ST_Perimeter(p) FROM geospatial_test WHERE id = 4;)", dt));
+    EXPECT_ANY_THROW(run_simple_agg(
+        R"(SELECT ST_Perimeter(l) FROM geospatial_test WHERE id = 4;)", dt));
+    ASSERT_NEAR(
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Perimeter(poly) FROM geospatial_test WHERE id = 4;)", dt)),
+        double(17.071067811865476),
+        double(10e-5));
+    ASSERT_NEAR(
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Perimeter(mpoly) FROM geospatial_test WHERE id = 4;)", dt)),
+        double(17.071067811865476),
+        double(10e-5));
+    ASSERT_NEAR(
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Perimeter(gpoly4326) FROM geospatial_test WHERE id = 4;)", dt)),
+        double(17.07106773237212),
+        double(10e-5));
+
+    EXPECT_ANY_THROW(
+        run_simple_agg(R"(SELECT ST_Area(p) FROM geospatial_test WHERE id = 4;)", dt));
+    EXPECT_ANY_THROW(
+        run_simple_agg(R"(SELECT ST_Area(l) FROM geospatial_test WHERE id = 4;)", dt));
+    ASSERT_NEAR(v<double>(run_simple_agg(
+                    R"(SELECT ST_Area(poly) FROM geospatial_test WHERE id = 4;)", dt)),
+                double(12.5),
+                double(10e-5));
+    ASSERT_NEAR(v<double>(run_simple_agg(
+                    R"(SELECT ST_Area(mpoly) FROM geospatial_test WHERE id = 4;)", dt)),
+                double(12.5),
+                double(10e-5));
+    ASSERT_NEAR(
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(gpoly4326) FROM geospatial_test WHERE id = 4;)", dt)),
+        double(12.5),
+        double(10e-5));
+
     // order by (unsupported)
     EXPECT_ANY_THROW(run_multiple_agg("SELECT p FROM geospatial_test ORDER BY p;", dt));
     EXPECT_ANY_THROW(run_multiple_agg(
         "SELECT poly, l, id FROM geospatial_test ORDER BY id, poly;", dt));
+  }
+}
+
+TEST_P(GeoSpatialTestTablesFixture, Constructors) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    {
+      auto rows = run_multiple_agg(
+          R"(SELECT ST_Point(id, id), id, ST_Point(id + 1, id + 2) FROM geospatial_test WHERE id < 2 ORDER BY 2;)",
+          dt);
+      rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
+      EXPECT_EQ(rows->rowCount(), size_t(2));
+
+      auto process_row = [&](const int64_t id_for_row) {
+        auto row = rows->getNextRow(false, false);
+        EXPECT_EQ(row.size(), size_t(3));
+        const auto id = v<int64_t>(row[1]);
+        EXPECT_EQ(id, id_for_row);
+        const auto first_geo_tv = boost::get<GeoTargetValue>(row[0]);
+        CHECK(first_geo_tv);
+        const auto first_pt = boost::get<GeoPointTargetValue>(*first_geo_tv);
+        CHECK(first_pt.coords->data());
+        const double* first_pt_array = first_pt.coords->data();
+        EXPECT_EQ(first_pt_array[0], static_cast<double>(id));
+        EXPECT_EQ(first_pt_array[1], static_cast<double>(id));
+
+        const auto second_geo_tv = boost::get<GeoTargetValue>(row[2]);
+        CHECK(second_geo_tv);
+        const auto second_pt = boost::get<GeoPointTargetValue>(*second_geo_tv);
+        CHECK(second_pt.coords->data());
+        const double* second_pt_array = second_pt.coords->data();
+        EXPECT_EQ(second_pt_array[0], static_cast<double>(id + 1));
+        EXPECT_EQ(second_pt_array[1], static_cast<double>(id + 2));
+      };
+
+      process_row(0);
+      process_row(1);
+    }
+
+    {
+      // multi-frag iteration check
+      auto rows = run_multiple_agg(
+          R"(SELECT id, ST_Point(id, id) FROM geospatial_test WHERE id > 2 ORDER BY 1;)",
+          dt);
+      rows->setGeoReturnType(ResultSet::GeoReturnType::WktString);
+      EXPECT_EQ(rows->rowCount(), size_t(7));
+
+      auto process_row = [&](const int64_t id_for_row) {
+        auto row = rows->getNextRow(false, false);
+        EXPECT_EQ(row.size(), size_t(2));
+        const auto id = v<int64_t>(row[0]);
+        EXPECT_EQ(id, id_for_row + 3);  // offset by 3 from filter
+        const auto wkt_str = boost::get<std::string>(v<NullableString>(row[1]));
+        EXPECT_EQ(wkt_str,
+                  "POINT (" + std::to_string(id) + " " + std::to_string(id) + ")");
+      };
+      for (size_t i = 0; i < 7; i++) {
+        process_row(i);
+      }
+    }
+
+    EXPECT_EQ(
+        "POINT (2 2)",
+        boost::get<std::string>(v<NullableString>(run_simple_agg(
+            "SELECT ST_Point(id,id) FROM geospatial_test WHERE id = 2;", dt, false))));
+    EXPECT_EQ(
+        "POINT (2 2)",
+        boost::get<std::string>(v<NullableString>(run_simple_agg(
+            "SELECT ST_SetSRID(ST_Point(id,id),4326) FROM geospatial_test WHERE id = 2;",
+            dt,
+            false))));
+    EXPECT_EQ(
+        double(2),
+        v<double>(run_simple_agg(
+            "SELECT ST_X(ST_Point(id, id)) FROM geospatial_test WHERE id = 2;", dt)));
+    EXPECT_EQ(
+        double(3),
+        v<double>(run_simple_agg(
+            "SELECT ST_Y(ST_Point(id, id + 1)) FROM geospatial_test WHERE id = 2;", dt)));
+    EXPECT_EQ(
+        inline_fp_null_value<double>(),
+        v<double>(run_simple_agg(
+            "SELECT ST_Y(ST_Point(id, null)) FROM geospatial_test WHERE id = 2;", dt)));
+    EXPECT_EQ(
+        "POINT (222638.981556 222684.208469473)",
+        boost::get<std::string>(v<NullableString>(run_simple_agg(
+            R"(SELECT ST_Transform(ST_SetSRID(ST_Point(id,id),4326), 900913) FROM geospatial_test WHERE id = 2;)",
+            dt,
+            false))));
+    EXPECT_EQ(
+        "POINT (222638.977720049 222684.204631182)",
+        boost::get<std::string>(v<NullableString>(run_simple_agg(
+            R"(SELECT ST_Transform(gp4326, 900913) FROM geospatial_test WHERE id = 2;)",
+            dt,
+            false))));
+    SKIP_ON_AGGREGATOR({
+      // ensure transforms run on GPU. transforms use math functions which need to be
+      // specialized for GPU
+      if (dt == ExecutorDeviceType::GPU) {
+        const auto query_explain_result = QR::get()->runSelectQuery(
+            R"(SELECT ST_Transform(gp4326, 900913) FROM geospatial_test WHERE id = 2;)",
+            dt,
+            /*hoist_literals=*/true,
+            /*allow_loop_joins=*/false,
+            /*just_explain=*/true);
+        const auto explain_result = query_explain_result->getRows();
+        EXPECT_EQ(size_t(1), explain_result->rowCount());
+        const auto crt_row = explain_result->getNextRow(true, true);
+        EXPECT_EQ(size_t(1), crt_row.size());
+        const auto explain_str = boost::get<std::string>(v<NullableString>(crt_row[0]));
+        EXPECT_FALSE(explain_str.find("IR for the GPU:") == std::string::npos);
+      }
+    });
+    EXPECT_DOUBLE_EQ(
+        double(222638.977720049),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_X(ST_Transform(gp4326, 900913)) FROM geospatial_test WHERE id = 2;)",
+            dt,
+            false)));
+    EXPECT_DOUBLE_EQ(
+        double(1.796630568489136e-05),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_X(ST_Transform(gp900913, 4326)) FROM geospatial_test WHERE id = 2;)",
+            dt,
+            false)));
+    EXPECT_DOUBLE_EQ(
+        double(1.796630569117497e-05),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Y(ST_Transform(gp900913, 4326)) FROM geospatial_test WHERE id = 2;)",
+            dt,
+            false)));
+    EXPECT_EQ(
+        "POINT (0.000017966305685 0.000017966305691)",
+        boost::get<std::string>(v<NullableString>(run_simple_agg(
+            R"(SELECT ST_Transform(gp900913, 4326) FROM geospatial_test WHERE id = 2;)",
+            dt,
+            false))));
+    SKIP_ON_AGGREGATOR({
+      // ensure transforms run on GPU. transforms use math functions which need to be
+      // specialized for GPU
+      if (dt == ExecutorDeviceType::GPU) {
+        const auto query_explain_result = QR::get()->runSelectQuery(
+            R"(SELECT ST_Transform(gp900913, 4326) FROM geospatial_test WHERE id = 2;)",
+            dt,
+            /*hoist_literals=*/true,
+            /*allow_loop_joins=*/false,
+            /*just_explain=*/true);
+        const auto explain_result = query_explain_result->getRows();
+        EXPECT_EQ(size_t(1), explain_result->rowCount());
+        const auto crt_row = explain_result->getNextRow(true, true);
+        EXPECT_EQ(size_t(1), crt_row.size());
+        const auto explain_str = boost::get<std::string>(v<NullableString>(crt_row[0]));
+        EXPECT_FALSE(explain_str.find("IR for the GPU:") == std::string::npos);
+      }
+    });
+    EXPECT_ANY_THROW(run_simple_agg(
+        R"(SELECT ST_Transform(gpoly900913, 4326) FROM geospatial_test WHERE id = 2;)",
+        dt));
   }
 }
 
@@ -1052,6 +1190,31 @@ TEST_P(GeoSpatialNullTablesFixture, GeoWithNulls) {
             "SELECT ST_Contains(poly,p) IS NULL FROM geospatial_null_test WHERE id=2;",
             dt,
             false)));
+  }
+}
+
+TEST_P(GeoSpatialNullTablesFixture, Constructors) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    auto nullcheck_result = [](auto p) {
+      auto p_v = boost::get<void*>(&p);
+      auto p_s = boost::get<std::string>(&p);
+      EXPECT_TRUE(p_v && *p_v == nullptr && !p_s);
+    };
+
+    nullcheck_result(v<NullableString>(run_simple_agg(
+        R"(SELECT ST_Transform(gp4326, 900913) FROM geospatial_null_test WHERE id = 4;)",
+        dt,
+        false)));
+    nullcheck_result(v<NullableString>(run_simple_agg(
+        R"(SELECT ST_Transform(gp4326none, 900913) FROM geospatial_null_test WHERE id = 5;)",
+        dt,
+        false)));
+    nullcheck_result(v<NullableString>(run_simple_agg(
+        R"(SELECT ST_Transform(gp900913, 4326) FROM geospatial_null_test WHERE id = 6;)",
+        dt,
+        false)));
   }
 }
 
@@ -1364,6 +1527,11 @@ TEST(GeoSpatial, Math) {
         v<int64_t>(run_simple_agg(
             R"(SELECT ST_Intersects(ST_GeomFromText('POLYGON((-165.27254008488316 60.286744877866084,-164.279755308478 60.286744877866084, -164.279755308478 60.818880025426154,-165.27254008488316 60.818880025426154))', 4326),ST_GeomFromText('MULTIPOLYGON (((-165.273152946156 60.5488599839382,-165.244307548387 60.4963022239955,-165.23881195357 60.4964759808483,-165.234271979534 60.4961199595109,-165.23165799921 60.496354988076,-165.229399998313 60.4973489979735,-165.225239975948 60.4977589987674,-165.217958113746 60.4974514248303,-165.21276192051 60.4972319866052)))',4326));)",
             dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg(
+            R"(SELECT ST_Intersects(ST_GeomFromText('POLYGON((-9.838404039411898 50.55533029518068, -2.310857889588476 50.55533029518068, -2.310857889588476 53.61604635210904, -9.838404039411898 53.61604635210904, -9.838404039411898 50.55533029518068))', 4326), ST_GeomFromText('LINESTRING (-9.54855228287566 51.7461543817754,-9.54461588968738 51.7447587529871,-9.54434548949094 51.7369761558887)', 4326));)",
+            dt)));
 
     // ST_Disjoint
     ASSERT_EQ(
@@ -1589,9 +1757,9 @@ TEST(GeoSpatial, Math) {
             R"(SELECT ST_X(ST_EndPoint(ST_GeomFromText('LINESTRING(-118.243683 34.052235, -119.229034 34.274647, -119.698189 34.420830, -121.898460 36.603954, -122.446747 37.733795)', 4326)));)",
             dt)),
         static_cast<double>(0.01));
-    ASSERT_NEAR(
+    ASSERT_NEAR(  // TODO: postgis has this at 557422.59741475
         static_cast<double>(
-            557637.370),  // geodesic distance between first and end points: LA - SF trip
+            557637.3711),  // geodesic distance between first and end points: LA - SF trip
         v<double>(run_simple_agg(
             R"(SELECT ST_Distance(ST_PointN(ST_GeogFromText('LINESTRING(-118.243683 34.052235, -119.229034 34.274647, -119.698189 34.420830, -121.898460 36.603954, -122.446747 37.733795)', 4326), 1), ST_EndPoint(ST_GeogFromText('LINESTRING(-118.243683 34.052235, -119.229034 34.274647, -119.698189 34.420830, -121.898460 36.603954, -122.446747 37.733795)', 4326)));)",
             dt)),
@@ -1612,7 +1780,7 @@ TEST(GeoSpatial, Math) {
         static_cast<double>(0.01));
     // Linestring: check that runaway indices are controlled
     ASSERT_NEAR(
-        static_cast<double>(-122.446747),  // stop at endpoint
+        static_cast<double>(inline_fp_null_value<double>()),  // return null
         v<double>(run_simple_agg(
             R"(SELECT ST_X(ST_PointN(ST_GeomFromText('LINESTRING(-118.243683 34.052235, -119.229034 34.274647, -119.698189 34.420830, -121.898460 36.603954, -122.446747 37.733795)', 4326), 1000000));)",
             dt)),
@@ -1748,6 +1916,19 @@ TEST(GeoSpatial, Math) {
   }
 }
 
+TEST(GeoSpatial, Projections) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    ASSERT_EQ("POINT (2 2)",
+              boost::get<std::string>(v<NullableString>(
+                  run_simple_agg("SELECT ST_GeomFromText('POINT(2 2)');", dt, false))));
+    ASSERT_EQ("POINT (2 2)",
+              boost::get<std::string>(
+                  v<NullableString>(run_simple_agg("SELECT ST_Point(2,2);", dt, false))));
+  }
+}
+
 class GeoSpatialTempTables : public ::testing::Test {
  protected:
   void SetUp() override { import_geospatial_test(/*with_temporary_tables=*/true); }
@@ -1771,179 +1952,173 @@ TEST_F(GeoSpatialTempTables, Geos) {
     // natively supported ST functions
     // poly id=2: POLYGON (((0 0,3 0,0 3,0 0))
     // ST_Intersection with poly: MULTIPOLYGON (((1 2,1 1,2 1,1 2)))
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(0.5),
         v<double>(run_simple_agg(
-            "SELECT ST_Area(ST_Intersection(poly, 'POLYGON((1 1,3 1,3 3,1 3,1 1))')) "
-            "FROM geospatial_test WHERE id = 2;",
+            R"(SELECT ST_Area(ST_Intersection(poly, 'POLYGON((1 1,3 1,3 3,1 3,1 1))')) FROM geospatial_test WHERE id = 2;)",
             dt)),
-        static_cast<double>(0.00001));
+        static_cast<double>(0.00001)));
     // ST_Union with poly: MULTIPOLYGON (((2 1,3 1,3 3,1 3,1 2,0 3,0 0,3 0,2 1)))
-    ASSERT_NEAR(static_cast<double>(8.0),
-                v<double>(run_simple_agg(
-                    "SELECT ST_Area(ST_Union(poly, 'POLYGON((1 1,3 1,3 3,1 3,1 1))')) "
-                    "FROM geospatial_test WHERE id = 2;",
-                    dt)),
-                static_cast<double>(0.00001));
+    EXPECT_GPU_THROW(ASSERT_NEAR(
+        static_cast<double>(8.0),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Union(poly, 'POLYGON((1 1,3 1,3 3,1 3,1 1))')) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.00001)));
     // ST_Difference with poly:  MULTIPOLYGON (((2 1,1 1,1 2,0 3,0 0,3 0,2 1)))
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(4.0),
         v<double>(run_simple_agg(
-            "SELECT ST_Area(ST_Difference(poly, 'POLYGON((1 1,3 1,3 3,1 3,1 1))')) "
-            "FROM geospatial_test WHERE id = 2;",
+            R"(SELECT ST_Area(ST_Difference(poly, 'POLYGON((1 1,3 1,3 3,1 3,1 1))')) FROM geospatial_test WHERE id = 2;)",
             dt)),
-        static_cast<double>(0.00001));
+        static_cast<double>(0.00001)));
     // ST_Buffer of poly, 0 width: MULTIPOLYGON (((0 0,3 0,0 3,0 0)))
-    ASSERT_NEAR(static_cast<double>(4.5),
-                v<double>(run_simple_agg("SELECT ST_Area(ST_Buffer(poly, 0.0)) "
-                                         "FROM geospatial_test WHERE id = 2;",
-                                         dt)),
-                static_cast<double>(0.00001));
+    EXPECT_GPU_THROW(ASSERT_NEAR(
+        static_cast<double>(4.5),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Buffer(poly, 0.0)) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.00001)));
     // ST_Buffer of poly, 0.1 width: huge rounded MULTIPOLYGON wrapped around poly
-    ASSERT_NEAR(static_cast<double>(5.539),
-                v<double>(run_simple_agg("SELECT ST_Area(ST_Buffer(poly, 0.1)) "
-                                         "FROM geospatial_test WHERE id = 2;",
-                                         dt)),
-                static_cast<double>(0.05));
+    EXPECT_GPU_THROW(ASSERT_NEAR(
+        static_cast<double>(5.539),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Buffer(poly, 0.1)) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.05)));
     // ST_Buffer on a point, 1.0 width: almost a circle, with area close to Pi
-    ASSERT_NEAR(static_cast<double>(3.14159),
-                v<double>(run_simple_agg("SELECT ST_Area(ST_Buffer(p, 1.0)) "
-                                         "FROM geospatial_test WHERE id = 3;",
-                                         dt)),
-                static_cast<double>(0.03));
+    EXPECT_GPU_THROW(ASSERT_NEAR(
+        static_cast<double>(3.14159),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Buffer(p, 1.0)) FROM geospatial_test WHERE id = 3;)",
+            dt)),
+        static_cast<double>(0.03)));
     // ST_Buffer on a point, 1.0 width: distance to buffer
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(2.0),
-        v<double>(run_simple_agg("SELECT ST_Distance(ST_Buffer(p, 1.0), 'POINT(0 3)') "
-                                 "FROM geospatial_test WHERE id = 3;",
-                                 dt)),
-        static_cast<double>(0.03));
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Distance(ST_Buffer(p, 1.0), 'POINT(0 3)') FROM geospatial_test WHERE id = 3;)",
+            dt)),
+        static_cast<double>(0.03)));
     // ST_Buffer on a linestring, 1.0 width: two 10-unit segments
     // each segment is buffered by ~2x10 wide stretch (2 * 2 * 10) plus circular areas
     // around mid- and endpoints
-    ASSERT_NEAR(static_cast<double>(42.9018),
-                v<double>(run_simple_agg(
-                    "SELECT ST_Area(ST_Buffer('LINESTRING(0 0, 10 0, 10 10)', 1.0)) "
-                    "FROM geospatial_test WHERE id = 3;",
-                    dt)),
-                static_cast<double>(0.03));
+    EXPECT_GPU_THROW(ASSERT_NEAR(
+        static_cast<double>(42.9018),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Buffer('LINESTRING(0 0, 10 0, 10 10)', 1.0)) FROM geospatial_test WHERE id = 3;)",
+            dt)),
+        static_cast<double>(0.03)));
     // ST_IsValid
-    ASSERT_EQ(static_cast<int64_t>(1),
-              v<int64_t>(run_simple_agg(
-                  "SELECT ST_IsValid(poly) from geospatial_test limit 1;", dt)));
+    EXPECT_GPU_THROW(
+        ASSERT_EQ(static_cast<int64_t>(1),
+                  v<int64_t>(run_simple_agg(
+                      R"(SELECT ST_IsValid(poly) from geospatial_test limit 1;)", dt))));
     // ST_IsValid: invalid: self-intersecting poly
-    ASSERT_EQ(
-        static_cast<int64_t>(0),
-        v<int64_t>(run_simple_agg("SELECT ST_IsValid('POLYGON((0 0,1 1,1 0,0 1,0 0))') "
-                                  "from geospatial_test limit 1;",
-                                  dt)));
-    // ST_IsValid: invalid: intersecting polys in a multipolygon
-    ASSERT_EQ(
+    EXPECT_GPU_THROW(ASSERT_EQ(
         static_cast<int64_t>(0),
         v<int64_t>(run_simple_agg(
-            "SELECT ST_IsValid('MULTIPOLYGON(((1 1,3 1,3 3,1 3)),((2 2,2 4,4 4,4 2)))') "
-            "from geospatial_test limit 1;",
-            dt)));
+            R"(SELECT ST_IsValid('POLYGON((0 0,1 1,1 0,0 1,0 0))') from geospatial_test limit 1;)",
+            dt))));
+    // ST_IsValid: invalid: intersecting polys in a multipolygon
+    EXPECT_GPU_THROW(ASSERT_EQ(
+        static_cast<int64_t>(0),
+        v<int64_t>(run_simple_agg(
+            R"(SELECT ST_IsValid('MULTIPOLYGON(((1 1,3 1,3 3,1 3)),((2 2,2 4,4 4,4 2)))') from geospatial_test limit 1;)",
+            dt))));
     // geos-backed ST_Union(MULTIPOLYGON,MULTIPOLYGON)
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(14.0),
-        v<double>(run_simple_agg("SELECT ST_Area(ST_Union('MULTIPOLYGON(((0 0,2 "
-                                 "0,2 2,0 2)),((4 4,6 4,6 6,4 6)))', "
-                                 "'MULTIPOLYGON(((1 1,3 1,3 3,1 3,1 1)),((5 5,7 5,7 7,5 "
-                                 "7)))')) FROM geospatial_test WHERE id = 2;",
-                                 dt)),
-        static_cast<double>(0.001));
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Union('MULTIPOLYGON(((0 0,2 0,2 2,0 2)),((4 4,6 4,6 6,4 6)))', 'MULTIPOLYGON(((1 1,3 1,3 3,1 3,1 1)),((5 5,7 5,7 7,5 7)))')) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.001)));
     // geos-backed ST_Intersection(MULTIPOLYGON,MULTIPOLYGON)
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(2.0),
-        v<double>(run_simple_agg("SELECT ST_Area(ST_Intersection('MULTIPOLYGON(((0 0,2 "
-                                 "0,2 2,0 2)),((4 4,6 4,6 6,4 6)))', "
-                                 "'MULTIPOLYGON(((1 1,3 1,3 3,1 3,1 1)),((5 5,7 5,7 7,5 "
-                                 "7)))')) FROM geospatial_test WHERE id = 2;",
-                                 dt)),
-        static_cast<double>(0.001));
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Intersection('MULTIPOLYGON(((0 0,2 0,2 2,0 2)),((4 4,6 4,6 6,4 6)))', 'MULTIPOLYGON(((1 1,3 1,3 3,1 3,1 1)),((5 5,7 5,7 7,5 7)))')) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.001)));
     // geos-backed ST_Intersection(POLYGON,MULTIPOLYGON)
-    ASSERT_NEAR(static_cast<double>(3.0),
-                v<double>(run_simple_agg(
-                    "SELECT ST_Area(ST_Intersection('POLYGON((2 2,2 6,7 6,7 2))', "
-                    "'MULTIPOLYGON(((1 1,3 1,3 3,1 3,1 1)),((5 5,7 5,7 7,5 "
-                    "7)))')) FROM geospatial_test WHERE id = 2;",
-                    dt)),
-                static_cast<double>(0.001));
+    EXPECT_GPU_THROW(ASSERT_NEAR(
+        static_cast<double>(3.0),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Intersection('POLYGON((2 2,2 6,7 6,7 2))', 'MULTIPOLYGON(((1 1,3 1,3 3,1 3,1 1)),((5 5,7 5,7 7,5 7)))')) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.001)));
     // geos-backed ST_Intersection(POLYGON,MULTIPOLYGON) returning a POINT
-    ASSERT_NEAR(static_cast<double>(2.828427),
-                v<double>(run_simple_agg(
-                    "SELECT ST_Distance('POINT(0 0)',ST_Intersection('POLYGON((2 2,2 6,7 "
-                    "6,7 2))', 'MULTIPOLYGON(((1 1,2 1,2 2,1 2,1 1)))')) FROM "
-                    "geospatial_test WHERE id = 2;",
-                    dt)),
-                static_cast<double>(0.001));
+    EXPECT_GPU_THROW(ASSERT_NEAR(
+        static_cast<double>(2.828427),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Distance('POINT(0 0)',ST_Intersection('POLYGON((2 2,2 6,7 6,7 2))', 'MULTIPOLYGON(((1 1,2 1,2 2,1 2,1 1)))')) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.001)));
     // geos-backed ST_Intersection returning GEOMETRYCOLLECTION EMPTY
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(0.0),
-        v<double>(run_simple_agg("SELECT ST_Area(ST_Intersection('POLYGON((3 3,3 6,7 6,7 "
-                                 "3))', 'MULTIPOLYGON(((1 1,2 1,2 2,1 2,1 1)))')) FROM "
-                                 "geospatial_test WHERE id = 2;",
-                                 dt)),
-        static_cast<double>(0.001));
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Intersection('POLYGON((3 3,3 6,7 6,7 3))', 'MULTIPOLYGON(((1 1,2 1,2 2,1 2,1 1)))')) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.001)));
     // geos-backed ST_IsEmpty on ST_Intersection returning GEOMETRYCOLLECTION EMPTY
-    ASSERT_EQ(static_cast<int64_t>(1),
-              v<int64_t>(run_simple_agg(
-                  "SELECT ST_IsEmpty(ST_Intersection('POLYGON((3 3,3 6,7 6,7 3))', "
-                  "'MULTIPOLYGON(((1 1,2 1,2 2,1 2,1 1)))')) FROM "
-                  "geospatial_test WHERE id = 2;",
-                  dt)));
+    EXPECT_GPU_THROW(ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg(
+            R"(SELECT ST_IsEmpty(ST_Intersection('POLYGON((3 3,3 6,7 6,7 3))', 'MULTIPOLYGON(((1 1,2 1,2 2,1 2,1 1)))')) FROM geospatial_test WHERE id = 2;)",
+            dt))));
     // geos-backed ST_IsEmpty on ST_Intersection returning non-empty geo
-    ASSERT_EQ(static_cast<int64_t>(0),
-              v<int64_t>(run_simple_agg(
-                  "SELECT ST_IsEmpty(ST_Intersection('POLYGON((3 3,3 6,7 6,7 3))', "
-                  "'MULTIPOLYGON(((1 1,4 1,4 4,1 4,1 1)))')) FROM "
-                  "geospatial_test WHERE id = 2;",
-                  dt)));
+    EXPECT_GPU_THROW(ASSERT_EQ(
+        static_cast<int64_t>(0),
+        v<int64_t>(run_simple_agg(
+            R"(SELECT ST_IsEmpty(ST_Intersection('POLYGON((3 3,3 6,7 6,7 3))', 'MULTIPOLYGON(((1 1,4 1,4 4,1 4,1 1)))')) FROM geospatial_test WHERE id = 2;)",
+            dt))));
     // geos runtime support for geometry decompression
-    ASSERT_NEAR(static_cast<double>(4.5),
-                v<double>(run_simple_agg("SELECT ST_Area(ST_Buffer(gpoly4326, 0.0)) "
-                                         "FROM geospatial_test WHERE id = 2;",
-                                         dt)),
-                static_cast<double>(0.00001));
+    EXPECT_GPU_THROW(ASSERT_NEAR(
+        static_cast<double>(4.5),
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Area(ST_Buffer(gpoly4326, 0.0)) FROM geospatial_test WHERE id = 2;)",
+            dt)),
+        static_cast<double>(0.00001)));
     // geos runtime doesn't support geometry transforms
     EXPECT_THROW(
-        run_simple_agg("SELECT ST_Area(ST_Transform(ST_Buffer(gpoly4326, 0.1), 900913)) "
-                       "FROM geospatial_test WHERE id = 2;",
-                       dt),
+        run_simple_agg(
+            R"(SELECT ST_Area(ST_Transform(ST_Buffer(gpoly4326, 0.1), 900913)) FROM geospatial_test WHERE id = 2;)",
+            dt),
         std::runtime_error);
     // Handling geos returning a MULTIPOINT
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(0.9),
         v<double>(run_simple_agg(
-            "SELECT ST_Distance(ST_Union('POINT(2 1)', 'POINT(3 0)'), 'POINT(2 0.1)');",
+            R"(SELECT ST_Distance(ST_Union('POINT(2 1)', 'POINT(3 0)'), 'POINT(2 0.1)');)",
             dt)),
-        static_cast<double>(0.00001));
+        static_cast<double>(0.00001)));
     // Handling geos returning a LINESTRING
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(0.8062257740),
-        v<double>(run_simple_agg("SELECT ST_Distance(ST_Union('LINESTRING(2 1, 3 1)', "
-                                 "'LINESTRING(3 1, 4 1, 3 0)'), 'POINT(2.2 0.1)');",
-                                 dt)),
-        static_cast<double>(0.00001));
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Distance(ST_Union('LINESTRING(2 1, 3 1)', 'LINESTRING(3 1, 4 1, 3 0)'), 'POINT(2.2 0.1)');)",
+            dt)),
+        static_cast<double>(0.00001)));
     // Handling geos returning a MULTILINESTRING
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(0.9),
-        v<double>(run_simple_agg("SELECT ST_Distance(ST_Union('LINESTRING(2 1, 3 1)', "
-                                 "'LINESTRING(3 -1, 2 -1)'), 'POINT(2 0.1)');",
-                                 dt)),
-        static_cast<double>(0.00001));
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Distance(ST_Union('LINESTRING(2 1, 3 1)', 'LINESTRING(3 -1, 2 -1)'), 'POINT(2 0.1)');)",
+            dt)),
+        static_cast<double>(0.00001)));
     // Handling geos returning a GEOMETRYCOLLECTION
-    ASSERT_NEAR(
+    EXPECT_GPU_THROW(ASSERT_NEAR(
         static_cast<double>(0.9),
-        v<double>(run_simple_agg("SELECT ST_Distance(ST_Union('LINESTRING(2 1, 3 1)', "
-                                 "'POINT(2 -1)'), 'POINT(2 0.1)');",
-                                 dt)),
-        static_cast<double>(0.00001));
+        v<double>(run_simple_agg(
+            R"(SELECT ST_Distance(ST_Union('LINESTRING(2 1, 3 1)', 'POINT(2 -1)'), 'POINT(2 0.1)');)",
+            dt)),
+        static_cast<double>(0.00001)));
     // ST_IsValid: geos validation of SRID-carrying geometries
-    ASSERT_EQ(static_cast<int64_t>(1),
-              v<int64_t>(run_simple_agg(
-                  "SELECT ST_IsValid(gpoly4326) FROM geospatial_test limit 1;", dt)));
+    EXPECT_GPU_THROW(ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg(
+            R"(SELECT ST_IsValid(gpoly4326) FROM geospatial_test limit 1;)", dt))));
     // geos runtime doesn't yet support input geo transforms
     EXPECT_THROW(run_simple_agg("SELECT ST_IsEmpty(ST_Transform(gpoly4326, 900913)) "
                                 "FROM geospatial_test limit 1;",
@@ -2151,24 +2326,17 @@ class GeoSpatialMultiFragTestTablesFixture : public ::testing::TestWithParam<boo
 };
 
 TEST_P(GeoSpatialMultiFragTestTablesFixture, LoopJoin) {
+  SKIP_ALL_ON_AGGREGATOR();  // TODO(adb): investigate different result in distributed
+
   const auto enable_overlaps_hashjoin_state = g_enable_overlaps_hashjoin;
   g_enable_overlaps_hashjoin = false;
   ScopeGuard reset_overlaps_state = [&enable_overlaps_hashjoin_state] {
     g_enable_overlaps_hashjoin = enable_overlaps_hashjoin_state;
   };
 
-  // If GPU exists, check whether we get an exception related to varlen columnarization
-  // when query is executed on GPU
-  if (!skip_tests(ExecutorDeviceType::GPU)) {
-    EXPECT_THROW(
-        run_simple_agg(
-            R"(SELECT count(*) FROM geospatial_multi_frag_test t1, geospatial_multi_frag_test t2 WHERE ST_DISTANCE(t1.pt, t2.pt) < 10;)",
-            ExecutorDeviceType::GPU),
-        std::runtime_error);
-  }
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
 
-  // skip to test GPU device until we fix the #5425 issue
-  for (auto dt : {ExecutorDeviceType::CPU}) {
     ASSERT_EQ(
         static_cast<int64_t>(109),
         v<int64_t>(run_simple_agg(
@@ -2249,6 +2417,12 @@ TEST_P(GeoSpatialMultiFragTestTablesFixture, LoopJoin) {
         v<int64_t>(run_simple_agg(
             R"(SELECT count(*) FROM geospatial_multi_frag_test t1, geospatial_multi_frag_test t2 WHERE ST_DISTANCE(t1.pt_comp, t2.pt_comp) is null;)",
             dt)));
+    ASSERT_NEAR(
+        static_cast<double>(14.14213561714551),
+        v<double>(run_simple_agg(
+            R"(SELECT MAX(ST_DISTANCE(t1.pt, t2.pt)) FROM geospatial_multi_frag_test t1, geospatial_multi_frag_test t2;)",
+            dt)),
+        static_cast<double>(0.01));
   }
 }
 
@@ -2278,6 +2452,10 @@ int main(int argc, char** argv) {
   if (vm.count("keep-data")) {
     g_keep_data = true;
   }
+
+  // disable CPU retry to catch illegal code generation on GPU
+  g_allow_cpu_retry = false;
+  g_allow_query_step_cpu_retry = false;
 
   QR::init(BASE_PATH);
 

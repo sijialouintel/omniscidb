@@ -866,6 +866,7 @@ TEST_F(OptimizeTableVacuumTest, PartialOldChunkPagesRemainAfterCompaction) {
   // Fill up fragment. This should occupy 5 data pages (4 pages for the big int entries
   // + 1 page for the $deleted$ chunk) across 2 files (since there are 3 pages per file,
   // per above setting).
+  // sql("insert into test_table select * from (values (1), (2), (3), (4));");
   sql("insert into test_table select * from (values (1), (2), (3), (4));");
   assertFileAndFreePageCount(1, 4094, 2, 1);
 
@@ -1781,7 +1782,7 @@ TEST_F(OpportunisticVacuumingTest, DifferentDataTypesMetadataUpdate) {
        {i(1), "test_1", "test_1", 1.5f, array({10.5}), array({"2021-01-01 00:10:00"}), "2021-01-01"},
        {i(4), "test_4", "test_4", 4.5f, array({40.5}), array({"2021-04-01 00:10:00"}), "2021-04-01"},
        {i(10), "test_10", "test_10", 100.5f, array({1000.5}), array({"2021-10-10 00:10:00"}), "2021-10-10"},
-       {Null_i, Null, Null, NULL_FLOAT, array({NULL_DOUBLE}), array({}), Null}});
+       {Null_i, Null, Null, NULL_FLOAT, array({NULL_DOUBLE}), Null, Null}});
   // clang-format on
 }
 

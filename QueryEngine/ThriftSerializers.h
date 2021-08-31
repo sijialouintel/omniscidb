@@ -432,14 +432,12 @@ inline ExtArgumentType from_thrift(const TExtArgumentType::type& t) {
       return ExtArgumentType::ColumnDouble;
     case TExtArgumentType::ColumnBool:
       return ExtArgumentType::ColumnBool;
+    case TExtArgumentType::ColumnTextEncodingDict:
+      return ExtArgumentType::ColumnTextEncodingDict;
     case TExtArgumentType::TextEncodingNone:
       return ExtArgumentType::TextEncodingNone;
-    case TExtArgumentType::TextEncodingDict8:
-      return ExtArgumentType::TextEncodingDict8;
-    case TExtArgumentType::TextEncodingDict16:
-      return ExtArgumentType::TextEncodingDict16;
-    case TExtArgumentType::TextEncodingDict32:
-      return ExtArgumentType::TextEncodingDict32;
+    case TExtArgumentType::TextEncodingDict:
+      return ExtArgumentType::TextEncodingDict;
     case TExtArgumentType::ColumnListInt8:
       return ExtArgumentType::ColumnListInt8;
     case TExtArgumentType::ColumnListInt16:
@@ -454,6 +452,8 @@ inline ExtArgumentType from_thrift(const TExtArgumentType::type& t) {
       return ExtArgumentType::ColumnListDouble;
     case TExtArgumentType::ColumnListBool:
       return ExtArgumentType::ColumnListBool;
+    case TExtArgumentType::ColumnListTextEncodingDict:
+      return ExtArgumentType::ColumnListTextEncodingDict;
   }
   UNREACHABLE();
   return ExtArgumentType{};
@@ -529,14 +529,12 @@ inline TExtArgumentType::type to_thrift(const ExtArgumentType& t) {
       return TExtArgumentType::ColumnDouble;
     case ExtArgumentType::ColumnBool:
       return TExtArgumentType::ColumnBool;
+    case ExtArgumentType::ColumnTextEncodingDict:
+      return TExtArgumentType::ColumnTextEncodingDict;
     case ExtArgumentType::TextEncodingNone:
       return TExtArgumentType::TextEncodingNone;
-    case ExtArgumentType::TextEncodingDict8:
-      return TExtArgumentType::TextEncodingDict8;
-    case ExtArgumentType::TextEncodingDict16:
-      return TExtArgumentType::TextEncodingDict16;
-    case ExtArgumentType::TextEncodingDict32:
-      return TExtArgumentType::TextEncodingDict32;
+    case ExtArgumentType::TextEncodingDict:
+      return TExtArgumentType::TextEncodingDict;
     case ExtArgumentType::ColumnListInt8:
       return TExtArgumentType::ColumnListInt8;
     case ExtArgumentType::ColumnListInt16:
@@ -551,6 +549,8 @@ inline TExtArgumentType::type to_thrift(const ExtArgumentType& t) {
       return TExtArgumentType::ColumnListDouble;
     case ExtArgumentType::ColumnListBool:
       return TExtArgumentType::ColumnListBool;
+    case ExtArgumentType::ColumnListTextEncodingDict:
+      return TExtArgumentType::ColumnListTextEncodingDict;
   }
   UNREACHABLE();
   return TExtArgumentType::type{};
@@ -587,6 +587,8 @@ inline table_functions::OutputBufferSizeType from_thrift(
       return table_functions::OutputBufferSizeType::kUserSpecifiedConstantParameter;
     case TOutputBufferSizeType::kUserSpecifiedRowMultiplier:
       return table_functions::OutputBufferSizeType::kUserSpecifiedRowMultiplier;
+    case TOutputBufferSizeType::kTableFunctionSpecifiedParameter:
+      return table_functions::OutputBufferSizeType::kTableFunctionSpecifiedParameter;
   }
   UNREACHABLE();
   return table_functions::OutputBufferSizeType{};
@@ -601,6 +603,8 @@ inline TOutputBufferSizeType::type to_thrift(
       return TOutputBufferSizeType::kUserSpecifiedConstantParameter;
     case table_functions::OutputBufferSizeType::kUserSpecifiedRowMultiplier:
       return TOutputBufferSizeType::kUserSpecifiedRowMultiplier;
+    case table_functions::OutputBufferSizeType::kTableFunctionSpecifiedParameter:
+      return TOutputBufferSizeType::kTableFunctionSpecifiedParameter;
   }
   UNREACHABLE();
   return TOutputBufferSizeType::type{};
@@ -614,6 +618,7 @@ inline TUserDefinedTableFunction to_thrift(const table_functions::TableFunction&
   tfunc.inputArgTypes = to_thrift(func.getInputArgs());
   tfunc.outputArgTypes = to_thrift(func.getOutputArgs());
   tfunc.sqlArgTypes = to_thrift(func.getSqlArgs());
+  tfunc.annotations = func.getAnnotations();
   return tfunc;
 }
 

@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "Catalog/Catalog.h"
 #include "DataMgr/AbstractBuffer.h"
 #include "DataMgr/Allocators/CudaAllocator.h"
 #include "QueryEngine/CompilationOptions.h"
@@ -27,44 +26,40 @@
 class BaselineHashTable : public HashTable {
  public:
   // CPU constructor
-  BaselineHashTable(const Catalog_Namespace::Catalog* catalog,
-                    HashType layout,
+  BaselineHashTable(HashType layout,
                     const size_t entry_count,
                     const size_t emitted_keys_count,
                     const size_t hash_table_size)
-      :
+      : gpu_hash_table_buff_(nullptr)
 #ifdef HAVE_CUDA
-      device_id_(0)
-      , catalog_(catalog)
-      ,
+      , device_id_(0)
+      , data_mgr_(nullptr)
 #endif
-      layout_(layout)
+      , layout_(layout)
       , entry_count_(entry_count)
       , emitted_keys_count_(emitted_keys_count) {
     cpu_hash_table_buff_.resize(hash_table_size);
   }
 
   // GPU constructor
-  BaselineHashTable(const Catalog_Namespace::Catalog* catalog,
+  BaselineHashTable(Data_Namespace::DataMgr* data_mgr,
                     HashType layout,
                     const size_t entry_count,
                     const size_t emitted_keys_count,
                     const size_t hash_table_size,
                     const size_t device_id)
-      :
+      : gpu_hash_table_buff_(nullptr)
 #ifdef HAVE_CUDA
-      device_id_(device_id)
-      , catalog_(catalog)
-      ,
+      , device_id_(device_id)
+      , data_mgr_(data_mgr)
 #endif
-      layout_(layout)
+      , layout_(layout)
       , entry_count_(entry_count)
       , emitted_keys_count_(emitted_keys_count) {
 #ifdef HAVE_CUDA
-    CHECK(catalog_);
-    auto& data_mgr = catalog_->getDataMgr();
+    CHECK(data_mgr_);
     gpu_hash_table_buff_ =
-        CudaAllocator::allocGpuAbstractBuffer(&data_mgr, hash_table_size, device_id_);
+        CudaAllocator::allocGpuAbstractBuffer(data_mgr_, hash_table_size, device_id_);
 #else
     UNREACHABLE();
 #endif
@@ -72,10 +67,9 @@ class BaselineHashTable : public HashTable {
 
   ~BaselineHashTable() {
 #ifdef HAVE_CUDA
-    CHECK(catalog_);
-    auto& data_mgr = catalog_->getDataMgr();
     if (gpu_hash_table_buff_) {
-      data_mgr.free(gpu_hash_table_buff_);
+      CHECK(data_mgr_);
+      data_mgr_->free(gpu_hash_table_buff_);
     }
 #endif
   }
@@ -103,11 +97,11 @@ class BaselineHashTable : public HashTable {
 
  private:
   std::vector<int8_t> cpu_hash_table_buff_;
-  Data_Namespace::AbstractBuffer* gpu_hash_table_buff_{nullptr};
+  Data_Namespace::AbstractBuffer* gpu_hash_table_buff_;
 
 #ifdef HAVE_CUDA
   const size_t device_id_;
-  const Catalog_Namespace::Catalog* catalog_;
+  Data_Namespace::DataMgr* data_mgr_;
 #endif
 
   HashType layout_;

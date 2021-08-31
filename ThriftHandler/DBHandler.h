@@ -34,6 +34,7 @@
 #include "Fragmenter/InsertOrderFragmenter.h"
 #include "Geospatial/Transforms.h"
 #include "ImportExport/Importer.h"
+#include "ImportExport/RenderGroupAnalyzer.h"
 #include "LockMgr/LockMgr.h"
 #include "Logger/Logger.h"
 #include "Parser/ParserWrapper.h"
@@ -50,7 +51,6 @@
 #include "Shared/StringTransform.h"
 #include "Shared/SystemParameters.h"
 #include "Shared/mapd_shared_mutex.h"
-#include "Shared/mapd_shared_ptr.h"
 #include "Shared/measure.h"
 #include "Shared/scope.h"
 #include "StringDictionary/StringDictionaryClient.h"
@@ -107,11 +107,11 @@ using query_state::QueryStateProxy;
 
 class TrackingProcessor : public OmniSciProcessor {
  public:
-  TrackingProcessor(mapd::shared_ptr<OmniSciIf> handler, const bool check_origin)
+  TrackingProcessor(std::shared_ptr<OmniSciIf> handler, const bool check_origin)
       : OmniSciProcessor(handler), check_origin_(check_origin) {}
 
-  bool process(mapd::shared_ptr<::apache::thrift::protocol::TProtocol> in,
-               mapd::shared_ptr<::apache::thrift::protocol::TProtocol> out,
+  bool process(std::shared_ptr<::apache::thrift::protocol::TProtocol> in,
+               std::shared_ptr<::apache::thrift::protocol::TProtocol> out,
                void* connectionContext) {
     using namespace ::apache::thrift;
 
@@ -152,7 +152,9 @@ class TrackingProcessor : public OmniSciProcessor {
   const bool check_origin_;
 };
 
+namespace File_Namespace {
 struct DiskCacheConfig;
+}
 
 class DBHandler : public OmniSciIf {
  public:
@@ -185,7 +187,7 @@ class DBHandler : public OmniSciIf {
 #ifdef ENABLE_GEOS
             const std::string& libgeos_so_filename,
 #endif
-            const DiskCacheConfig& disk_cache_config,
+            const File_Namespace::DiskCacheConfig& disk_cache_config,
             const bool is_new_db);
   void initialize(const bool is_new_db);
   ~DBHandler() override;
@@ -220,6 +222,9 @@ class DBHandler : public OmniSciIf {
   bool hasTableAccessPrivileges(const TableDescriptor* td,
                                 const Catalog_Namespace::SessionInfo& session_info);
   void get_tables(std::vector<std::string>& _return, const TSessionId& session) override;
+  void get_tables_for_database(std::vector<std::string>& _return,
+                               const TSessionId& session,
+                               const std::string& database_name) override;
   void get_physical_tables(std::vector<std::string>& _return,
                            const TSessionId& session) override;
   void get_views(std::vector<std::string>& _return, const TSessionId& session) override;
@@ -228,9 +233,17 @@ class DBHandler : public OmniSciIf {
   void get_table_details(TTableDetails& _return,
                          const TSessionId& session,
                          const std::string& table_name) override;
+  void get_table_details_for_database(TTableDetails& _return,
+                                      const TSessionId& session,
+                                      const std::string& table_name,
+                                      const std::string& database_name) override;
   void get_internal_table_details(TTableDetails& _return,
                                   const TSessionId& session,
                                   const std::string& table_name) override;
+  void get_internal_table_details_for_database(TTableDetails& _return,
+                                               const TSessionId& session,
+                                               const std::string& table_name,
+                                               const std::string& database_name) override;
   void get_users(std::vector<std::string>& _return, const TSessionId& session) override;
   void get_databases(std::vector<TDBInfo>& _return, const TSessionId& session) override;
 
@@ -246,11 +259,13 @@ class DBHandler : public OmniSciIf {
   void set_cur_session(const TSessionId& parent_session,
                        const TSessionId& leaf_session,
                        const std::string& start_time_str,
-                       const std::string& label) override;
+                       const std::string& label,
+                       bool for_running_query_kernel) override;
   void invalidate_cur_session(const TSessionId& parent_session,
                               const TSessionId& leaf_session,
                               const std::string& start_time_str,
-                              const std::string& label) override;
+                              const std::string& label,
+                              bool for_running_query_kernel) override;
   void set_table_epoch(const TSessionId& session,
                        const int db_id,
                        const int table_id,
@@ -605,6 +620,16 @@ class DBHandler : public OmniSciIf {
                             const Catalog_Namespace::SessionInfo& session_info,
                             const bool with_table_locks = true);
 
+  // Visible for use in tests.
+  void resizeDispatchQueue(size_t queue_size);
+
+ protected:
+  // Returns empty std::shared_ptr if !check_license && session.empty().
+  std::shared_ptr<Catalog_Namespace::SessionInfo> get_session_ptr(
+      const TSessionId& session_id);
+
+  ConnectionInfo getConnectionInfo() const;
+
  private:
   std::atomic<bool> initialized_{false};
   std::shared_ptr<Catalog_Namespace::SessionInfo> create_new_session(
@@ -626,12 +651,14 @@ class DBHandler : public OmniSciIf {
                                    const std::string& table_name);
   void get_tables_impl(std::vector<std::string>& table_names,
                        const Catalog_Namespace::SessionInfo&,
-                       const GetTablesType get_tables_type);
+                       const GetTablesType get_tables_type,
+                       const std::string& database_name = {});
   void get_table_details_impl(TTableDetails& _return,
                               query_state::StdLog& stdlog,
                               const std::string& table_name,
                               const bool get_system,
-                              const bool get_physical);
+                              const bool get_physical,
+                              const std::string& database_name = {});
   void check_read_only(const std::string& str);
   void check_session_exp_unsafe(const SessionMap::iterator& session_it);
   void validateGroups(const std::vector<std::string>& groups);
@@ -650,8 +677,7 @@ class DBHandler : public OmniSciIf {
   // Returns empty std::shared_ptr if session.empty().
   std::shared_ptr<const Catalog_Namespace::SessionInfo> get_const_session_ptr(
       const TSessionId& session);
-  std::shared_ptr<Catalog_Namespace::SessionInfo> get_session_ptr(
-      const TSessionId& session_id);
+
   template <typename SESSION_MAP_LOCK>
   SessionMap::iterator get_session_it_unsafe(const TSessionId& session,
                                              SESSION_MAP_LOCK& lock);
@@ -739,7 +765,8 @@ class DBHandler : public OmniSciIf {
                           const std::string& query_ra,
                           QueryStateProxy query_state_proxy,
                           const Catalog_Namespace::SessionInfo& session_info,
-                          const ExecutorDeviceType device_type,
+                          const ExecutorDeviceType executor_device_type,
+                          const ExecutorDeviceType results_device_type,
                           const size_t device_id,
                           const int32_t first_n,
                           const TArrowTransport::type transport_method) const;
@@ -825,8 +852,6 @@ class DBHandler : public OmniSciIf {
   fill_column_names_by_table(std::vector<std::string>& table_names,
                              query_state::StdLog& stdlog);
 
-  ConnectionInfo getConnectionInfo() const;
-
   TDashboard get_dashboard_impl(
       const std::shared_ptr<Catalog_Namespace::SessionInfo const>& session_ptr,
       Catalog_Namespace::UserMetadata& user_meta,
@@ -862,6 +887,26 @@ class DBHandler : public OmniSciIf {
       const std::vector<std::string>& column_names,
       std::string load_type);
 
+  void fillGeoColumns(
+      const TSessionId& session,
+      const Catalog_Namespace::Catalog& catalog,
+      std::vector<std::unique_ptr<import_export::TypedImportBuffer>>& import_buffers,
+      const ColumnDescriptor* cd,
+      size_t& col_idx,
+      size_t num_rows,
+      const std::string& table_name,
+      bool assign_render_groups);
+
+  void fillMissingBuffers(
+      const TSessionId& session,
+      const Catalog_Namespace::Catalog& catalog,
+      std::vector<std::unique_ptr<import_export::TypedImportBuffer>>& import_buffers,
+      const std::list<const ColumnDescriptor*>& cds,
+      const std::vector<int>& desc_id_to_column_id,
+      size_t num_rows,
+      const std::string& table_name,
+      bool assign_render_groups);
+
   query_state::QueryStates query_states_;
   SessionMap sessions_;
 
@@ -885,7 +930,7 @@ class DBHandler : public OmniSciIf {
 #ifdef ENABLE_GEOS
   const std::string& libgeos_so_filename_;
 #endif
-  const DiskCacheConfig& disk_cache_config_;
+  const File_Namespace::DiskCacheConfig& disk_cache_config_;
   const std::string& udf_filename_;
   const std::string& clang_path_;
   const std::vector<std::string>& clang_options_;
@@ -927,7 +972,7 @@ class DBHandler : public OmniSciIf {
   mutable std::mutex handle_to_dev_ptr_mutex_;
   mutable std::unordered_map<std::string, std::string> ipc_handle_to_dev_ptr_;
 
-  friend void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
+  friend void run_warmup_queries(std::shared_ptr<DBHandler> handler,
                                  std::string base_path,
                                  std::string query_file_path);
 
@@ -996,6 +1041,8 @@ class DBHandler : public OmniSciIf {
       const std::vector<TColumn>& cols,
       const std::vector<std::string>& column_names,
       const AssignRenderGroupsMode assign_render_groups_mode);
+
+  TRole::type getServerRole() const;
 
   using RenderGroupAssignmentColumnMap =
       std::unordered_map<std::string,

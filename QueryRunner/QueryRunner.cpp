@@ -18,6 +18,7 @@
 
 #include "Calcite/Calcite.h"
 #include "Catalog/Catalog.h"
+#include "Catalog/DdlCommandExecutor.h"
 #include "DistributedLoader.h"
 #include "Geospatial/Transforms.h"
 #include "ImportExport/CopyParams.h"
@@ -93,6 +94,25 @@ QueryRunner* QueryRunner::init(const char* db_path,
                            reserved_gpu_mem);
 }
 
+QueryRunner* QueryRunner::init(const File_Namespace::DiskCacheConfig* disk_cache_config,
+                               const char* db_path,
+                               const std::vector<LeafHostInfo>& string_servers,
+                               const std::vector<LeafHostInfo>& leaf_servers) {
+  return QueryRunner::init(db_path,
+                           std::string{OMNISCI_ROOT_USER},
+                           "HyperInteractive",
+                           std::string{OMNISCI_DEFAULT_DB},
+                           string_servers,
+                           leaf_servers,
+                           "",
+                           true,
+                           0,
+                           256 << 20,
+                           false,
+                           false,
+                           disk_cache_config);
+}
+
 QueryRunner* QueryRunner::init(const char* db_path,
                                const std::string& user,
                                const std::string& pass,
@@ -104,7 +124,8 @@ QueryRunner* QueryRunner::init(const char* db_path,
                                const size_t max_gpu_mem,
                                const int reserved_gpu_mem,
                                const bool create_user,
-                               const bool create_db) {
+                               const bool create_db,
+                               const File_Namespace::DiskCacheConfig* disk_cache_config) {
   // Whitelist root path for tests by default
   ddl_utils::FilePathWhitelist::clear();
   ddl_utils::FilePathWhitelist::initialize(db_path, "[\"/\"]", "[\"/\"]");
@@ -121,7 +142,8 @@ QueryRunner* QueryRunner::init(const char* db_path,
                                      max_gpu_mem,
                                      reserved_gpu_mem,
                                      create_user,
-                                     create_db));
+                                     create_db,
+                                     disk_cache_config));
   return qr_instance_.get();
 }
 
@@ -136,7 +158,8 @@ QueryRunner::QueryRunner(const char* db_path,
                          const size_t max_gpu_mem,
                          const int reserved_gpu_mem,
                          const bool create_user,
-                         const bool create_db)
+                         const bool create_db,
+                         const File_Namespace::DiskCacheConfig* cache_config)
     : dispatch_queue_(std::make_unique<QueryDispatchQueue>(1)) {
   g_serialize_temp_tables = true;
   boost::filesystem::path base_path{db_path};
@@ -144,8 +167,11 @@ QueryRunner::QueryRunner(const char* db_path,
   auto system_db_file = base_path / "mapd_catalogs" / OMNISCI_DEFAULT_DB;
   CHECK(boost::filesystem::exists(system_db_file));
   auto data_dir = base_path / "mapd_data";
-  DiskCacheConfig disk_cache_config{(base_path / "omnisci_disk_cache").string(),
-                                    DiskCacheLevel::fsi};
+  File_Namespace::DiskCacheConfig disk_cache_config{
+      (base_path / "omnisci_disk_cache").string(), File_Namespace::DiskCacheLevel::fsi};
+  if (cache_config) {
+    disk_cache_config = *cache_config;
+  }
   Catalog_Namespace::UserMetadata user;
   Catalog_Namespace::DBMetadata db;
 
@@ -197,7 +223,7 @@ QueryRunner::QueryRunner(const char* db_path,
 
   if (create_user) {
     if (!sys_cat.getMetadataForUser(user_name, user)) {
-      sys_cat.createUser(user_name, passwd, false, "", true);
+      sys_cat.createUser(user_name, passwd, false, "", true, g_read_only);
     }
   }
   CHECK(sys_cat.getMetadataForUser(user_name, user));
@@ -214,10 +240,6 @@ QueryRunner::QueryRunner(const char* db_path,
   CHECK(cat);
   session_info_ = std::make_unique<Catalog_Namespace::SessionInfo>(
       cat, user, ExecutorDeviceType::GPU, "");
-}
-
-QueryRunner::~QueryRunner() {
-  Executor::nukeCacheOfExecutors();
 }
 
 void QueryRunner::resizeDispatchQueue(const size_t num_executors) {
@@ -287,6 +309,86 @@ RegisteredQueryHint QueryRunner::getParsedQueryHint(const std::string& query_str
   return query_hints;
 }
 
+// used to validate calcite ddl statements
+void QueryRunner::validateDDLStatement(const std::string& stmt_str_in) {
+  CHECK(session_info_);
+
+  std::string stmt_str = stmt_str_in;
+  // First remove special chars
+  boost::algorithm::trim_left_if(stmt_str, boost::algorithm::is_any_of("\n"));
+  // Then remove spaces
+  boost::algorithm::trim_left(stmt_str);
+
+  auto query_state = create_query_state(session_info_, stmt_str);
+  auto stdlog = STDLOG(query_state);
+
+  const auto& cat = session_info_->getCatalog();
+  auto calcite_mgr = cat.getCalciteMgr();
+  calcite_mgr->process(query_state->createQueryStateProxy(),
+                       pg_shim(stmt_str),
+                       {},
+                       true,
+                       false,
+                       false,
+                       true);
+}
+
+std::shared_ptr<RelAlgTranslator> QueryRunner::getRelAlgTranslator(
+    const std::string& query_str,
+    Executor* executor) {
+  CHECK(session_info_);
+  CHECK(!Catalog_Namespace::SysCatalog::instance().isAggregator());
+  auto query_state = create_query_state(session_info_, query_str);
+  const auto& cat = session_info_->getCatalog();
+  auto calcite_mgr = cat.getCalciteMgr();
+  const auto query_ra = calcite_mgr
+                            ->process(query_state->createQueryStateProxy(),
+                                      pg_shim(query_str),
+                                      {},
+                                      true,
+                                      false,
+                                      false,
+                                      true)
+                            .plan_result;
+  executor->setCatalog(&cat);
+  auto ra_executor = RelAlgExecutor(executor, cat, query_ra);
+  auto root_node_shared_ptr = ra_executor.getRootRelAlgNodeShPtr();
+  return ra_executor.getRelAlgTranslator(root_node_shared_ptr.get());
+}
+
+QueryPlanDagInfo QueryRunner::getQueryInfoForDataRecyclerTest(
+    const std::string& query_str) {
+  CHECK(session_info_);
+  CHECK(!Catalog_Namespace::SysCatalog::instance().isAggregator());
+  auto query_state = create_query_state(session_info_, query_str);
+  const auto& cat = session_info_->getCatalog();
+  auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
+  auto calcite_mgr = cat.getCalciteMgr();
+  const auto query_ra = calcite_mgr
+                            ->process(query_state->createQueryStateProxy(),
+                                      pg_shim(query_str),
+                                      {},
+                                      true,
+                                      false,
+                                      false,
+                                      true)
+                            .plan_result;
+  executor->setCatalog(&cat);
+  auto ra_executor = RelAlgExecutor(executor.get(), cat, query_ra);
+  // note that we assume the test for data recycler that needs to have join_info
+  // does not contain any ORDER BY clause; this is necessary to create work_unit
+  // without actually performing the query
+  auto root_node_shared_ptr = ra_executor.getRootRelAlgNodeShPtr();
+  auto join_info = ra_executor.getJoinInfo(root_node_shared_ptr.get());
+  auto relAlgTranslator = ra_executor.getRelAlgTranslator(root_node_shared_ptr.get());
+  return {root_node_shared_ptr, join_info.first, join_info.second, relAlgTranslator};
+}
+
+void QueryRunner::printQueryPlanDagCache() const {
+  auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
+  executor->getQueryPlanDagCache().printDag();
+}
+
 void QueryRunner::runDDLStatement(const std::string& stmt_str_in) {
   CHECK(session_info_);
   CHECK(!Catalog_Namespace::SysCatalog::instance().isAggregator());
@@ -304,6 +406,23 @@ void QueryRunner::runDDLStatement(const std::string& stmt_str_in) {
 
   auto query_state = create_query_state(session_info_, stmt_str);
   auto stdlog = STDLOG(query_state);
+
+  if (pw.isCalciteDdl()) {
+    const auto& cat = session_info_->getCatalog();
+    auto calcite_mgr = cat.getCalciteMgr();
+    const auto query_ra = calcite_mgr
+                              ->process(query_state->createQueryStateProxy(),
+                                        pg_shim(stmt_str),
+                                        {},
+                                        true,
+                                        false,
+                                        false,
+                                        true)
+                              .plan_result;
+    DdlCommandExecutor executor = DdlCommandExecutor(query_ra, session_info_);
+    executor.execute();
+    return;
+  }
 
   SQLParser parser;
   std::list<std::unique_ptr<Parser::Stmt>> parse_trees;
@@ -463,6 +582,11 @@ std::shared_ptr<ResultSet> QueryRunner::runSQLWithAllowingInterrupt(
         if (cpu_mode_enabled) {
           co.device_type = ExecutorDeviceType::CPU;
         }
+        if (query_hints.isHintRegistered(QueryHint::kColumnarOutput)) {
+          eo.output_columnar_hint = true;
+        } else if (query_hints.isHintRegistered(QueryHint::kRowwiseOutput)) {
+          eo.output_columnar_hint = false;
+        }
         result = std::make_shared<ExecutionResult>(
             ra_executor.executeRelAlgQuery(co, eo, false, nullptr));
       });
@@ -491,22 +615,29 @@ std::vector<std::shared_ptr<ResultSet>> QueryRunner::runMultipleStatements(
     if (text == ";") {
       continue;
     }
-    // TODO: Maybe remove this redundant parsing after enhancing Parser::Stmt?
-    SQLParser parser;
-    std::list<std::unique_ptr<Parser::Stmt>> parse_trees;
-    std::string last_parsed;
-    CHECK_EQ(parser.parse(text, parse_trees, last_parsed), 0);
-    CHECK_EQ(parse_trees.size(), size_t(1));
-    auto stmt = parse_trees.front().get();
-    Parser::DDLStmt* ddl = dynamic_cast<Parser::DDLStmt*>(stmt);
-    Parser::DMLStmt* dml = dynamic_cast<Parser::DMLStmt*>(stmt);
-    if (ddl != nullptr && dml == nullptr) {
+
+    ParserWrapper pw{text};
+    if (pw.isCalciteDdl()) {
       runDDLStatement(text);
       results.push_back(nullptr);
-    } else if (ddl == nullptr && dml != nullptr) {
-      results.push_back(runSQL(text, dt, true, true));
     } else {
-      throw std::runtime_error("Unexpected SQL statement type: " + text);
+      // TODO: Maybe remove this redundant parsing after enhancing Parser::Stmt?
+      SQLParser parser;
+      std::list<std::unique_ptr<Parser::Stmt>> parse_trees;
+      std::string last_parsed;
+      CHECK_EQ(parser.parse(text, parse_trees, last_parsed), 0);
+      CHECK_EQ(parse_trees.size(), size_t(1));
+      auto stmt = parse_trees.front().get();
+      Parser::DDLStmt* ddl = dynamic_cast<Parser::DDLStmt*>(stmt);
+      Parser::DMLStmt* dml = dynamic_cast<Parser::DMLStmt*>(stmt);
+      if (ddl != nullptr && dml == nullptr) {
+        runDDLStatement(text);
+        results.push_back(nullptr);
+      } else if (ddl == nullptr && dml != nullptr) {
+        results.push_back(runSQL(text, dt, true, true));
+      } else {
+        throw std::runtime_error("Unexpected SQL statement type: " + text);
+      }
     }
   }
   return results;
@@ -566,6 +697,11 @@ std::shared_ptr<ExecutionResult> run_select_query_with_filter_push_down(
   const bool cpu_mode_enabled = query_hints.isHintRegistered(QueryHint::kCpuMode);
   if (cpu_mode_enabled) {
     co.device_type = ExecutorDeviceType::CPU;
+  }
+  if (query_hints.isHintRegistered(QueryHint::kColumnarOutput)) {
+    eo.output_columnar_hint = true;
+  } else if (query_hints.isHintRegistered(QueryHint::kRowwiseOutput)) {
+    eo.output_columnar_hint = false;
   }
   auto result = std::make_shared<ExecutionResult>(
       ra_executor.executeRelAlgQuery(co, eo, false, nullptr));
@@ -655,6 +791,11 @@ std::shared_ptr<ExecutionResult> QueryRunner::runSelectQuery(const std::string& 
         const bool cpu_mode_enabled = query_hints.isHintRegistered(QueryHint::kCpuMode);
         if (cpu_mode_enabled) {
           co.device_type = ExecutorDeviceType::CPU;
+        }
+        if (query_hints.isHintRegistered(QueryHint::kColumnarOutput)) {
+          eo.output_columnar_hint = true;
+        } else if (query_hints.isHintRegistered(QueryHint::kRowwiseOutput)) {
+          eo.output_columnar_hint = false;
         }
         result = std::make_shared<ExecutionResult>(
             ra_executor.executeRelAlgQuery(co, eo, false, nullptr));
@@ -753,8 +894,10 @@ void ImportDriver::importGeoTable(const std::string& file_path,
   copy_params.geo_assign_render_groups = true;
   copy_params.geo_explode_collections = explode_collections;
 
-  auto cds = Importer::gdalToColumnDescriptors(file_path, geo_column_name, copy_params);
   std::map<std::string, std::string> colname_to_src;
+  auto& cat = session_info_->getCatalog();
+  auto cds = Importer::gdalToColumnDescriptors(file_path, geo_column_name, copy_params);
+
   for (auto& cd : cds) {
     const auto col_name_sanitized = ImportHelpers::sanitize_name(cd.columnName);
     const auto ret =
@@ -762,8 +905,6 @@ void ImportDriver::importGeoTable(const std::string& file_path,
     CHECK(ret.second);
     cd.columnName = col_name_sanitized;
   }
-
-  auto& cat = session_info_->getCatalog();
 
   if (create_table) {
     const auto td = cat.getMetadataForTable(table_name);

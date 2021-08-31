@@ -60,7 +60,6 @@
 #include "Shared/ThriftTypesConvert.h"
 #include "Shared/base64.h"
 #include "Shared/checked_alloc.h"
-#include "Shared/mapd_shared_ptr.h"
 #include "Shared/misc.h"
 #include "gen-cpp/OmniSci.h"
 
@@ -581,10 +580,10 @@ bool backchannel(int action, ClientContext* cc, const std::string& ccn = "") {
   }
   if (state == INTERRUPTIBLE && action == INTERRUPT) {
     CHECK(context);
-    mapd::shared_ptr<ThriftClientConnection> connMgr;
-    mapd::shared_ptr<TTransport> transport2;
-    mapd::shared_ptr<TProtocol> protocol2;
-    mapd::shared_ptr<TTransport> socket2;
+    std::shared_ptr<ThriftClientConnection> connMgr;
+    std::shared_ptr<TTransport> transport2;
+    std::shared_ptr<TProtocol> protocol2;
+    std::shared_ptr<TTransport> socket2;
     connMgr = std::make_shared<ThriftClientConnection>();
     if (context->http || context->https) {
       transport2 = connMgr->open_http_client_transport(context->server_host,
@@ -592,11 +591,11 @@ bool backchannel(int action, ClientContext* cc, const std::string& ccn = "") {
                                                        ca_cert_name,
                                                        context->https,
                                                        context->skip_host_verify);
-      protocol2 = mapd::shared_ptr<TProtocol>(new TJSONProtocol(transport2));
+      protocol2 = std::shared_ptr<TProtocol>(new TJSONProtocol(transport2));
     } else {
       transport2 = connMgr->open_buffered_client_transport(
           context->server_host, context->port, ca_cert_name);
-      protocol2 = mapd::shared_ptr<TProtocol>(new TBinaryProtocol(transport2));
+      protocol2 = std::shared_ptr<TProtocol>(new TBinaryProtocol(transport2));
     }
     OmniSciClient c2(protocol2);
     ClientContext context2(*transport2, c2);
@@ -1209,18 +1208,18 @@ int main(int argc, char** argv) {
     passwd = mapd_getpass();
   }
 
-  mapd::shared_ptr<ThriftClientConnection> connMgr;
+  std::shared_ptr<ThriftClientConnection> connMgr;
   connMgr = std::make_shared<ThriftClientConnection>();
-  mapd::shared_ptr<TTransport> transport;
-  mapd::shared_ptr<TProtocol> protocol;
-  mapd::shared_ptr<TTransport> socket;
+  std::shared_ptr<TTransport> transport;
+  std::shared_ptr<TProtocol> protocol;
+  std::shared_ptr<TTransport> socket;
   if (https || http) {
     transport = connMgr->open_http_client_transport(
         server_host, port, ca_cert_name, https, skip_host_verify);
-    protocol = mapd::shared_ptr<TProtocol>(new TJSONProtocol(transport));
+    protocol = std::shared_ptr<TProtocol>(new TJSONProtocol(transport));
   } else {
     transport = connMgr->open_buffered_client_transport(server_host, port, ca_cert_name);
-    protocol = mapd::shared_ptr<TProtocol>(new TBinaryProtocol(transport));
+    protocol = std::shared_ptr<TProtocol>(new TBinaryProtocol(transport));
   }
   OmniSciClient c(protocol);
   ClientContext context(*transport, c);
@@ -1446,6 +1445,9 @@ int main(int argc, char** argv) {
       }
       if (nullptr != (env = getenv("AWS_SECRET_ACCESS_KEY"))) {
         copy_params.s3_secret_key = env;
+      }
+      if (nullptr != (env = getenv("AWS_SESSION_TOKEN"))) {
+        copy_params.s3_session_token = env;
       }
       detect_table(filepath, copy_params, context);
     } else if (!strncmp(line, "\\historylen", 11)) {

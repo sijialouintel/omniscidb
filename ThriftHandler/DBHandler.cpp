@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 OmniSci, Inc.
+ * Copyright 2021 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@
 
 #include "DBHandler.h"
 #include "DistributedLoader.h"
-#include "QueryEngine/UDFCompiler.h"
 #include "TokenCompletionHints.h"
 
 #ifdef HAVE_PROFILER
@@ -43,6 +42,7 @@
 #include "DataMgr/ForeignStorage/DummyForeignStorage.h"
 #include "DistributedHandler.h"
 #include "Fragmenter/InsertOrderFragmenter.h"
+#include "Geospatial/Compression.h"
 #include "Geospatial/GDAL.h"
 #include "Geospatial/Transforms.h"
 #include "Geospatial/Types.h"
@@ -70,7 +70,11 @@
 #include "Shared/mapd_shared_mutex.h"
 #include "Shared/measure.h"
 #include "Shared/scope.h"
+#include "UdfCompiler/UdfCompiler.h"
 
+#ifdef HAVE_AWS_S3
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
+#endif
 #include <fcntl.h>
 #include <picosha2.h>
 #include <sys/types.h>
@@ -101,6 +105,10 @@
 #include "Shared/ArrowUtil.h"
 
 #define ENABLE_GEO_IMPORT_COLUMN_MATCHING 0
+
+#ifdef HAVE_AWS_S3
+extern bool g_allow_s3_server_privileges;
+#endif
 
 using Catalog_Namespace::Catalog;
 using Catalog_Namespace::SysCatalog;
@@ -240,7 +248,7 @@ DBHandler::DBHandler(const std::vector<LeafHostInfo>& db_leaves,
 #ifdef ENABLE_GEOS
                      const std::string& libgeos_so_filename,
 #endif
-                     const DiskCacheConfig& disk_cache_config,
+                     const File_Namespace::DiskCacheConfig& disk_cache_config,
                      const bool is_new_db)
     : leaf_aggregator_(db_leaves)
     , db_leaves_(db_leaves)
@@ -304,7 +312,7 @@ void DBHandler::initialize(const bool is_new_db) {
     cpu_mode_only_ = false;
 #else
     executor_device_type_ = ExecutorDeviceType::CPU;
-    LOG(ERROR) << "This build isn't CUDA enabled, will run on CPU";
+    LOG(WARNING) << "This build isn't CUDA enabled, will run on CPU";
     cpu_mode_only_ = true;
 #endif
   }
@@ -357,12 +365,14 @@ void DBHandler::initialize(const bool is_new_db) {
       const CudaMgr_Namespace::NvidiaDeviceArch device_arch =
           cuda_mgr ? cuda_mgr->getDeviceArch()
                    : CudaMgr_Namespace::NvidiaDeviceArch::Kepler;
-      UdfCompiler compiler(udf_filename_, device_arch, clang_path_, clang_options_);
-      int compile_result = compiler.compileUdf();
+      UdfCompiler compiler(device_arch, clang_path_, clang_options_);
 
-      if (compile_result == 0) {
-        udf_ast_filename = compiler.getAstFileName();
+      const auto [cpu_udf_ir_file, cuda_udf_ir_file] = compiler.compileUdf(udf_filename_);
+      Executor::addUdfIrToModule(cpu_udf_ir_file, /*is_cuda_ir=*/false);
+      if (!cuda_udf_ir_file.empty()) {
+        Executor::addUdfIrToModule(cuda_udf_ir_file, /*is_cuda_ir=*/true);
       }
+      udf_ast_filename = compiler.getAstFileName(udf_filename_);
     }
   } catch (const std::exception& e) {
     LOG(FATAL) << "Failed to initialize UDF compiler: " << e.what();
@@ -467,7 +477,9 @@ void DBHandler::initialize(const bool is_new_db) {
 #endif
 }
 
-DBHandler::~DBHandler() {}
+DBHandler::~DBHandler() {
+  shutdown();
+}
 
 void DBHandler::parser_with_error_handler(
     const std::string& query_str,
@@ -508,7 +520,8 @@ std::string const DBHandler::createInMemoryCalciteSession(
                                             calcite_->getInternalSessionProxyPassword(),
                                             true,
                                             -1,
-                                            true);
+                                            true,
+                                            false);
   const auto emplace_ret =
       sessions_.emplace(session_id,
                         std::make_shared<Catalog_Namespace::SessionInfo>(
@@ -792,6 +805,16 @@ void DBHandler::interrupt(const TSessionId& query_session,
   }
 }
 
+TRole::type DBHandler::getServerRole() const {
+  if (g_cluster) {
+    if (leaf_aggregator_.leafCount() > 0) {
+      return TRole::type::AGGREGATOR;
+    }
+    return TRole::type::LEAF;
+  }
+  return TRole::type::SERVER;
+}
+
 void DBHandler::get_server_status(TServerStatus& _return, const TSessionId& session) {
   auto stdlog = STDLOG(get_session_ptr(session));
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
@@ -799,34 +822,47 @@ void DBHandler::get_server_status(TServerStatus& _return, const TSessionId& sess
   _return.read_only = read_only_;
   _return.version = MAPD_RELEASE;
   _return.rendering_enabled = rendering_enabled;
-  _return.poly_rendering_enabled = rendering_enabled;
   _return.start_time = start_time_;
   _return.edition = MAPD_EDITION;
   _return.host_name = omnisci::get_hostname();
+  _return.poly_rendering_enabled = rendering_enabled;
+  _return.role = getServerRole();
+  _return.renderer_status_json =
+      render_handler_ ? render_handler_->get_renderer_status_json() : "";
 }
 
 void DBHandler::get_status(std::vector<TServerStatus>& _return,
                            const TSessionId& session) {
-  auto stdlog = STDLOG(get_session_ptr(session));
-  stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+  //
+  // get_status() is now called locally at startup on the aggregator
+  // in order to validate that all nodes of a cluster are running the
+  // same software version and the same renderer status
+  //
+  // In that context, it is called with the InvalidSessionID, and
+  // with the local super-user flag set.
+  //
+  // Hence, we allow this session-less mode only in distributed mode, and
+  // then on a leaf (always), or on the aggregator (only in super-user mode)
+  //
+  auto const allow_invalid_session = g_cluster && (!isAggregator() || super_user_rights_);
+  if (!allow_invalid_session || session != getInvalidSessionId()) {
+    auto stdlog = STDLOG(get_session_ptr(session));
+    stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+  } else {
+    LOG(INFO) << "get_status() called in session-less mode";
+  }
   const auto rendering_enabled = bool(render_handler_);
   TServerStatus ret;
   ret.read_only = read_only_;
   ret.version = MAPD_RELEASE;
   ret.rendering_enabled = rendering_enabled;
-  ret.poly_rendering_enabled = rendering_enabled;
   ret.start_time = start_time_;
   ret.edition = MAPD_EDITION;
   ret.host_name = omnisci::get_hostname();
-
-  // TSercivePort tcp_port{}
-
-  if (g_cluster) {
-    ret.role =
-        (leaf_aggregator_.leafCount() > 0) ? TRole::type::AGGREGATOR : TRole::type::LEAF;
-  } else {
-    ret.role = TRole::type::SERVER;
-  }
+  ret.poly_rendering_enabled = rendering_enabled;
+  ret.role = getServerRole();
+  ret.renderer_status_json =
+      render_handler_ ? render_handler_->get_renderer_status_json() : "";
 
   _return.push_back(ret);
   if (leaf_aggregator_.leafCount() > 0) {
@@ -1259,14 +1295,13 @@ void DBHandler::sql_execute(TQueryResult& _return,
     VLOG(1) << "Table Data Locks:\n" << lockmgr::TableDataLockMgr::instance();
   } catch (const std::exception& e) {
     if (strstr(e.what(), "java.lang.NullPointerException")) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") +
-                           "query failed from broken view or other schema related issue");
+      THROW_MAPD_EXCEPTION("query failed from broken view or other schema related issue");
     } else if (strstr(e.what(), "SQL Error: Encountered \";\"")) {
       THROW_MAPD_EXCEPTION("multiple SQL statements not allowed");
     } else if (strstr(e.what(), "SQL Error: Encountered \"<EOF>\" at line 0, column 0")) {
       THROW_MAPD_EXCEPTION("empty SQL statment not allowed");
     } else {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+      THROW_MAPD_EXCEPTION(e.what());
     }
   }
 }
@@ -1317,14 +1352,13 @@ void DBHandler::sql_execute(ExecutionResult& _return,
     VLOG(1) << "Table Data Locks:\n" << lockmgr::TableDataLockMgr::instance();
   } catch (const std::exception& e) {
     if (strstr(e.what(), "java.lang.NullPointerException")) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") +
-                           "query failed from broken view or other schema related issue");
+      THROW_MAPD_EXCEPTION("query failed from broken view or other schema related issue");
     } else if (strstr(e.what(), "SQL Error: Encountered \";\"")) {
       THROW_MAPD_EXCEPTION("multiple SQL statements not allowed");
     } else if (strstr(e.what(), "SQL Error: Encountered \"<EOF>\" at line 0, column 0")) {
       THROW_MAPD_EXCEPTION("empty SQL statment not allowed");
     } else {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+      THROW_MAPD_EXCEPTION(e.what());
     }
   }
 }
@@ -1364,7 +1398,7 @@ int64_t DBHandler::process_geo_copy_from(const TSessionId& session_id) {
 void DBHandler::sql_execute_df(TDataFrame& _return,
                                const TSessionId& session,
                                const std::string& query_str,
-                               const TDeviceType::type device_type,
+                               const TDeviceType::type results_device_type,
                                const int32_t device_id,
                                const int32_t first_n,
                                const TArrowTransport::type transport_method) {
@@ -1372,18 +1406,18 @@ void DBHandler::sql_execute_df(TDataFrame& _return,
   auto query_state = create_query_state(session_ptr, query_str);
   auto stdlog = STDLOG(session_ptr, query_state);
 
-  if (device_type == TDeviceType::GPU) {
-    const auto executor_device_type = session_ptr->get_executor_device_type();
+  const auto executor_device_type = session_ptr->get_executor_device_type();
+
+  if (results_device_type == TDeviceType::GPU) {
     if (executor_device_type != ExecutorDeviceType::GPU) {
-      THROW_MAPD_EXCEPTION(
-          std::string("Exception: GPU mode is not allowed in this session"));
+      THROW_MAPD_EXCEPTION(std::string("GPU mode is not allowed in this session"));
     }
     if (!data_mgr_->gpusPresent()) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: no GPU is available in this server"));
+      THROW_MAPD_EXCEPTION(std::string("No GPU is available in this server"));
     }
     if (device_id < 0 || device_id >= data_mgr_->getCudaMgr()->getDeviceCount()) {
       THROW_MAPD_EXCEPTION(
-          std::string("Exception: invalid device_id or unavailable GPU with this ID"));
+          std::string("Invalid device_id or unavailable GPU with this ID"));
     }
   }
   _return.execution_time_ms = 0;
@@ -1420,18 +1454,19 @@ void DBHandler::sql_execute_df(TDataFrame& _return,
                          query_ra,
                          query_state_proxy,
                          *session_ptr,
-                         device_type == TDeviceType::CPU ? ExecutorDeviceType::CPU
-                                                         : ExecutorDeviceType::GPU,
+                         executor_device_type,
+                         results_device_type == TDeviceType::CPU
+                             ? ExecutorDeviceType::CPU
+                             : ExecutorDeviceType::GPU,
                          static_cast<size_t>(device_id),
                          first_n,
                          transport_method);
       return;
     }
   } catch (std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
-  THROW_MAPD_EXCEPTION(
-      "Exception: DDL or update DML are not unsupported by current thrift API");
+  THROW_MAPD_EXCEPTION("DDL or update DML are not unsupported by current thrift API");
 }
 
 void DBHandler::sql_execute_gdf(TDataFrame& _return,
@@ -1461,7 +1496,7 @@ void DBHandler::deallocate_df(const TSessionId& session,
     if (ipc_handle_to_dev_ptr_.count(df.df_handle) != size_t(1)) {
       TOmniSciException ex;
       ex.error_msg = std::string(
-          "Exception: current data frame handle is not bookkept or been inserted "
+          "Current data frame handle is not bookkept or been inserted "
           "twice");
       LOG(ERROR) << ex.error_msg;
       throw ex;
@@ -1528,7 +1563,7 @@ void DBHandler::sql_validate(TRowDescriptor& _return,
     _return = fixup_row_descriptor(result.row_set.row_desc,
                                    query_state->getConstSessionInfo()->getCatalog());
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -1607,12 +1642,13 @@ void DBHandler::get_completion_hints_unsorted(std::vector<TCompletionHint>& hint
   const auto& session_info = *stdlog.getConstSessionInfo();
   try {
     get_tables_impl(visible_tables, session_info, GET_PHYSICAL_TABLES_AND_VIEWS);
+
     // Filter out keywords suggested by Calcite which we don't support.
     hints = just_whitelisted_keyword_hints(
         calcite_->getCompletionHints(session_info, visible_tables, sql, cursor));
   } catch (const std::exception& e) {
     TOmniSciException ex;
-    ex.error_msg = "Exception: " + std::string(e.what());
+    ex.error_msg = std::string(e.what());
     LOG(ERROR) << ex.error_msg;
     throw ex;
   }
@@ -1728,6 +1764,7 @@ TQueryResult DBHandler::validate_rel_alg(const std::string& query_ra,
   ExecutionResult result;
   auto execute_rel_alg_task = std::make_shared<QueryDispatchQueue::Task>(
       [this, &result, &query_state_proxy, &query_ra](const size_t executor_index) {
+        auto qid_scope_guard = query_state_proxy.getQueryState().setThreadLocalQueryId();
         execute_rel_alg(result,
                         query_state_proxy,
                         query_ra,
@@ -2194,7 +2231,7 @@ void DBHandler::get_result_row_for_pixel(
                                               pixel_radius,
                                               nonce);
   } catch (std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
 }
 
@@ -2239,6 +2276,9 @@ TColumnType DBHandler::populateThriftColumnType(const Catalog* cat,
             : cd->columnType.get_comp_param();
   }
   col_type.is_reserved_keyword = ImportHelpers::is_reserved_name(col_type.col_name);
+  if (cd->default_value.has_value()) {
+    col_type.__set_default_value(cd->getDefaultValueLiteral());
+  }
   return col_type;
 }
 
@@ -2250,6 +2290,16 @@ void DBHandler::get_internal_table_details(TTableDetails& _return,
   get_table_details_impl(_return, stdlog, table_name, true, false);
 }
 
+void DBHandler::get_internal_table_details_for_database(
+    TTableDetails& _return,
+    const TSessionId& session,
+    const std::string& table_name,
+    const std::string& database_name) {
+  auto stdlog = STDLOG(get_session_ptr(session), "table_name", table_name);
+  stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+  get_table_details_impl(_return, stdlog, table_name, true, false, database_name);
+}
+
 void DBHandler::get_table_details(TTableDetails& _return,
                                   const TSessionId& session,
                                   const std::string& table_name) {
@@ -2258,14 +2308,26 @@ void DBHandler::get_table_details(TTableDetails& _return,
   get_table_details_impl(_return, stdlog, table_name, false, false);
 }
 
+void DBHandler::get_table_details_for_database(TTableDetails& _return,
+                                               const TSessionId& session,
+                                               const std::string& table_name,
+                                               const std::string& database_name) {
+  auto stdlog = STDLOG(get_session_ptr(session), "table_name", table_name);
+  stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+  get_table_details_impl(_return, stdlog, table_name, false, false, database_name);
+}
+
 void DBHandler::get_table_details_impl(TTableDetails& _return,
                                        query_state::StdLog& stdlog,
                                        const std::string& table_name,
                                        const bool get_system,
-                                       const bool get_physical) {
+                                       const bool get_physical,
+                                       const std::string& database_name) {
   try {
     auto session_info = stdlog.getSessionInfo();
-    auto& cat = session_info->getCatalog();
+    auto& cat = (database_name.empty())
+                    ? session_info->getCatalog()
+                    : *SysCatalog::instance().getCatalog(database_name);
     const auto td_with_lock =
         lockmgr::TableSchemaLockContainer<lockmgr::ReadLock>::acquireTableDescriptor(
             cat, table_name, false);
@@ -2346,7 +2408,7 @@ void DBHandler::get_table_details_impl(TTableDetails& _return,
                    : (td->partitions == "SHARDED" ? TPartitionDetail::SHARDED
                                                   : TPartitionDetail::OTHER));
   } catch (const std::runtime_error& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -2386,9 +2448,16 @@ bool DBHandler::hasTableAccessPrivileges(
 
 void DBHandler::get_tables_impl(std::vector<std::string>& table_names,
                                 const Catalog_Namespace::SessionInfo& session_info,
-                                const GetTablesType get_tables_type) {
-  table_names = session_info.getCatalog().getTableNamesForUser(
-      session_info.get_currentUser(), get_tables_type);
+                                const GetTablesType get_tables_type,
+                                const std::string& database_name) {
+  if (database_name.empty()) {
+    table_names = session_info.getCatalog().getTableNamesForUser(
+        session_info.get_currentUser(), get_tables_type);
+  } else {
+    auto request_cat = SysCatalog::instance().getCatalog(database_name);
+    table_names = request_cat->getTableNamesForUser(session_info.get_currentUser(),
+                                                    get_tables_type);
+  }
 }
 
 void DBHandler::get_tables(std::vector<std::string>& table_names,
@@ -2397,6 +2466,18 @@ void DBHandler::get_tables(std::vector<std::string>& table_names,
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
   get_tables_impl(
       table_names, *stdlog.getConstSessionInfo(), GET_PHYSICAL_TABLES_AND_VIEWS);
+}
+
+void DBHandler::get_tables_for_database(std::vector<std::string>& table_names,
+                                        const TSessionId& session,
+                                        const std::string& database_name) {
+  auto stdlog = STDLOG(get_session_ptr(session));
+  stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+
+  get_tables_impl(table_names,
+                  *stdlog.getConstSessionInfo(),
+                  GET_PHYSICAL_TABLES_AND_VIEWS,
+                  database_name);
 }
 
 void DBHandler::get_physical_tables(std::vector<std::string>& table_names,
@@ -2592,7 +2673,8 @@ void DBHandler::clear_cpu_memory(const TSessionId& session) {
 void DBHandler::set_cur_session(const TSessionId& parent_session,
                                 const TSessionId& leaf_session,
                                 const std::string& start_time_str,
-                                const std::string& label) {
+                                const std::string& label,
+                                bool for_running_query_kernel) {
   // internal API to manage query interruption in distributed mode
   auto stdlog = STDLOG(get_session_ptr(leaf_session));
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
@@ -2603,24 +2685,21 @@ void DBHandler::set_cur_session(const TSessionId& parent_session,
                                label,
                                start_time_str,
                                Executor::UNITARY_EXECUTOR_ID,
-                               QuerySessionStatus::QueryStatus::RUNNING);
-  if (leaf_aggregator_.leafCount() > 0) {
-    leaf_aggregator_.set_cur_session(parent_session, start_time_str, label);
-  }
+                               for_running_query_kernel
+                                   ? QuerySessionStatus::QueryStatus::RUNNING_QUERY_KERNEL
+                                   : QuerySessionStatus::QueryStatus::RUNNING_IMPORTER);
 }
 
 void DBHandler::invalidate_cur_session(const TSessionId& parent_session,
                                        const TSessionId& leaf_session,
                                        const std::string& start_time_str,
-                                       const std::string& label) {
+                                       const std::string& label,
+                                       bool for_running_query_kernel) {
   // internal API to manage query interruption in distributed mode
   auto stdlog = STDLOG(get_session_ptr(leaf_session));
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
   auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID).get();
-  executor->clearQuerySessionStatus(parent_session, start_time_str, false);
-  if (leaf_aggregator_.leafCount() > 0) {
-    leaf_aggregator_.invalidate_cur_session(parent_session, start_time_str, label);
-  }
+  executor->clearQuerySessionStatus(parent_session, start_time_str);
 }
 
 TSessionId DBHandler::getInvalidSessionId() const {
@@ -2777,6 +2856,140 @@ std::vector<int> column_ids_by_names(const std::list<const ColumnDescriptor*>& d
 
 }  // namespace
 
+void DBHandler::fillGeoColumns(
+    const TSessionId& session,
+    const Catalog& catalog,
+    std::vector<std::unique_ptr<import_export::TypedImportBuffer>>& import_buffers,
+    const ColumnDescriptor* cd,
+    size_t& col_idx,
+    size_t num_rows,
+    const std::string& table_name,
+    bool assign_render_groups) {
+  auto geo_col_idx = col_idx - 1;
+  const auto wkt_or_wkb_hex_column = import_buffers[geo_col_idx]->getGeoStringBuffer();
+  std::vector<std::vector<double>> coords_column, bounds_column;
+  std::vector<std::vector<int>> ring_sizes_column, poly_rings_column;
+  std::vector<int> render_groups_column;
+  SQLTypeInfo ti = cd->columnType;
+  if (num_rows != wkt_or_wkb_hex_column->size() ||
+      !Geospatial::GeoTypesFactory::getGeoColumns(wkt_or_wkb_hex_column,
+                                                  ti,
+                                                  coords_column,
+                                                  bounds_column,
+                                                  ring_sizes_column,
+                                                  poly_rings_column,
+                                                  false)) {
+    std::ostringstream oss;
+    oss << "Invalid geometry in column " << cd->columnName;
+    THROW_MAPD_EXCEPTION(oss.str());
+  }
+
+  // start or continue assigning render groups for poly columns?
+  if (IS_GEO_POLY(cd->columnType.get_type()) && assign_render_groups) {
+    // get RGA to use
+    import_export::RenderGroupAnalyzer* render_group_analyzer{};
+    {
+      // mutex the map access
+      std::lock_guard<std::mutex> lock(render_group_assignment_mutex_);
+
+      // emplace new RGA or fetch existing RGA from map
+      auto [itr_table, emplaced_table] = render_group_assignment_map_.try_emplace(
+          session, RenderGroupAssignmentTableMap());
+      LOG_IF(INFO, emplaced_table)
+          << "load_table_binary_columnar_polys: Creating Render Group Assignment "
+             "Persistent Data for Session '"
+          << session << "'";
+      auto [itr_column, emplaced_column] =
+          itr_table->second.try_emplace(table_name, RenderGroupAssignmentColumnMap());
+      LOG_IF(INFO, emplaced_column)
+          << "load_table_binary_columnar_polys: Creating Render Group Assignment "
+             "Persistent Data for Table '"
+          << table_name << "'";
+      auto [itr_analyzer, emplaced_analyzer] = itr_column->second.try_emplace(
+          cd->columnName, std::make_unique<import_export::RenderGroupAnalyzer>());
+      LOG_IF(INFO, emplaced_analyzer)
+          << "load_table_binary_columnar_polys: Creating Render Group Assignment "
+             "Persistent Data for Column '"
+          << cd->columnName << "'";
+      render_group_analyzer = itr_analyzer->second.get();
+      CHECK(render_group_analyzer);
+
+      // seed new RGA from existing table/column, to handle appends
+      if (emplaced_analyzer) {
+        LOG(INFO) << "load_table_binary_columnar_polys: Seeding Render Groups from "
+                     "existing table...";
+        render_group_analyzer->seedFromExistingTableContents(
+            catalog, table_name, cd->columnName);
+        LOG(INFO) << "load_table_binary_columnar_polys: Done";
+      }
+    }
+
+    // assign render groups for this set of bounds
+    LOG(INFO) << "load_table_binary_columnar_polys: Assigning Render Groups...";
+    render_groups_column.reserve(bounds_column.size());
+    for (auto const& bounds : bounds_column) {
+      CHECK_EQ(bounds.size(), 4u);
+      int rg = render_group_analyzer->insertBoundsAndReturnRenderGroup(bounds);
+      render_groups_column.push_back(rg);
+    }
+    LOG(INFO) << "load_table_binary_columnar_polys: Done";
+  } else {
+    // render groups all zero
+    render_groups_column.resize(bounds_column.size(), 0);
+  }
+
+  // Populate physical columns, advance col_idx
+  import_export::Importer::set_geo_physical_import_buffer_columnar(catalog,
+                                                                   cd,
+                                                                   import_buffers,
+                                                                   col_idx,
+                                                                   coords_column,
+                                                                   bounds_column,
+                                                                   ring_sizes_column,
+                                                                   poly_rings_column,
+                                                                   render_groups_column);
+}
+
+void DBHandler::fillMissingBuffers(
+    const TSessionId& session,
+    const Catalog& catalog,
+    std::vector<std::unique_ptr<import_export::TypedImportBuffer>>& import_buffers,
+    const std::list<const ColumnDescriptor*>& cds,
+    const std::vector<int>& desc_id_to_column_id,
+    size_t num_rows,
+    const std::string& table_name,
+    bool assign_render_groups) {
+  size_t skip_physical_cols = 0;
+  size_t col_idx = 0, import_idx = 0;
+  for (const auto& cd : cds) {
+    if (skip_physical_cols > 0) {
+      CHECK(cd->isGeoPhyCol);
+      skip_physical_cols--;
+      continue;
+    } else if (cd->columnType.is_geometry()) {
+      skip_physical_cols = cd->columnType.get_physical_cols();
+    }
+    if (desc_id_to_column_id[import_idx] == -1) {
+      import_buffers[col_idx]->addDefaultValues(cd, num_rows);
+      col_idx++;
+      if (cd->columnType.is_geometry()) {
+        fillGeoColumns(session,
+                       catalog,
+                       import_buffers,
+                       cd,
+                       col_idx,
+                       num_rows,
+                       table_name,
+                       assign_render_groups);
+      }
+    } else {
+      col_idx++;
+      col_idx += skip_physical_cols;
+    }
+    import_idx++;
+  }
+}
+
 void DBHandler::load_table_binary(const TSessionId& session,
                                   const std::string& table_name,
                                   const std::vector<TRow>& rows,
@@ -2803,19 +3016,15 @@ void DBHandler::load_table_binary(const TSessionId& session,
     auto col_descs = loader->get_column_descs();
     auto desc_id_to_column_id = column_ids_by_names(col_descs, column_names);
 
-    TDatum empty_value;
-    empty_value.is_null = true;
     size_t rows_completed = 0;
     for (auto const& row : rows) {
       size_t col_idx = 0;
       try {
         for (auto cd : col_descs) {
-          int mapped_idx = desc_id_to_column_id[col_idx];
+          auto mapped_idx = desc_id_to_column_id[col_idx];
           if (mapped_idx != -1) {
             import_buffers[col_idx]->add_value(
                 cd, row.cols[mapped_idx], row.cols[mapped_idx].is_null);
-          } else {
-            import_buffers[col_idx]->add_value(cd, empty_value, true);
           }
           col_idx++;
         }
@@ -2829,13 +3038,21 @@ void DBHandler::load_table_binary(const TSessionId& session,
                    << " data :" << row;
       }
     }
+    fillMissingBuffers(session,
+                       session_ptr->getCatalog(),
+                       import_buffers,
+                       col_descs,
+                       desc_id_to_column_id,
+                       rows_completed,
+                       table_name,
+                       false);
     auto insert_data_lock = lockmgr::InsertDataLockMgr::getWriteLockForTable(
         session_ptr->getCatalog(), table_name);
     if (!loader->load(import_buffers, rows.size(), session_ptr.get())) {
       THROW_MAPD_EXCEPTION(loader->getErrorMessage());
     }
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -2986,125 +3203,44 @@ void DBHandler::load_table_binary_columnar_internal(
   size_t num_rows = get_column_size(cols.front());
   size_t import_idx = 0;  // index into the TColumn vector being loaded
   size_t col_idx = 0;     // index into column description vector
-  TColumn empty_column;
-  empty_column.nulls.resize(num_rows, true);
-  empty_column.data.arr_col.resize(num_rows);
-  empty_column.data.int_col.resize(num_rows);
-  empty_column.data.str_col.resize(num_rows);
-  empty_column.data.real_col.resize(num_rows);
   try {
     size_t skip_physical_cols = 0;
     for (auto cd : loader->get_column_descs()) {
       if (skip_physical_cols > 0) {
-        if (!cd->isGeoPhyCol) {
-          throw std::runtime_error("Unexpected physical column");
-        }
+        CHECK(cd->isGeoPhyCol);
         skip_physical_cols--;
         continue;
       }
-      int mapped_idx = desc_id_to_column_id[import_idx];
-      const TColumn& value = mapped_idx == -1 ? empty_column : cols[mapped_idx];
-      size_t col_rows = import_buffers[col_idx]->add_values(cd, value);
-      if (col_rows != num_rows) {
-        std::ostringstream oss;
-        oss << "load_table_binary_columnar: Inconsistent number of rows in column "
-            << cd->columnName << " ,  expecting " << num_rows << " rows, column "
-            << col_idx << " has " << col_rows << " rows";
-        THROW_MAPD_EXCEPTION(oss.str());
-      }
-      // Advance to the next column in the table
-      col_idx++;
-
-      // For geometry columns: process WKT strings and fill physical columns
-      if (cd->columnType.is_geometry()) {
-        auto geo_col_idx = col_idx - 1;
-        const auto wkt_or_wkb_hex_column =
-            import_buffers[geo_col_idx]->getGeoStringBuffer();
-        std::vector<std::vector<double>> coords_column, bounds_column;
-        std::vector<std::vector<int>> ring_sizes_column, poly_rings_column;
-        std::vector<int> render_groups_column;
-        SQLTypeInfo ti = cd->columnType;
-        if (num_rows != wkt_or_wkb_hex_column->size() ||
-            !Geospatial::GeoTypesFactory::getGeoColumns(wkt_or_wkb_hex_column,
-                                                        ti,
-                                                        coords_column,
-                                                        bounds_column,
-                                                        ring_sizes_column,
-                                                        poly_rings_column,
-                                                        false)) {
+      auto mapped_idx = desc_id_to_column_id[import_idx];
+      if (mapped_idx != -1) {
+        size_t col_rows = import_buffers[col_idx]->add_values(cd, cols[mapped_idx]);
+        if (col_rows != num_rows) {
           std::ostringstream oss;
-          oss << "load_table_binary_columnar: Invalid geometry in column "
-              << cd->columnName;
+          oss << "load_table_binary_columnar: Inconsistent number of rows in column "
+              << cd->columnName << " ,  expecting " << num_rows << " rows, column "
+              << col_idx << " has " << col_rows << " rows";
           THROW_MAPD_EXCEPTION(oss.str());
         }
-
-        // start or continue assigning render groups for poly columns?
-        if (IS_GEO_POLY(cd->columnType.get_type()) &&
-            assign_render_groups_mode == AssignRenderGroupsMode::kAssign) {
-          // get RGA to use
-          import_export::RenderGroupAnalyzer* render_group_analyzer{};
-          {
-            // mutex the map access
-            std::lock_guard<std::mutex> lock(render_group_assignment_mutex_);
-
-            // emplace new RGA or fetch existing RGA from map
-            auto [itr_table, emplaced_table] = render_group_assignment_map_.try_emplace(
-                session, RenderGroupAssignmentTableMap());
-            LOG_IF(INFO, emplaced_table)
-                << "load_table_binary_columnar_polys: Creating Render Group Assignment "
-                   "Persistent Data for Session '"
-                << session << "'";
-            auto [itr_column, emplaced_column] = itr_table->second.try_emplace(
-                table_name, RenderGroupAssignmentColumnMap());
-            LOG_IF(INFO, emplaced_column)
-                << "load_table_binary_columnar_polys: Creating Render Group Assignment "
-                   "Persistent Data for Table '"
-                << table_name << "'";
-            auto [itr_analyzer, emplaced_analyzer] = itr_column->second.try_emplace(
-                cd->columnName, std::make_unique<import_export::RenderGroupAnalyzer>());
-            LOG_IF(INFO, emplaced_analyzer)
-                << "load_table_binary_columnar_polys: Creating Render Group Assignment "
-                   "Persistent Data for Column '"
-                << cd->columnName << "'";
-            render_group_analyzer = itr_analyzer->second.get();
-            CHECK(render_group_analyzer);
-
-            // seed new RGA from existing table/column, to handle appends
-            if (emplaced_analyzer) {
-              LOG(INFO) << "load_table_binary_columnar_polys: Seeding Render Groups from "
-                           "existing table...";
-              render_group_analyzer->seedFromExistingTableContents(
-                  session_ptr->getCatalog(), table_name, cd->columnName);
-              LOG(INFO) << "load_table_binary_columnar_polys: Done";
-            }
-          }
-
-          // assign render groups for this set of bounds
-          LOG(INFO) << "load_table_binary_columnar_polys: Assigning Render Groups...";
-          render_groups_column.reserve(bounds_column.size());
-          for (auto const& bounds : bounds_column) {
-            CHECK_EQ(bounds.size(), 4u);
-            int rg = render_group_analyzer->insertBoundsAndReturnRenderGroup(bounds);
-            render_groups_column.push_back(rg);
-          }
-          LOG(INFO) << "load_table_binary_columnar_polys: Done";
-        } else {
-          // render groups all zero
-          render_groups_column.resize(bounds_column.size(), 0);
+        // Advance to the next column in the table
+        col_idx++;
+        // For geometry columns: process WKT strings and fill physical columns
+        if (cd->columnType.is_geometry()) {
+          fillGeoColumns(session,
+                         session_ptr->getCatalog(),
+                         import_buffers,
+                         cd,
+                         col_idx,
+                         num_rows,
+                         table_name,
+                         assign_render_groups_mode == AssignRenderGroupsMode::kAssign);
+          skip_physical_cols = cd->columnType.get_physical_cols();
         }
-
-        // Populate physical columns, advance col_idx
-        import_export::Importer::set_geo_physical_import_buffer_columnar(
-            session_ptr->getCatalog(),
-            cd,
-            import_buffers,
-            col_idx,
-            coords_column,
-            bounds_column,
-            ring_sizes_column,
-            poly_rings_column,
-            render_groups_column);
-        skip_physical_cols = cd->columnType.get_physical_cols();
+      } else {
+        col_idx++;
+        if (cd->columnType.is_geometry()) {
+          skip_physical_cols = cd->columnType.get_physical_cols();
+          col_idx += skip_physical_cols;
+        }
       }
       // Advance to the next column of values being loaded
       import_idx++;
@@ -3115,6 +3251,14 @@ void DBHandler::load_table_binary_columnar_internal(
         << ". Issue at column : " << (col_idx + 1) << ". Import aborted";
     THROW_MAPD_EXCEPTION(oss.str());
   }
+  fillMissingBuffers(session,
+                     session_ptr->getCatalog(),
+                     import_buffers,
+                     loader->get_column_descs(),
+                     desc_id_to_column_id,
+                     num_rows,
+                     table_name,
+                     assign_render_groups_mode == AssignRenderGroupsMode::kAssign);
   auto insert_data_lock = lockmgr::InsertDataLockMgr::getWriteLockForTable(
       session_ptr->getCatalog(), table_name);
   if (!loader->load(import_buffers, num_rows, session_ptr.get())) {
@@ -3199,29 +3343,14 @@ void DBHandler::load_table_binary_arrow(const TSessionId& session,
       column_ids_by_names(loader->get_column_descs(), column_names);
   size_t num_rows = 0;
   size_t col_idx = 0;
-  std::shared_ptr<arrow::Array> empty_array;
-  {
-    arrow::BooleanBuilder builder;
-    ARROW_THROW_NOT_OK(builder.Resize(batch->num_rows()));
-    ARROW_THROW_NOT_OK(builder.AppendNulls(batch->num_rows()));
-    auto status = builder.Finish(&empty_array);
-    if (!status.ok()) {
-      THROW_MAPD_EXCEPTION("Failed to load data: " + status.message());
-    }
-  }
-
   try {
     for (auto cd : loader->get_column_descs()) {
-      int mapped_idx = desc_id_to_column_id[col_idx];
+      auto mapped_idx = desc_id_to_column_id[col_idx];
       if (mapped_idx != -1) {
         auto& array = *batch->column(mapped_idx);
         import_export::ArraySliceRange row_slice(0, array.length());
         num_rows = import_buffers[col_idx]->add_arrow_values(
             cd, array, true, row_slice, nullptr);
-      } else {
-        import_export::ArraySliceRange row_slice(0, empty_array->length());
-        num_rows = import_buffers[col_idx]->add_arrow_values(
-            cd, *empty_array, false, row_slice, nullptr);
       }
       col_idx++;
     }
@@ -3230,8 +3359,16 @@ void DBHandler::load_table_binary_arrow(const TSessionId& session,
                << ". Issue at column : " << (col_idx + 1) << ". Import aborted";
     // TODO(tmostak): Go row-wise on binary columnar import to be consistent with our
     // other import paths
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
+  fillMissingBuffers(session,
+                     session_ptr->getCatalog(),
+                     import_buffers,
+                     loader->get_column_descs(),
+                     desc_id_to_column_id,
+                     num_rows,
+                     table_name,
+                     false);
   auto insert_data_lock = lockmgr::InsertDataLockMgr::getWriteLockForTable(
       session_ptr->getCatalog(), table_name);
   if (!loader->load(import_buffers, num_rows, session_ptr.get())) {
@@ -3274,66 +3411,80 @@ void DBHandler::load_table(const TSessionId& session,
         size_t skip_physical_cols = 0;
         for (auto cd : col_descs) {
           if (skip_physical_cols > 0) {
-            if (!cd->isGeoPhyCol) {
-              throw std::runtime_error("Unexpected physical column");
-            }
+            CHECK(cd->isGeoPhyCol);
             skip_physical_cols--;
             continue;
           }
-          const std::string empty_val = "";
-          int mapped_idx = desc_id_to_column_id[import_idx];
-          const std::string& value =
-              mapped_idx == -1 ? empty_val : row.cols[mapped_idx].str_val;
-          bool is_null = mapped_idx == -1 || row.cols[mapped_idx].is_null;
-          import_buffers[col_idx]->add_value(cd, value, is_null, copy_params);
-          // Advance to the next column within the table
+          auto mapped_idx = desc_id_to_column_id[import_idx];
+          if (mapped_idx != -1) {
+            import_buffers[col_idx]->add_value(cd,
+                                               row.cols[mapped_idx].str_val,
+                                               row.cols[mapped_idx].is_null,
+                                               copy_params);
+          }
           col_idx++;
-
           if (cd->columnType.is_geometry()) {
-            // Populate physical columns
-            std::vector<double> coords, bounds;
-            std::vector<int> ring_sizes, poly_rings;
-            int render_group = 0;
-            SQLTypeInfo ti{cd->columnType};
-            if (!Geospatial::GeoTypesFactory::getGeoColumns(
-                    !is_null ? value : std::string(),
-                    ti,
-                    coords,
-                    bounds,
-                    ring_sizes,
-                    poly_rings,
-                    false)) {
-              throw std::runtime_error("Invalid geometry");
-            }
-            if (cd->columnType.get_type() != ti.get_type()) {
-              throw std::runtime_error("Geometry type mismatch");
-            }
-            import_export::Importer::set_geo_physical_import_buffer(
-                session_ptr->getCatalog(),
-                cd,
-                import_buffers,
-                col_idx,
-                coords,
-                bounds,
-                ring_sizes,
-                poly_rings,
-                render_group);
+            // physical geo columns will be filled separately lately
             skip_physical_cols = cd->columnType.get_physical_cols();
+            col_idx += skip_physical_cols;
           }
           // Advance to the next field within the row
           import_idx++;
         }
         rows_completed++;
       } catch (const std::exception& e) {
-        for (size_t col_idx_to_pop = 0; col_idx_to_pop < col_idx; ++col_idx_to_pop) {
-          import_buffers[col_idx_to_pop]->pop_value();
-        }
         LOG(ERROR) << "Input exception thrown: " << e.what()
                    << ". Row discarded, issue at column : " << (col_idx + 1)
                    << " data :" << row;
         THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
       }
     }
+    // do batch filling of geo columns separately
+    if (rows.size() != 0) {
+      const auto& row = rows[0];
+      size_t col_idx = 0;  // index into column description vector
+      try {
+        size_t import_idx = 0;
+        size_t skip_physical_cols = 0;
+        for (auto cd : col_descs) {
+          if (skip_physical_cols > 0) {
+            skip_physical_cols--;
+            continue;
+          }
+          auto mapped_idx = desc_id_to_column_id[import_idx];
+          col_idx++;
+          if (cd->columnType.is_geometry()) {
+            skip_physical_cols = cd->columnType.get_physical_cols();
+            if (mapped_idx != -1) {
+              fillGeoColumns(session,
+                             session_ptr->getCatalog(),
+                             import_buffers,
+                             cd,
+                             col_idx,
+                             rows_completed,
+                             table_name,
+                             false);
+            } else {
+              col_idx += skip_physical_cols;
+            }
+          }
+          import_idx++;
+        }
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "Input exception thrown: " << e.what()
+                   << ". Row discarded, issue at column : " << (col_idx + 1)
+                   << " data :" << row;
+        THROW_MAPD_EXCEPTION(e.what());
+      }
+    }
+    fillMissingBuffers(session,
+                       session_ptr->getCatalog(),
+                       import_buffers,
+                       col_descs,
+                       desc_id_to_column_id,
+                       rows_completed,
+                       table_name,
+                       false);
     auto insert_data_lock = lockmgr::InsertDataLockMgr::getWriteLockForTable(
         session_ptr->getCatalog(), table_name);
     if (!loader->load(import_buffers, rows_completed, session_ptr.get())) {
@@ -3341,7 +3492,7 @@ void DBHandler::load_table(const TSessionId& session,
     }
 
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -3416,12 +3567,25 @@ import_export::CopyParams DBHandler::thrift_to_copyparams(const TCopyParams& cp)
   if (cp.s3_secret_key.length() > 0) {
     copy_params.s3_secret_key = cp.s3_secret_key;
   }
+  if (cp.s3_session_token.length() > 0) {
+    copy_params.s3_session_token = cp.s3_session_token;
+  }
   if (cp.s3_region.length() > 0) {
     copy_params.s3_region = cp.s3_region;
   }
   if (cp.s3_endpoint.length() > 0) {
     copy_params.s3_endpoint = cp.s3_endpoint;
   }
+#ifdef HAVE_AWS_S3
+  if (g_allow_s3_server_privileges && cp.s3_access_key.length() == 0 &&
+      cp.s3_secret_key.length() == 0 && cp.s3_session_token.length() == 0) {
+    const auto& server_credentials =
+        Aws::Auth::DefaultAWSCredentialsProviderChain().GetAWSCredentials();
+    copy_params.s3_access_key = server_credentials.GetAWSAccessKeyId();
+    copy_params.s3_secret_key = server_credentials.GetAWSSecretKey();
+    copy_params.s3_session_token = server_credentials.GetSessionToken();
+  }
+#endif
   switch (cp.file_type) {
     case TFileType::POLYGON:
       copy_params.file_type = import_export::FileType::POLYGON;
@@ -3511,6 +3675,7 @@ TCopyParams DBHandler::copyparams_to_thrift(const import_export::CopyParams& cp)
   copy_params.threads = cp.threads;
   copy_params.s3_access_key = cp.s3_access_key;
   copy_params.s3_secret_key = cp.s3_secret_key;
+  copy_params.s3_session_token = cp.s3_session_token;
   copy_params.s3_region = cp.s3_region;
   copy_params.s3_endpoint = cp.s3_endpoint;
   switch (cp.file_type) {
@@ -3642,7 +3807,7 @@ bool is_a_supported_geo_file(const std::string& path, bool include_gz) {
   if (boost::iends_with(path, ".shp") || boost::iends_with(path, ".geojson") ||
       boost::iends_with(path, ".json") || boost::iends_with(path, ".kml") ||
       boost::iends_with(path, ".kmz") || boost::iends_with(path, ".gdb") ||
-      boost::iends_with(path, ".gdb.zip")) {
+      boost::iends_with(path, ".gdb.zip") || boost::iends_with(path, ".fgb")) {
     return true;
   }
   return false;
@@ -3885,15 +4050,14 @@ void DBHandler::render_vega(TRenderResult& _return,
 
   _return.total_time_ms = measure<>::execution([&]() {
     try {
-      render_handler_->render_vega(
-          _return,
-          std::make_shared<Catalog_Namespace::SessionInfo>(*session_ptr),
-          widget_id,
-          vega_json,
-          compression_level,
-          nonce);
+      render_handler_->render_vega(_return,
+                                   stdlog.getSessionInfo(),
+                                   widget_id,
+                                   vega_json,
+                                   compression_level,
+                                   nonce);
     } catch (std::exception& e) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+      THROW_MAPD_EXCEPTION(e.what());
     }
   });
 }
@@ -4153,7 +4317,7 @@ int32_t DBHandler::create_dashboard(const TSessionId& session,
         session_ptr->get_currentUser(), dashboard_name, DashboardDBObjectType, cat, id);
     return id;
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
 }
 
@@ -4193,7 +4357,7 @@ void DBHandler::replace_dashboard(const TSessionId& session,
   try {
     cat.replaceDashboard(dd);
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
 }
 
@@ -4212,7 +4376,7 @@ void DBHandler::delete_dashboards(const TSessionId& session,
   try {
     cat.deleteMetadataForDashboards(dashboard_ids, session_ptr->get_currentUser());
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
 }
 
@@ -4223,7 +4387,7 @@ std::vector<std::string> DBHandler::get_valid_groups(const TSessionId& session,
   auto& cat = session_info.getCatalog();
   auto dash = cat.getMetadataForDashboard(dashboard_id);
   if (!dash) {
-    THROW_MAPD_EXCEPTION("Exception: Dashboard id " + std::to_string(dashboard_id) +
+    THROW_MAPD_EXCEPTION("Dashboard id " + std::to_string(dashboard_id) +
                          " does not exist");
   } else if (session_info.get_currentUser().userId != dash->userId &&
              !session_info.get_currentUser().isSuper) {
@@ -4235,7 +4399,7 @@ std::vector<std::string> DBHandler::get_valid_groups(const TSessionId& session,
   for (auto& group : groups) {
     user_meta.isSuper = false;  // initialize default flag
     if (!SysCatalog::instance().getGrantee(group)) {
-      THROW_MAPD_EXCEPTION("Exception: User/Role " + group + " does not exist");
+      THROW_MAPD_EXCEPTION("User/Role " + group + " does not exist");
     } else if (!user_meta.isSuper) {
       valid_groups.push_back(group);
     }
@@ -4246,7 +4410,7 @@ std::vector<std::string> DBHandler::get_valid_groups(const TSessionId& session,
 void DBHandler::validateGroups(const std::vector<std::string>& groups) {
   for (auto const& group : groups) {
     if (!SysCatalog::instance().getGrantee(group)) {
-      THROW_MAPD_EXCEPTION("Exception: User/Role '" + group + "' does not exist");
+      THROW_MAPD_EXCEPTION("User/Role '" + group + "' does not exist");
     }
   }
 }
@@ -4363,7 +4527,7 @@ void DBHandler::get_dashboard_grantees(
   Catalog_Namespace::UserMetadata user_meta;
   auto dash = cat.getMetadataForDashboard(dashboard_id);
   if (!dash) {
-    THROW_MAPD_EXCEPTION("Exception: Dashboard id " + std::to_string(dashboard_id) +
+    THROW_MAPD_EXCEPTION("Dashboard id " + std::to_string(dashboard_id) +
                          " does not exist");
   } else if (session_ptr->get_currentUser().userId != dash->userId &&
              !session_ptr->get_currentUser().isSuper) {
@@ -4414,7 +4578,7 @@ void DBHandler::create_link(std::string& _return,
   try {
     _return = cat.createLink(ld, 6);
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
 }
 
@@ -4495,6 +4659,9 @@ void DBHandler::create_table(const TSessionId& session,
 
     std::string col_stmt;
     col_stmt.append(col.col_name + " " + thrift_to_name(col.col_type));
+    if (col.__isset.default_value) {
+      col_stmt.append(" DEFAULT " + col.default_value);
+    }
 
     // As of 2016-06-27 the Immerse v1 frontend does not explicitly set the
     // `nullable` argument, leading this to default to false. Uncomment for v2.
@@ -4553,13 +4720,13 @@ void DBHandler::import_table(const TSessionId& session,
                                    "IMPORT_TABLE",
                                    start_time,
                                    Executor::UNITARY_EXECUTOR_ID,
-                                   QuerySessionStatus::QueryStatus::RUNNING);
+                                   QuerySessionStatus::QueryStatus::RUNNING_IMPORTER);
     }
 
     ScopeGuard clearInterruptStatus = [executor, &session, &start_time] {
       // reset the runtime query interrupt status
       if (g_enable_non_kernel_time_query_interrupt) {
-        executor->clearQuerySessionStatus(session, start_time, false);
+        executor->clearQuerySessionStatus(session, start_time);
       }
     };
     const auto td_with_lock =
@@ -4607,7 +4774,7 @@ void DBHandler::import_table(const TSessionId& session,
     auto ms = measure<>::execution([&]() { importer->import(session_ptr.get()); });
     std::cout << "Total Import Time: " << (double)ms / 1000.0 << " Seconds." << std::endl;
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -4681,13 +4848,13 @@ void DBHandler::import_geo_table(const TSessionId& session,
                                  "IMPORT_GEO_TABLE",
                                  start_time,
                                  Executor::UNITARY_EXECUTOR_ID,
-                                 QuerySessionStatus::QueryStatus::RUNNING);
+                                 QuerySessionStatus::QueryStatus::RUNNING_IMPORTER);
   }
 
   ScopeGuard clearInterruptStatus = [executor, &session, &start_time] {
     // reset the runtime query interrupt status
     if (g_enable_non_kernel_time_query_interrupt) {
-      executor->clearQuerySessionStatus(session, start_time, false);
+      executor->clearQuerySessionStatus(session, start_time);
     }
   };
 
@@ -4918,9 +5085,24 @@ void DBHandler::import_geo_table(const TSessionId& session,
       }
     }
 
-    // by this point, the table should exist, one way or another
-    const TableDescriptor* td = cat.getMetadataForTable(this_table_name);
-    if (!td) {
+    // match locking sequence for CopyTableStmt::execute
+    mapd_unique_lock<mapd_shared_mutex> execute_read_lock(
+        *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
+            legacylockmgr::ExecutorOuterLock, true));
+
+    const TableDescriptor* td{nullptr};
+    std::unique_ptr<lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>> td_with_lock;
+    std::unique_ptr<lockmgr::WriteLock> insert_data_lock;
+
+    try {
+      td_with_lock =
+          std::make_unique<lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>>(
+              lockmgr::TableSchemaLockContainer<
+                  lockmgr::WriteLock>::acquireTableDescriptor(cat, this_table_name));
+      td = (*td_with_lock)();
+      insert_data_lock = std::make_unique<lockmgr::WriteLock>(
+          lockmgr::InsertDataLockMgr::getWriteLockForTable(cat, this_table_name));
+    } catch (const std::runtime_error& e) {
       // capture the error and abort this layer
       std::string exception_message =
           "Could not import geo file '" + file_path.filename().string() + "' to table '" +
@@ -4928,6 +5110,7 @@ void DBHandler::import_geo_table(const TSessionId& session,
       caught_exception_messages.emplace_back(exception_message);
       continue;
     }
+    CHECK(td);
 
     // then, we have to verify that the structure matches
     // get column descriptors (non-system, non-deleted, logical columns only)
@@ -5054,30 +5237,25 @@ void DBHandler::import_geo_table(const TSessionId& session,
     }
 
     if (is_geo_layer) {
-      // Final check to ensure that we actually have a geo column
-      // of the expected name and type before doing the actual import,
-      // in case the user naively overrode the name or type in Immerse
-      // Preview (which as of 6/8/18 it still allows you to do).
-      // This avoids a fatal assert later when it fails to find the
-      // column. We should make Immerse more robust and disallow this.
-      bool have_geo_column_with_correct_name = false;
-      for (const auto& r : rd) {
-        if (TTypeInfo_IsGeo(r.col_type.type)) {
-          // TODO(team): allow user to override the geo column name
-          if (r.col_name == OMNISCI_GEO_PREFIX) {
-            have_geo_column_with_correct_name = true;
-          } else if (r.col_name == LEGACY_GEO_PREFIX) {
-            CHECK(colname_to_src.find(r.col_name) != colname_to_src.end());
-            // Normalize column names for geo append with legacy column naming scheme
-            colname_to_src[r.col_name] = r.col_name;
-            have_geo_column_with_correct_name = true;
-          }
+      // Final check to ensure that we have exactly one geo column
+      // before doing the actual import, in case the user naively
+      // overrode the types in Immerse Preview (which as of 6/17/21
+      // it still allows you to do). We should make Immerse more
+      // robust and disallow re-typing of columns to/from geo types
+      // completely. Currently, if multiple columns are re-typed
+      // such that there is still exactly one geo column (but it's
+      // the wrong one) then this test will pass, but the import
+      // will then reject some (or more likely all) of the rows.
+      int num_geo_columns{0};
+      for (auto const& col : rd) {
+        if (TTypeInfo_IsGeo(col.col_type.type)) {
+          num_geo_columns++;
         }
       }
-      if (!have_geo_column_with_correct_name) {
-        std::string exception_message = "Table " + this_table_name +
-                                        " does not have a geo column with name '" +
-                                        OMNISCI_GEO_PREFIX + "'. Import aborted!";
+      if (num_geo_columns != 1) {
+        std::string exception_message =
+            "Table '" + this_table_name +
+            "' must have exactly one geo column. Import aborted!";
         caught_exception_messages.emplace_back(exception_message);
         continue;
       }
@@ -5487,7 +5665,13 @@ std::vector<PushedDownFilterInfo> DBHandler::execute_rel_alg(
       intel_jit_profile_};
   auto validate_or_explain_query =
       explain_info.justExplain() || explain_info.justCalciteExplain() || just_validate;
-  ExecutionOptions eo = {g_enable_columnar_output,
+  auto columnar_output_enabled = g_enable_columnar_output;
+  if (query_hints.isHintRegistered(QueryHint::kColumnarOutput)) {
+    columnar_output_enabled = true;
+  } else if (query_hints.isHintRegistered(QueryHint::kRowwiseOutput)) {
+    columnar_output_enabled = false;
+  }
+  ExecutionOptions eo = {columnar_output_enabled,
                          allow_multifrag_,
                          explain_info.justExplain(),
                          allow_loop_joins_ || just_validate,
@@ -5533,13 +5717,12 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
                                    const std::string& query_ra,
                                    QueryStateProxy query_state_proxy,
                                    const Catalog_Namespace::SessionInfo& session_info,
-                                   const ExecutorDeviceType device_type,
+                                   const ExecutorDeviceType executor_device_type,
+                                   const ExecutorDeviceType results_device_type,
                                    const size_t device_id,
                                    const int32_t first_n,
                                    const TArrowTransport::type transport_method) const {
   const auto& cat = session_info.getCatalog();
-  CHECK(device_type == ExecutorDeviceType::CPU ||
-        session_info.get_executor_device_type() == ExecutorDeviceType::GPU);
   auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID,
                                         jit_debug_ ? "/tmp" : "",
                                         jit_debug_ ? "mapdquery" : "",
@@ -5550,14 +5733,15 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
                              query_state_proxy.getQueryState().shared_from_this());
   const auto& query_hints = ra_executor.getParsedQueryHints();
   const bool cpu_mode_enabled = query_hints.isHintRegistered(QueryHint::kCpuMode);
-  CompilationOptions co = {cpu_mode_enabled ? ExecutorDeviceType::CPU : device_type,
-                           /*hoist_literals=*/true,
-                           ExecutorOptLevel::Default,
-                           g_enable_dynamic_watchdog,
-                           /*allow_lazy_fetch=*/true,
-                           /*filter_on_deleted_column=*/true,
-                           ExecutorExplainType::Default,
-                           intel_jit_profile_};
+  CompilationOptions co = {
+      cpu_mode_enabled ? ExecutorDeviceType::CPU : executor_device_type,
+      /*hoist_literals=*/true,
+      ExecutorOptLevel::Default,
+      g_enable_dynamic_watchdog,
+      /*allow_lazy_fetch=*/true,
+      /*filter_on_deleted_column=*/true,
+      ExecutorExplainType::Default,
+      intel_jit_profile_};
   ExecutionOptions eo = {
       g_enable_columnar_output,
       allow_multifrag_,
@@ -5577,6 +5761,11 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
                                                .empty(),
       g_running_query_interrupt_freq,
       g_pending_query_interrupt_freq};
+  if (query_hints.isHintRegistered(QueryHint::kColumnarOutput)) {
+    eo.output_columnar_hint = true;
+  } else if (query_hints.isHintRegistered(QueryHint::kRowwiseOutput)) {
+    eo.output_columnar_hint = false;
+  }
   ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
                                                      ExecutorDeviceType::CPU,
                                                      QueryMemoryDescriptor(),
@@ -5592,7 +5781,7 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
   const auto converter =
       std::make_unique<ArrowResultSetConverter>(rs,
                                                 data_mgr_,
-                                                device_type,
+                                                results_device_type,
                                                 device_id,
                                                 getTargetNames(result.getTargetsMeta()),
                                                 first_n,
@@ -5607,7 +5796,7 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
       std::string(arrow_result.df_handle.begin(), arrow_result.df_handle.end());
   _return.df_buffer =
       std::string(arrow_result.df_buffer.begin(), arrow_result.df_buffer.end());
-  if (device_type == ExecutorDeviceType::GPU) {
+  if (results_device_type == ExecutorDeviceType::GPU) {
     std::lock_guard<std::mutex> map_lock(handle_to_dev_ptr_mutex_);
     CHECK(!ipc_handle_to_dev_ptr_.count(_return.df_handle));
     ipc_handle_to_dev_ptr_.insert(
@@ -5788,7 +5977,7 @@ void DBHandler::check_and_invalidate_sessions(Parser::DDLStmt* ddl) {
     invalidate_sessions(*drop_db_stmt->getDatabaseName(), drop_db_stmt);
     return;
   }
-  const auto rename_db_stmt = dynamic_cast<Parser::RenameDatabaseStmt*>(ddl);
+  const auto rename_db_stmt = dynamic_cast<Parser::RenameDBStmt*>(ddl);
   if (rename_db_stmt) {
     invalidate_sessions(*rename_db_stmt->getPreviousDatabaseName(), rename_db_stmt);
     return;
@@ -5826,7 +6015,49 @@ void DBHandler::sql_execute_impl(ExecutionResult& _return,
 
   lockmgr::LockedTableDescriptors locks;
   ParserWrapper pw{query_str};
-  if (pw.isCalcitePathPermissable(read_only_)) {
+
+  if (pw.is_itas) {
+    // itas can attempt to execute here
+    check_read_only("insert_into_table");
+
+    std::string query_ra;
+    _return.addExecutionTime(measure<>::execution([&]() {
+      TPlanResult result;
+      std::tie(result, locks) =
+          parse_to_ra(query_state_proxy, query_str, {}, false, system_parameters_);
+      query_ra = result.plan_result;
+    }));
+    rapidjson::Document ddl_query;
+    ddl_query.Parse(query_ra);
+    CHECK(ddl_query.HasMember("payload"));
+    CHECK(ddl_query["payload"].IsObject());
+    auto stmt = Parser::InsertIntoTableAsSelectStmt(ddl_query["payload"].GetObject());
+    _return.addExecutionTime(measure<>::execution([&]() { stmt.execute(*session_ptr); }));
+    return;
+
+  } else if (pw.is_ctas) {
+    // ctas can attempt to execute here
+    check_read_only("create_table_as");
+
+    std::string query_ra;
+    _return.addExecutionTime(measure<>::execution([&]() {
+      TPlanResult result;
+      std::tie(result, locks) =
+          parse_to_ra(query_state_proxy, query_str, {}, false, system_parameters_);
+      query_ra = result.plan_result;
+    }));
+    if (query_ra.size()) {
+      rapidjson::Document ddl_query;
+      ddl_query.Parse(query_ra);
+      CHECK(ddl_query.HasMember("payload"));
+      CHECK(ddl_query["payload"].IsObject());
+      auto stmt = Parser::CreateTableAsSelectStmt(ddl_query["payload"].GetObject());
+      _return.addExecutionTime(
+          measure<>::execution([&]() { stmt.execute(*session_ptr); }));
+    }
+    return;
+
+  } else if (pw.isCalcitePathPermissable(read_only_)) {
     // run DDL before the locks as DDL statements should handle their own locking
     if (pw.isCalciteDdl()) {
       std::string query_ra;
@@ -5839,6 +6070,7 @@ void DBHandler::sql_execute_impl(ExecutionResult& _return,
       executeDdl(_return, query_ra, session_ptr);
       return;
     }
+
     executeReadLock = mapd_shared_lock<mapd_shared_mutex>(
         *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
             legacylockmgr::ExecutorOuterLock, true));
@@ -5882,6 +6114,10 @@ void DBHandler::sql_execute_impl(ExecutionResult& _return,
          executor_device_type,
          first_n,
          at_most_n](const size_t executor_index) {
+          // if we find proper filters we need to "re-execute" the query
+          // with a modified query plan (i.e., which has pushdowned filter)
+          // otherwise this trial just executes the query and keeps corresponding query
+          // resultset in _return object
           filter_push_down_requests = execute_rel_alg(
               _return,
               query_state_proxy,
@@ -5894,33 +6130,43 @@ void DBHandler::sql_execute_impl(ExecutionResult& _return,
               g_enable_filter_push_down && !g_cluster,
               explain_info,
               executor_index);
-          if (explain_info.justCalciteExplain() && filter_push_down_requests.empty()) {
-            // we only reach here if filter push down was enabled, but no filter
-            // push down candidate was found
-            _return.updateResultSet(query_ra, ExecutionResult::Explaination);
-          } else if (!filter_push_down_requests.empty()) {
-            CHECK(!locks.empty());
-            execute_rel_alg_with_filter_push_down(_return,
-                                                  query_state_proxy,
-                                                  query_ra,
-                                                  column_format,
-                                                  executor_device_type,
-                                                  first_n,
-                                                  at_most_n,
-                                                  explain_info.justExplain(),
-                                                  explain_info.justCalciteExplain(),
-                                                  filter_push_down_requests);
-          } else if (explain_info.justCalciteExplain() &&
-                     filter_push_down_requests.empty()) {
-            // return the ra as the result:
-            // If we reach here, the 'filter_push_down_request' turned out to be
-            // empty, i.e., no filter push down so we continue with the initial
-            // (unchanged) query's calcite explanation.
-            CHECK(!locks.empty());
-            query_ra =
-                parse_to_ra(query_state_proxy, query_str, {}, false, system_parameters_)
-                    .first.plan_result;
-            _return.updateResultSet(query_ra, ExecutionResult::Explaination);
+          if (explain_info.justCalciteExplain()) {
+            if (filter_push_down_requests.empty()) {
+              // we only reach here if filter push down was enabled, but no filter
+              // push down candidate was found
+              _return.updateResultSet(query_ra, ExecutionResult::Explaination);
+            } else {
+              CHECK(!locks.empty());
+              std::vector<TFilterPushDownInfo> filter_push_down_info;
+              for (const auto& req : filter_push_down_requests) {
+                TFilterPushDownInfo filter_push_down_info_for_request;
+                filter_push_down_info_for_request.input_prev = req.input_prev;
+                filter_push_down_info_for_request.input_start = req.input_start;
+                filter_push_down_info_for_request.input_next = req.input_next;
+                filter_push_down_info.push_back(filter_push_down_info_for_request);
+              }
+              query_ra = parse_to_ra(query_state_proxy,
+                                     query_str,
+                                     filter_push_down_info,
+                                     false,
+                                     system_parameters_)
+                             .first.plan_result;
+              _return.updateResultSet(query_ra, ExecutionResult::Explaination);
+            }
+          } else {
+            if (!filter_push_down_requests.empty()) {
+              CHECK(!locks.empty());
+              execute_rel_alg_with_filter_push_down(_return,
+                                                    query_state_proxy,
+                                                    query_ra,
+                                                    column_format,
+                                                    executor_device_type,
+                                                    first_n,
+                                                    at_most_n,
+                                                    explain_info.justExplain(),
+                                                    explain_info.justCalciteExplain(),
+                                                    filter_push_down_requests);
+            }
           }
         });
     CHECK(dispatch_queue_);
@@ -6014,8 +6260,12 @@ void DBHandler::sql_execute_impl(ExecutionResult& _return,
       return;
     }
   }
+
   LOG(INFO) << "passing query to legacy processor";
-  const auto result = apply_copy_to_shim(query_str);
+  auto result = query_str;
+  if (pw.is_copy_to) {
+    result = apply_copy_to_shim(query_str);
+  }
   DBHandler::parser_with_error_handler(result, parse_trees);
   auto handle_ddl = [&query_state_proxy, &session_ptr, &_return, &locks, this](
                         Parser::DDLStmt* ddl) -> bool {
@@ -6085,9 +6335,9 @@ void DBHandler::sql_execute_impl(ExecutionResult& _return,
       // a limited set of commands are available in read-only mode
       auto select_stmt = dynamic_cast<Parser::SelectStmt*>(stmt.get());
       auto show_create_stmt = dynamic_cast<Parser::ShowCreateTableStmt*>(stmt.get());
-      if (!select_stmt && !show_create_stmt) {
-        THROW_MAPD_EXCEPTION(
-            "Only read-only SQL commands are supported in read only mode.");
+      auto copy_to_stmt = dynamic_cast<Parser::ExportQueryStmt*>(stmt.get());
+      if (!select_stmt && !show_create_stmt && !copy_to_stmt) {
+        THROW_MAPD_EXCEPTION("This SQL command is not supported in read-only mode.");
       }
     }
 
@@ -6182,7 +6432,8 @@ std::pair<TPlanResult, lockmgr::LockedTableDescriptors> DBHandler::parse_to_ra(
   ParserWrapper pw{query_str};
   const std::string actual_query{pw.isSelectExplain() ? pw.actual_query : query_str};
   TPlanResult result;
-  if (pw.isCalcitePathPermissable()) {
+
+  if (pw.isCalcitePathPermissable(read_only_)) {
     auto cat = query_state_proxy.getQueryState().getConstSessionInfo()->get_catalog_ptr();
     auto session_cleanup_handler = [&](const auto& session_id) {
       removeInMemoryCalciteSession(session_id);
@@ -6207,8 +6458,8 @@ std::pair<TPlanResult, lockmgr::LockedTableDescriptors> DBHandler::parse_to_ra(
     process_calcite_request();
     lockmgr::LockedTableDescriptors locks;
     if (acquire_locks) {
-      std::set<std::string> write_only_tables;
-      std::vector<std::string> tables;
+      std::set<std::vector<std::string>> write_only_tables;
+      std::vector<std::vector<std::string>> tables;
 
       tables.insert(tables.end(),
                     result.resolved_accessed_objects.tables_updated_in.begin(),
@@ -6234,12 +6485,14 @@ std::pair<TPlanResult, lockmgr::LockedTableDescriptors> DBHandler::parse_to_ra(
       // then, obtain table data locks
       // force sort into tableid order in case of name change to guarantee fixed order of
       // mutex access
-      std::sort(tables.begin(),
-                tables.end(),
-                [&cat](const std::string& a, const std::string& b) {
-                  return cat->getMetadataForTable(a, false)->tableId <
-                         cat->getMetadataForTable(b, false)->tableId;
-                });
+      std::sort(
+          tables.begin(),
+          tables.end(),
+          [&cat](const std::vector<std::string>& a, const std::vector<std::string>& b) {
+            return cat->getMetadataForTable(a[0], false)->tableId <
+                   cat->getMetadataForTable(b[0], false)->tableId;
+          });
+
       // In the case of self-join and possibly other cases, we will
       // have duplicate tables. Ensure we only take one for locking below.
       tables.erase(unique(tables.begin(), tables.end()), tables.end());
@@ -6247,7 +6500,7 @@ std::pair<TPlanResult, lockmgr::LockedTableDescriptors> DBHandler::parse_to_ra(
         locks.emplace_back(
             std::make_unique<lockmgr::TableSchemaLockContainer<lockmgr::ReadLock>>(
                 lockmgr::TableSchemaLockContainer<
-                    lockmgr::ReadLock>::acquireTableDescriptor(*cat.get(), table)));
+                    lockmgr::ReadLock>::acquireTableDescriptor(*cat.get(), table[0])));
         if (write_only_tables.count(table)) {
           // Aquire an insert data lock for updates/deletes, consistent w/ insert. The
           // table data lock will be aquired in the fragmenter during checkpoint.
@@ -6277,7 +6530,7 @@ int64_t DBHandler::query_get_outer_fragment_count(const TSessionId& session,
   try {
     return leaf_handler_->query_get_outer_fragment_count(session, select_query);
   } catch (std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
 }
 
@@ -6291,7 +6544,7 @@ void DBHandler::check_table_consistency(TTableMeta& _return,
   try {
     leaf_handler_->check_table_consistency(_return, session, table_id);
   } catch (std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    THROW_MAPD_EXCEPTION(e.what());
   }
 }
 
@@ -6318,7 +6571,7 @@ void DBHandler::start_query(TPendingQuery& _return,
                                  just_explain,
                                  outer_fragment_indices);
     } catch (std::exception& e) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+      THROW_MAPD_EXCEPTION(e.what());
     }
   });
   LOG(INFO) << "start_query-COMPLETED " << time_ms << "ms "
@@ -6338,7 +6591,7 @@ void DBHandler::execute_query_step(TStepResult& _return,
       leaf_handler_->execute_query_step(
           _return, pending_query, subquery_id, start_time_str);
     } catch (std::exception& e) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+      THROW_MAPD_EXCEPTION(e.what());
     }
   });
   LOG(INFO) << "execute_query_step-COMPLETED " << time_ms << "ms";
@@ -6358,7 +6611,7 @@ void DBHandler::broadcast_serialized_rows(const TSerializedRows& serialized_rows
       leaf_handler_->broadcast_serialized_rows(
           serialized_rows, row_desc, query_id, subquery_id, is_final_subquery_result);
     } catch (std::exception& e) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+      THROW_MAPD_EXCEPTION(e.what());
     }
   });
   LOG(INFO) << "BROADCAST-SERIALIZED-ROWS COMPLETED " << time_ms << "ms";
@@ -6381,6 +6634,8 @@ void DBHandler::insert_data(const TSessionId& session,
     insert_data.numRows = thrift_insert_data.num_rows;
     std::vector<std::unique_ptr<std::vector<std::string>>> none_encoded_string_columns;
     std::vector<std::unique_ptr<std::vector<ArrayDatum>>> array_columns;
+    SQLTypeInfo geo_ti{kNULLT,
+                       false};  // will be filled with the correct info if possible
     for (size_t col_idx = 0; col_idx < insert_data.columnIds.size(); ++col_idx) {
       const int column_id = insert_data.columnIds[col_idx];
       DataBlockPtr p;
@@ -6415,6 +6670,11 @@ void DBHandler::insert_data(const TSessionId& session,
           none_encoded_strings->push_back(varlen_str.payload);
         }
         p.stringsPtr = none_encoded_strings.get();
+
+        // point geo type needs to mark null sentinel in its physical coord column
+        // To recognize null sentinel for point, therefore, we keep the actual geo type
+        // and needs to use it when constructing geo null point
+        geo_ti = ti;
       } else {
         CHECK(ti.is_array());
         array_columns.emplace_back(new std::vector<ArrayDatum>());
@@ -6422,7 +6682,12 @@ void DBHandler::insert_data(const TSessionId& session,
         CHECK_EQ(rows_expected, thrift_insert_data.data[col_idx].var_len_data.size());
         for (const auto& t_arr_datum : thrift_insert_data.data[col_idx].var_len_data) {
           if (t_arr_datum.is_null) {
-            if (ti.get_size() > 0 && !ti.get_elem_type().is_string()) {
+            if ((cd->columnName.find("_coords") != std::string::npos) &&
+                geo_ti.get_type() == kPOINT) {
+              // For geo point, we manually mark its null sentinel to coord buffer
+              array_column->push_back(
+                  import_export::ImporterUtils::composeNullPointCoords(ti, geo_ti));
+            } else if (ti.get_size() > 0 && !ti.get_elem_type().is_string()) {
               array_column->push_back(import_export::ImporterUtils::composeNullArray(ti));
             } else {
               array_column->emplace_back(0, nullptr, true);
@@ -6443,10 +6708,11 @@ void DBHandler::insert_data(const TSessionId& session,
       }
       insert_data.data.push_back(p);
     }
-    const auto td_with_lock =
-        lockmgr::TableSchemaLockContainer<lockmgr::ReadLock>::acquireTableDescriptor(
-            cat, insert_data.tableId);
-    const auto td = td_with_lock();
+    const ChunkKey lock_chunk_key{cat.getDatabaseId(),
+                                  cat.getLogicalTableId(insert_data.tableId)};
+    auto table_read_lock =
+        lockmgr::TableSchemaLockMgr::getReadLockForTable(lock_chunk_key);
+    const auto td = cat.getMetadataForTable(insert_data.tableId);
     CHECK(td);
 
     // this should have the same lock seq as COPY FROM
@@ -6455,7 +6721,7 @@ void DBHandler::insert_data(const TSessionId& session,
     auto data_memory_holder = import_export::fill_missing_columns(&cat, insert_data);
     td->fragmenter->insertDataNoCheckpoint(insert_data);
   } catch (const std::exception& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -6476,7 +6742,7 @@ void DBHandler::start_render_query(TPendingRenderQuery& _return,
       render_handler_->start_render_query(
           _return, session, widget_id, node_idx, vega_json);
     } catch (std::exception& e) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+      THROW_MAPD_EXCEPTION(e.what());
     }
   });
   LOG(INFO) << "start_render_query-COMPLETED " << time_ms << "ms "
@@ -6495,7 +6761,7 @@ void DBHandler::execute_next_render_step(TRenderStepResult& _return,
     try {
       render_handler_->execute_next_render_step(_return, pending_render, merged_data);
     } catch (std::exception& e) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+      THROW_MAPD_EXCEPTION(e.what());
     }
   });
   LOG(INFO) << "execute_next_render_step-COMPLETED id: " << pending_render.id
@@ -6528,7 +6794,7 @@ void DBHandler::set_table_epoch(const TSessionId& session,
   try {
     cat.setTableEpoch(db_id, table_id, new_epoch);
   } catch (const std::runtime_error& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -6554,7 +6820,7 @@ void DBHandler::set_table_epoch_by_name(const TSessionId& session,
   try {
     cat.setTableEpoch(db_id, td->tableId, new_epoch);
   } catch (const std::runtime_error& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -6572,7 +6838,7 @@ int32_t DBHandler::get_table_epoch(const TSessionId& session,
   try {
     return cat.getTableEpoch(db_id, table_id);
   } catch (const std::runtime_error& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -6592,7 +6858,7 @@ int32_t DBHandler::get_table_epoch_by_name(const TSessionId& session,
   try {
     return cat.getTableEpoch(db_id, td->tableId);
   } catch (const std::runtime_error& e) {
-    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
+    THROW_MAPD_EXCEPTION(std::string(e.what()));
   }
 }
 
@@ -6755,6 +7021,7 @@ void DBHandler::register_runtime_extension_functions(
         ThriftSerializers::from_thrift(it->inputArgTypes),
         ThriftSerializers::from_thrift(it->outputArgTypes),
         ThriftSerializers::from_thrift(it->sqlArgTypes),
+        it->annotations,
         /*is_runtime =*/true);
   }
 
@@ -6886,14 +7153,23 @@ ExecutionResult DBHandler::getQueries(
                                                       session_read_lock);
         }
         // if there exists query info fired from this session we report it to user
-        const std::string getQueryStatusStr[] = {
-            "UNDEFINED", "PENDING_QUEUE", "PENDING_EXECUTOR", "RUNNING"};
+        const std::string getQueryStatusStr[] = {"UNDEFINED",
+                                                 "PENDING_QUEUE",
+                                                 "PENDING_EXECUTOR",
+                                                 "RUNNING_QUERY_KERNEL",
+                                                 "RUNNING_REDUCTION",
+                                                 "RUNNING_IMPORTER"};
+        bool is_table_import_session = false;
         for (QuerySessionStatus& query_info : query_infos) {
           logical_values.emplace_back(RelLogicalValues::RowValues{});
           logical_values.back().emplace_back(
               genLiteralStr(query_session_ptr->get_public_session_id()));
+          auto query_status = query_info.getQueryStatus();
           logical_values.back().emplace_back(
-              genLiteralStr(getQueryStatusStr[query_info.getQueryStatus()]));
+              genLiteralStr(getQueryStatusStr[query_status]));
+          if (query_status == QuerySessionStatus::QueryStatus::RUNNING_IMPORTER) {
+            is_table_import_session = true;
+          }
           logical_values.back().emplace_back(
               genLiteralStr(::toString(query_info.getExecutorId())));
           logical_values.back().emplace_back(
@@ -6905,7 +7181,8 @@ ExecutionResult DBHandler::getQueries(
               genLiteralStr(query_session_ptr->get_connection_info()));
           logical_values.back().emplace_back(
               genLiteralStr(query_session_ptr->getCatalog().getCurrentDB().dbName));
-          if (query_session_ptr->get_executor_device_type() == ExecutorDeviceType::GPU) {
+          if (query_session_ptr->get_executor_device_type() == ExecutorDeviceType::GPU &&
+              !is_table_import_session) {
             logical_values.back().emplace_back(genLiteralStr("GPU"));
           } else {
             logical_values.back().emplace_back(genLiteralStr("CPU"));
@@ -7028,6 +7305,7 @@ void DBHandler::executeDdl(
     std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr) {
   DdlCommandExecutor executor = DdlCommandExecutor(query_ra, session_ptr);
   std::string commandStr = executor.commandStr();
+
   if (executor.isKillQuery()) {
     interruptQuery(*session_ptr, executor.getTargetQuerySessionToKill());
   } else {
@@ -7046,4 +7324,8 @@ void DBHandler::executeDdl(
     _return.setExecutionTime(execution_time_ms);
   }
   _return.setResultType(ExecutionResult::CalciteDdl);
+}
+
+void DBHandler::resizeDispatchQueue(size_t queue_size) {
+  dispatch_queue_ = std::make_unique<QueryDispatchQueue>(queue_size);
 }

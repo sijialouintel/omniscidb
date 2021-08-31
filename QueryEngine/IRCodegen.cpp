@@ -40,6 +40,11 @@ std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::Expr* expr,
   if (u_oper) {
     return {codegen(u_oper, co)};
   }
+  auto geo_col_var = dynamic_cast<const Analyzer::GeoColumnVar*>(expr);
+  if (geo_col_var) {
+    // inherits from ColumnVar, so it is important we check this first
+    return codegenGeoColumnVar(geo_col_var, fetch_columns, co);
+  }
   auto col_var = dynamic_cast<const Analyzer::ColumnVar*>(expr);
   if (col_var) {
     return codegenColumn(col_var, fetch_columns, co);
@@ -146,6 +151,10 @@ std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::Expr* expr,
   if (function_oper_expr) {
     return {codegenFunctionOper(function_oper_expr, co)};
   }
+  auto geo_expr = dynamic_cast<const Analyzer::GeoExpr*>(expr);
+  if (geo_expr) {
+    return codegenGeoExpr(geo_expr, co);
+  }
   if (dynamic_cast<const Analyzer::OffsetInFragment*>(expr)) {
     return {posArg(nullptr)};
   }
@@ -194,8 +203,9 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::UOper* u_oper,
     case kUNNEST:
       return codegenUnnest(u_oper, co);
     default:
-      abort();
+      UNREACHABLE();
   }
+  return nullptr;
 }
 
 llvm::Value* CodeGenerator::codegen(const Analyzer::SampleRatioExpr* expr,
@@ -499,7 +509,7 @@ JoinLoop::HoistedFiltersCallback Executor::buildHoistLeftHandSideFiltersCb(
   }
 
   const auto& current_level_join_conditions = ra_exe_unit.join_quals[level_idx];
-  if (current_level_join_conditions.type == JoinType::LEFT) {
+  if (level_idx == 0 && current_level_join_conditions.type == JoinType::LEFT) {
     const auto& condition = current_level_join_conditions.quals.front();
     const auto bin_oper = dynamic_cast<const Analyzer::BinOper*>(condition.get());
     CHECK(bin_oper) << condition->toString();
@@ -665,6 +675,8 @@ std::shared_ptr<HashJoin> Executor::buildCurrentLevelHashTable(
     std::vector<std::string>& fail_reasons) {
   AUTOMATIC_IR_METADATA(cgen_state_.get());
   if (current_level_join_conditions.type != JoinType::INNER &&
+      current_level_join_conditions.type != JoinType::SEMI &&
+      current_level_join_conditions.type != JoinType::ANTI &&
       current_level_join_conditions.quals.size() > 1) {
     fail_reasons.emplace_back("No equijoin expression found for outer join");
     return nullptr;
@@ -674,7 +686,9 @@ std::shared_ptr<HashJoin> Executor::buildCurrentLevelHashTable(
     auto qual_bin_oper = std::dynamic_pointer_cast<Analyzer::BinOper>(join_qual);
     if (!qual_bin_oper || !IS_EQUIVALENCE(qual_bin_oper->get_optype())) {
       fail_reasons.emplace_back("No equijoin expression found");
-      if (current_level_join_conditions.type == JoinType::INNER) {
+      if (current_level_join_conditions.type == JoinType::INNER ||
+          current_level_join_conditions.type == JoinType::SEMI ||
+          current_level_join_conditions.type == JoinType::ANTI) {
         add_qualifier_to_execution_unit(ra_exe_unit, join_qual);
       }
       continue;
@@ -687,6 +701,7 @@ std::shared_ptr<HashJoin> Executor::buildCurrentLevelHashTable(
           query_infos,
           co.device_type == ExecutorDeviceType::GPU ? MemoryLevel::GPU_LEVEL
                                                     : MemoryLevel::CPU_LEVEL,
+          current_level_join_conditions.type,
           HashType::OneToOne,
           column_cache,
           ra_exe_unit.query_hint);
@@ -697,7 +712,9 @@ std::shared_ptr<HashJoin> Executor::buildCurrentLevelHashTable(
       plan_state_->join_info_.equi_join_tautologies_.push_back(qual_bin_oper);
     } else {
       fail_reasons.push_back(hash_table_or_error.fail_reason);
-      if (current_level_join_conditions.type == JoinType::INNER) {
+      if (current_level_join_conditions.type == JoinType::INNER ||
+          current_level_join_conditions.type == JoinType::SEMI ||
+          current_level_join_conditions.type == JoinType::ANTI) {
         add_qualifier_to_execution_unit(ra_exe_unit, qual_bin_oper);
       }
     }
@@ -730,6 +747,7 @@ void Executor::redeclareFilterFunction() {
           continue;
         }
 
+        CHECK(v);
         if (auto* instr = llvm::dyn_cast<llvm::Instruction>(v);
             instr && instr->getParent() &&
             instr->getParent()->getParent() == cgen_state_->row_func_) {
@@ -987,21 +1005,22 @@ CodeGenerator::NullCheckCodegen::NullCheckCodegen(CgenState* cgen_state,
                                                   const std::string& name)
     : cgen_state(cgen_state), name(name) {
   AUTOMATIC_IR_METADATA(cgen_state);
-  CHECK(nullable_ti.is_number() || nullable_ti.is_time());
+  CHECK(nullable_ti.is_number() || nullable_ti.is_time() || nullable_ti.is_boolean());
 
-  null_check = std::make_unique<DiamondCodegen>(
-      nullable_ti.is_fp()
-          ? cgen_state->ir_builder_.CreateFCmp(llvm::FCmpInst::FCMP_OEQ,
-                                               nullable_lv,
-                                               cgen_state->inlineFpNull(nullable_ti))
-          : cgen_state->ir_builder_.CreateICmp(llvm::ICmpInst::ICMP_EQ,
-                                               nullable_lv,
-                                               cgen_state->inlineIntNull(nullable_ti)),
-      executor,
-      false,
-      name,
-      nullptr,
-      false);
+  llvm::Value* is_null_lv{nullptr};
+  if (nullable_ti.is_fp()) {
+    is_null_lv = cgen_state->ir_builder_.CreateFCmp(
+        llvm::FCmpInst::FCMP_OEQ, nullable_lv, cgen_state->inlineFpNull(nullable_ti));
+  } else if (nullable_ti.is_boolean()) {
+    is_null_lv = cgen_state->ir_builder_.CreateICmp(
+        llvm::ICmpInst::ICMP_EQ, nullable_lv, cgen_state->llBool(true));
+  } else {
+    is_null_lv = cgen_state->ir_builder_.CreateICmp(
+        llvm::ICmpInst::ICMP_EQ, nullable_lv, cgen_state->inlineIntNull(nullable_ti));
+  }
+  CHECK(is_null_lv);
+  null_check =
+      std::make_unique<DiamondCodegen>(is_null_lv, executor, false, name, nullptr, false);
 
   // generate a phi node depending on whether we got a null or not
   nullcheck_bb = llvm::BasicBlock::Create(

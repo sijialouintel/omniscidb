@@ -34,8 +34,9 @@
 #include "Archive/PosixFileArchive.h"
 #include "Catalog/Catalog.h"
 #ifdef HAVE_AWS_S3
+#include "AwsHelpers.h"
 #include "DataMgr/OmniSciAwsSdk.h"
-#endif
+#endif  // HAVE_AWS_S3
 #include "Geospatial/GDAL.h"
 #include "Geospatial/Types.h"
 #include "ImportExport/DelimitedParserUtils.h"
@@ -56,6 +57,7 @@ using namespace TestHelpers;
 extern bool g_use_date_in_days_default_encoding;
 extern size_t g_leaf_count;
 extern bool g_is_test_env;
+extern bool g_allow_s3_server_privileges;
 
 namespace {
 
@@ -394,182 +396,6 @@ TEST_F(ImportTestSkipHeader, Skip_Header) {
     g_archive_read_buf_size = archive_read_buf_size_state;
   };
   EXPECT_TRUE(import_test_local("skip_header.txt", 1, 1.0));
-}
-
-const char* create_table_mini_sort = R"(
-  CREATE TABLE sortab(
-    i int,
-    f float,
-    ia int[2],
-    pt point,
-    sa text[],
-    s2 text encoding dict(16),
-    dt date,
-    d2 date ENCODING FIXED(16),
-    tm timestamp,
-    t4 timestamp ENCODING FIXED(32),
-    va int[])
-  )";
-
-class ImportTestMiniSort : public ::testing::Test {
- protected:
-  void SetUp() override {
-    ASSERT_NO_THROW(run_ddl_statement("drop table if exists sortab;"));
-    ASSERT_NO_THROW(run_ddl_statement("drop table if exists sortctas;"));
-  }
-
-  void TearDown() override {
-    ASSERT_NO_THROW(run_ddl_statement("drop table if exists sortab;"));
-    ASSERT_NO_THROW(run_ddl_statement("drop table if exists sortctas;"));
-  }
-};
-
-void create_minisort_table_on_column(const std::string& column_name) {
-  ASSERT_NO_THROW(run_ddl_statement(
-      std::string(create_table_mini_sort) +
-      (column_name.size() ? " with (sort_column='" + column_name + "');" : ";")));
-  EXPECT_NO_THROW(
-      run_ddl_statement("copy sortab from '../../Tests/Import/datafiles/mini_sort.txt' "
-                        "with (header='false');"));
-}
-
-void check_minisort_on_expects(const std::string& table_name,
-                               const std::vector<int>& expects) {
-  auto rows = run_query("SELECT i FROM " + table_name + ";");
-  CHECK_EQ(expects.size(), rows->rowCount());
-  for (auto exp : expects) {
-    auto crt_row = rows->getNextRow(true, true);
-    CHECK_EQ(size_t(1), crt_row.size());
-    CHECK_EQ(int64_t(exp), v<int64_t>(crt_row[0]));
-  }
-}
-
-void test_minisort_on_column(const std::string& column_name,
-                             const std::vector<int> expects) {
-  create_minisort_table_on_column(column_name);
-  check_minisort_on_expects("sortab", expects);
-}
-
-void create_minisort_table_on_column_with_ctas(const std::string& column_name) {
-  EXPECT_NO_THROW(
-      run_ddl_statement(
-          "create table sortctas as select * from sortab" +
-          (column_name.size() ? " with (sort_column='" + column_name + "');" : ";")););
-}
-
-void test_minisort_on_column_with_ctas(const std::string& column_name,
-                                       const std::vector<int> expects) {
-  create_minisort_table_on_column("");
-  create_minisort_table_on_column_with_ctas(column_name);
-  check_minisort_on_expects("sortctas", expects);
-}
-
-TEST_F(ImportTestMiniSort, on_none) {
-  test_minisort_on_column("", {5, 3, 1, 2, 4});
-}
-
-TEST_F(ImportTestMiniSort, on_int) {
-  test_minisort_on_column("i", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, on_float) {
-  test_minisort_on_column("f", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, on_int_array) {
-  test_minisort_on_column("ia", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, on_string_array) {
-  test_minisort_on_column("sa", {5, 3, 1, 2, 4});
-}
-
-TEST_F(ImportTestMiniSort, on_string_2b) {
-  test_minisort_on_column("s2", {5, 3, 1, 2, 4});
-}
-
-TEST_F(ImportTestMiniSort, on_date) {
-  test_minisort_on_column("dt", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, on_date_2b) {
-  test_minisort_on_column("d2", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, on_time) {
-  test_minisort_on_column("tm", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, on_time_4b) {
-  test_minisort_on_column("t4", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, on_varlen_array) {
-  test_minisort_on_column("va", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, on_geo_point) {
-  test_minisort_on_column("pt", {2, 3, 4, 5, 1});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_none) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("", {5, 3, 1, 2, 4});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_int) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("i", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_float) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("f", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_int_array) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("ia", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_string_array) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("sa", {5, 3, 1, 2, 4});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_string_2b) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("s2", {5, 3, 1, 2, 4});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_date) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("dt", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_date_2b) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("d2", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_time) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("tm", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_time_4b) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("t4", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_varlen_array) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("va", {1, 2, 3, 4, 5});
-}
-
-TEST_F(ImportTestMiniSort, ctas_on_geo_point) {
-  SKIP_ALL_ON_AGGREGATOR();
-  test_minisort_on_column_with_ctas("pt", {2, 3, 4, 5, 1});
 }
 
 const char* create_table_mixed_varlen = R"(
@@ -1041,8 +867,8 @@ class ImportTest : public ::testing::Test {
 
 // parquet test cases
 TEST_F(ImportTest, One_parquet_file_1k_rows_in_10_groups) {
-  EXPECT_TRUE(
-      import_test_local_parquet(".", "trip_data_1k_rows_in_10_grps.parquet", 1000, 1.0));
+  EXPECT_TRUE(import_test_local_parquet(
+      ".", "trip_data_dir/trip_data_1k_rows_in_10_grps.parquet", 1000, 1.0));
 }
 TEST_F(ImportTest, One_parquet_file) {
   EXPECT_TRUE(import_test_local_parquet(
@@ -1147,7 +973,7 @@ TEST_F(ImportTest, S3_Wildcard_Prefix) {
 #endif  // ENABLE_IMPORT_PARQUET
 
 TEST_F(ImportTest, One_csv_file) {
-  EXPECT_TRUE(import_test_local("trip_data_9.csv", 100, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/csv/trip_data_9.csv", 100, 1.0));
 }
 
 TEST_F(ImportTest, array_including_quoted_fields) {
@@ -1179,47 +1005,66 @@ TEST_F(ImportTest, with_quoted_fields) {
 }
 
 TEST_F(ImportTest, One_csv_file_no_newline) {
-  EXPECT_TRUE(import_test_local("trip_data_no_newline_1.csv", 100, 1.0));
+  EXPECT_TRUE(import_test_local(
+      "trip_data_dir/csv/no_newline/trip_data_no_newline_1.csv", 100, 1.0));
 }
 
 TEST_F(ImportTest, Many_csv_file) {
-  EXPECT_TRUE(import_test_local("trip_data_*.csv", 1200, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/csv/trip_data_*.csv", 1000, 1.0));
 }
 
 TEST_F(ImportTest, Many_csv_file_no_newline) {
-  EXPECT_TRUE(import_test_local("trip_data_no_newline_*.csv", 200, 1.0));
+  EXPECT_TRUE(import_test_local(
+      "trip_data_dir/csv/no_newline/trip_data_no_newline_*.csv", 200, 1.0));
 }
 
 TEST_F(ImportTest, One_gz_file) {
-  EXPECT_TRUE(import_test_local("trip_data_9.gz", 100, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/compressed/trip_data_9.gz", 100, 1.0));
 }
 
 TEST_F(ImportTest, One_bz2_file) {
-  EXPECT_TRUE(import_test_local("trip_data_9.bz2", 100, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/compressed/trip_data_9.bz2", 100, 1.0));
 }
 
 TEST_F(ImportTest, One_tar_with_many_csv_files) {
-  EXPECT_TRUE(import_test_local("trip_data.tar", 1000, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/compressed/trip_data.tar", 1000, 1.0));
 }
 
 TEST_F(ImportTest, One_tgz_with_many_csv_files) {
-  EXPECT_TRUE(import_test_local("trip_data.tgz", 100000, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/compressed/trip_data.tgz", 100000, 1.0));
 }
 
 TEST_F(ImportTest, One_rar_with_many_csv_files) {
-  EXPECT_TRUE(import_test_local("trip_data.rar", 1000, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/compressed/trip_data.rar", 1000, 1.0));
 }
 
 TEST_F(ImportTest, One_zip_with_many_csv_files) {
-  EXPECT_TRUE(import_test_local("trip_data.zip", 1000, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/compressed/trip_data.zip", 1000, 1.0));
 }
 
 TEST_F(ImportTest, One_7z_with_many_csv_files) {
-  EXPECT_TRUE(import_test_local("trip_data.7z", 1000, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/compressed/trip_data.7z", 1000, 1.0));
 }
 
 TEST_F(ImportTest, One_tgz_with_many_csv_files_no_newline) {
-  EXPECT_TRUE(import_test_local("trip_data_some_with_no_newline.tgz", 500, 1.0));
+  EXPECT_TRUE(import_test_local(
+      "trip_data_dir/compressed/trip_data_some_with_no_newline.tgz", 500, 1.0));
+}
+
+TEST_F(ImportTest, No_match_wildcard) {
+  try {
+    run_ddl_statement("COPY trips FROM '../../Tests/Import/datafiles/no_match*';");
+    FAIL() << "An exception should have been thrown for this test case.";
+  } catch (std::runtime_error& e) {
+    std::string expected_error_message{
+        "File or directory \"../../Tests/Import/datafiles/no_match*\" "
+        "does not exist."};
+    ASSERT_EQ(expected_error_message, e.what());
+  }
+}
+
+TEST_F(ImportTest, Many_files_directory) {
+  EXPECT_TRUE(import_test_local("trip_data_dir/csv", 1200, 1.0));
 }
 
 // Sharding tests
@@ -1259,7 +1104,7 @@ class ImportTestSharded : public ::testing::Test {
 };
 
 TEST_F(ImportTestSharded, One_csv_file) {
-  EXPECT_TRUE(import_test_local("sharded_trip_data_9.csv", 100, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/sharded_trip_data_9.csv", 100, 1.0));
 }
 
 const char* create_table_trips_dict_sharded_text = R"(
@@ -1298,7 +1143,7 @@ class ImportTestShardedText : public ::testing::Test {
 };
 
 TEST_F(ImportTestShardedText, One_csv_file) {
-  EXPECT_TRUE(import_test_local("sharded_trip_data_9.csv", 100, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/sharded_trip_data_9.csv", 100, 1.0));
 }
 
 const char* create_table_trips_dict_sharded_text_8bit = R"(
@@ -1337,7 +1182,7 @@ class ImportTestShardedText8 : public ::testing::Test {
 };
 
 TEST_F(ImportTestShardedText8, One_csv_file) {
-  EXPECT_TRUE(import_test_local("sharded_trip_data_9.csv", 100, 1.0));
+  EXPECT_TRUE(import_test_local("trip_data_dir/sharded_trip_data_9.csv", 100, 1.0));
 }
 
 namespace {
@@ -1801,6 +1646,22 @@ TEST_F(ImportTestGDAL, KML_Simple) {
   }
 }
 
+TEST_F(ImportTestGDAL, FlatGeobuf_Point_Import) {
+  SKIP_ALL_ON_AGGREGATOR();
+  const auto file_path = boost::filesystem::path("geospatial_point/geospatial_point.fgb");
+  import_test_geofile_importer(file_path.string(), "geospatial", false, true, false);
+  check_geo_gdal_point_import();
+  check_geo_num_rows("omnisci_geo, trip", 10);
+}
+
+TEST_F(ImportTestGDAL, FlatGeobuf_MultiPolygon_Import) {
+  SKIP_ALL_ON_AGGREGATOR();
+  const auto file_path = boost::filesystem::path("geospatial_mpoly/geospatial_mpoly.fgb");
+  import_test_geofile_importer(file_path.string(), "geospatial", false, true, false);
+  check_geo_gdal_poly_or_mpoly_import(false, false);  // poly, not exploded
+  check_geo_num_rows("omnisci_geo, trip", 10);
+}
+
 #ifdef HAVE_AWS_S3
 // s3 compressed (non-parquet) test cases
 TEST_F(ImportTest, S3_One_csv_file) {
@@ -1857,6 +1718,123 @@ TEST_F(ImportTest, S3_GCS_One_geo_file) {
                              "geo",
                              87,
                              1.0));
+}
+
+class ImportServerPrivilegeTest : public ::testing::Test {
+ protected:
+  inline const static std::string AWS_DUMMY_CREDENTIALS_DIR =
+      to_string(BASE_PATH) + "/aws";
+  inline static std::map<std::string, std::string> aws_environment_;
+
+  static void SetUpTestSuite() {
+    omnisci_aws_sdk::init_sdk();
+    g_allow_s3_server_privileges = true;
+    aws_environment_ = unset_aws_env();
+    create_stub_aws_profile(AWS_DUMMY_CREDENTIALS_DIR);
+  }
+
+  static void TearDownTestSuite() {
+    omnisci_aws_sdk::shutdown_sdk();
+    g_allow_s3_server_privileges = false;
+    restore_aws_env(aws_environment_);
+    boost::filesystem::remove_all(AWS_DUMMY_CREDENTIALS_DIR);
+  }
+
+  void SetUp() override {
+    ASSERT_NO_THROW(run_ddl_statement("drop table if exists test_table_1;"););
+    ASSERT_NO_THROW(run_ddl_statement("create table test_table_1(C1 Int, C2 Text "
+                                      "Encoding None, C3 Text Encoding None)"););
+  }
+
+  void TearDown() override {
+    ASSERT_NO_THROW(run_ddl_statement("drop table test_table_1;"););
+  }
+
+  void importPublicBucket() {
+    std::string query_stmt =
+        "copy test_table_1 from 's3://omnisci-fsi-test-public/FsiDataFiles/0_255.csv';";
+    run_ddl_statement(query_stmt);
+  }
+
+  void importPrivateBucket(std::string s3_access_key = "",
+                           std::string s3_secret_key = "",
+                           std::string s3_session_token = "",
+                           std::string s3_region = "us-west-1") {
+    std::string query_stmt =
+        "copy test_table_1 from 's3://omnisci-fsi-test/FsiDataFiles/0_255.csv' WITH(";
+    if (s3_access_key.size()) {
+      query_stmt += "s3_access_key='" + s3_access_key + "', ";
+    }
+    if (s3_secret_key.size()) {
+      query_stmt += "s3_secret_key='" + s3_secret_key + "', ";
+    }
+    if (s3_session_token.size()) {
+      query_stmt += "s3_session_token='" + s3_session_token + "', ";
+    }
+    if (s3_region.size()) {
+      query_stmt += "s3_region='" + s3_region + "'";
+    }
+    query_stmt += ");";
+    run_ddl_statement(query_stmt);
+  }
+};
+
+TEST_F(ImportServerPrivilegeTest, S3_Public_without_credentials) {
+  set_aws_profile(AWS_DUMMY_CREDENTIALS_DIR, false);
+  EXPECT_NO_THROW(importPublicBucket());
+}
+
+TEST_F(ImportServerPrivilegeTest, S3_Private_without_credentials) {
+  if (is_valid_aws_role()) {
+    GTEST_SKIP();
+  }
+  set_aws_profile(AWS_DUMMY_CREDENTIALS_DIR, false);
+  EXPECT_THROW(importPrivateBucket(), std::runtime_error);
+}
+
+TEST_F(ImportServerPrivilegeTest, S3_Private_with_invalid_specified_credentials) {
+  if (!is_valid_aws_key(aws_environment_)) {
+    GTEST_SKIP();
+  }
+  set_aws_profile(AWS_DUMMY_CREDENTIALS_DIR, false);
+  EXPECT_THROW(importPrivateBucket("invalid_key", "invalid_secret"), std::runtime_error);
+}
+
+TEST_F(ImportServerPrivilegeTest, S3_Private_with_valid_specified_credentials) {
+  if (!is_valid_aws_key(aws_environment_)) {
+    GTEST_SKIP();
+  }
+  const auto aws_access_key_id = aws_environment_.find("AWS_ACCESS_KEY_ID")->second;
+  const auto aws_secret_access_key =
+      aws_environment_.find("AWS_SECRET_ACCESS_KEY")->second;
+  set_aws_profile(AWS_DUMMY_CREDENTIALS_DIR, false);
+  EXPECT_NO_THROW(importPrivateBucket(aws_access_key_id, aws_secret_access_key));
+}
+
+TEST_F(ImportServerPrivilegeTest, S3_Private_with_env_credentials) {
+  if (!is_valid_aws_key(aws_environment_)) {
+    GTEST_SKIP();
+  }
+  restore_aws_keys(aws_environment_);
+  set_aws_profile(AWS_DUMMY_CREDENTIALS_DIR, false);
+  EXPECT_NO_THROW(importPrivateBucket());
+  unset_aws_keys();
+}
+
+TEST_F(ImportServerPrivilegeTest, S3_Private_with_profile_credentials) {
+  if (!is_valid_aws_key(aws_environment_)) {
+    GTEST_SKIP();
+  }
+  set_aws_profile(AWS_DUMMY_CREDENTIALS_DIR, true, aws_environment_);
+  EXPECT_NO_THROW(importPrivateBucket());
+}
+
+TEST_F(ImportServerPrivilegeTest, S3_Private_with_role_credentials) {
+  if (!is_valid_aws_role()) {
+    GTEST_SKIP();
+  }
+  set_aws_profile(AWS_DUMMY_CREDENTIALS_DIR, false);
+  EXPECT_NO_THROW(importPrivateBucket());
 }
 #endif  // HAVE_AWS_S3
 
@@ -2067,17 +2045,17 @@ class ExportTest : public ::testing::Test {
     }
 
     // select a comparable value from the first row
-    // hopefully immune to any re-ordering due to export query non-determinism
+    // tolerate any re-ordering due to export query non-determinism
     // scope this block so that the ResultSet is destroyed before the table is dropped
-    // @TODO(se) make this mo better
-    // push scope to ensure ResultSet deletion before table drop
     {
       auto rows =
           run_query("SELECT col_big FROM query_export_test_reimport WHERE rowid=0");
       rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
       auto crt_row = rows->getNextRow(true, true);
       const auto col_big = v<int64_t>(crt_row[0]);
-      ASSERT_EQ(20395569495LL, col_big);
+      constexpr std::array<int64_t, 5> values{
+          84212876526LL, 53000912292LL, 31851544292LL, 31334726270LL, 20395569495LL};
+      ASSERT_NE(std::find(values.begin(), values.end(), col_big), values.end());
     }
 
     // drop the table
@@ -2661,6 +2639,55 @@ TEST_F(ExportTest, Shapefile_Zip_Unimplemented) {
     EXPECT_THROW(
         doExport(shp_file, "Shapefile", "Zip", geo_type, NO_ARRAYS, DEFAULT_SRID),
         std::runtime_error);
+  };
+  RUN_TEST_ON_ALL_GEO_TYPES();
+}
+
+TEST_F(ExportTest, FlatGeobuf) {
+  SKIP_ALL_ON_AGGREGATOR();
+  doCreateAndImport();
+  auto run_test = [&](const std::string& geo_type) {
+    std::string exp_file = "query_export_test_fgb_" + geo_type + ".fgb";
+    ASSERT_NO_THROW(
+        doExport(exp_file, "FlatGeobuf", "", geo_type, NO_ARRAYS, DEFAULT_SRID));
+    std::string layer_name = "query_export_test_fgb_" + geo_type;
+    ASSERT_NO_THROW(doCompareWithOGRInfo(exp_file, layer_name, COMPARE_EXPLICIT));
+    doImportAgainAndCompare(exp_file, "FlatGeobuf", geo_type, NO_ARRAYS);
+    removeExportedFile(exp_file);
+  };
+  RUN_TEST_ON_ALL_GEO_TYPES();
+}
+
+TEST_F(ExportTest, FlatGeobuf_Overwrite) {
+  SKIP_ALL_ON_AGGREGATOR();
+  doCreateAndImport();
+  auto run_test = [&](const std::string& geo_type) {
+    std::string exp_file = "query_export_test_fgb_" + geo_type + ".fgb";
+    ASSERT_NO_THROW(
+        doExport(exp_file, "FlatGeobuf", "", geo_type, NO_ARRAYS, DEFAULT_SRID));
+    ASSERT_NO_THROW(
+        doExport(exp_file, "FlatGeobuf", "", geo_type, NO_ARRAYS, DEFAULT_SRID));
+    removeExportedFile(exp_file);
+  };
+  RUN_TEST_ON_ALL_GEO_TYPES();
+}
+
+TEST_F(ExportTest, FlatGeobuf_InvalidName) {
+  SKIP_ALL_ON_AGGREGATOR();
+  doCreateAndImport();
+  std::string geo_type = "point";
+  std::string exp_file = "query_export_test_fgb_" + geo_type + ".jpg";
+  EXPECT_THROW(doExport(exp_file, "FlatGeobuf", "", geo_type, NO_ARRAYS, DEFAULT_SRID),
+               std::runtime_error);
+}
+
+TEST_F(ExportTest, FlatGeobuf_Invalid_SRID) {
+  SKIP_ALL_ON_AGGREGATOR();
+  doCreateAndImport();
+  auto run_test = [&](const std::string& geo_type) {
+    std::string exp_file = "query_export_test_geojsonl_" + geo_type + ".fgb";
+    EXPECT_THROW(doExport(exp_file, "FlatGeobuf", "", geo_type, NO_ARRAYS, INVALID_SRID),
+                 std::runtime_error);
   };
   RUN_TEST_ON_ALL_GEO_TYPES();
 }

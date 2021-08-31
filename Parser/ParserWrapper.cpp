@@ -42,7 +42,8 @@ const std::vector<std::string> ParserWrapper::ddl_cmd = {"ARCHIVE",
                                                          "REVOKE",
                                                          "SHOW",
                                                          "TRUNCATE",
-                                                         "KILL"};
+                                                         "KILL",
+                                                         "REASSIGN"};
 
 const std::vector<std::string> ParserWrapper::update_dml_cmd = {
     "INSERT",
@@ -59,7 +60,6 @@ const std::string ParserWrapper::optimize_str = {"optimize"};
 const std::string ParserWrapper::validate_str = {"validate"};
 
 extern bool g_enable_fsi;
-extern bool g_enable_s3_fsi;
 extern bool g_enable_calcite_ddl_parser;
 
 ParserWrapper::ParserWrapper(std::string query_string) {
@@ -145,18 +145,23 @@ ParserWrapper::ParserWrapper(std::string query_string) {
         }
       }
       if (ddl == "CREATE") {
-        boost::regex ctas_regex{R"(CREATE\s+TABLE.*(\"|\s)AS(\(|\s)+(SELECT|WITH).*)",
-                                boost::regex::extended | boost::regex::icase};
+        boost::regex ctas_regex{
+            R"(CREATE\s+(TEMPORARY\s+|\s*)+TABLE.*(\"|\s)AS(\(|\s)+(SELECT|WITH).*)",
+            boost::regex::extended | boost::regex::icase};
         if (boost::regex_match(query_string, ctas_regex)) {
           is_ctas = true;
+          // why is TEMPORARY being processed in legacy still
+          boost::regex temp_regex{R"(\s+TEMPORARY\s+)",
+                                  boost::regex::extended | boost::regex::icase};
+          if (boost::regex_match(query_string, temp_regex)) {
+            is_calcite_ddl_ = false;
+            is_legacy_ddl_ = true;
+          }
         } else {
-          boost::regex create_table_regex{R"(CREATE\s+TABLE.*)",
-                                          boost::regex::extended | boost::regex::icase};
-          boost::regex create_view_regex{R"(CREATE\s+VIEW.*)",
-                                         boost::regex::extended | boost::regex::icase};
+          boost::regex create_regex{R"(CREATE\s+(TABLE|ROLE|VIEW|DATABASE|USER).*)",
+                                    boost::regex::extended | boost::regex::icase};
           if (g_enable_calcite_ddl_parser &&
-              (boost::regex_match(query_string, create_table_regex) ||
-               boost::regex_match(query_string, create_view_regex))) {
+              boost::regex_match(query_string, create_regex)) {
             is_calcite_ddl_ = true;
             is_legacy_ddl_ = false;
             return;
@@ -184,13 +189,10 @@ ParserWrapper::ParserWrapper(std::string query_string) {
           return;
         }
       } else if (ddl == "DROP") {
-        boost::regex drop_table_regex{R"(DROP\s+TABLE.*)",
-                                      boost::regex::extended | boost::regex::icase};
-        boost::regex drop_view_regex{R"(DROP\s+VIEW.*)",
-                                     boost::regex::extended | boost::regex::icase};
+        boost::regex drop_regex{R"(DROP\s+(TABLE|ROLE|VIEW|DATABASE|USER).*)",
+                                boost::regex::extended | boost::regex::icase};
         if (g_enable_calcite_ddl_parser &&
-            (boost::regex_match(query_string, drop_table_regex) ||
-             boost::regex_match(query_string, drop_view_regex))) {
+            (boost::regex_match(query_string, drop_regex))) {
           is_calcite_ddl_ = true;
           is_legacy_ddl_ = false;
           return;
@@ -202,21 +204,52 @@ ParserWrapper::ParserWrapper(std::string query_string) {
         return;
       } else if (ddl == "RENAME") {
         query_type_ = QueryType::SchemaWrite;
-        is_calcite_ddl_ = true;
-        is_legacy_ddl_ = false;
-        return;
-      } else if (ddl == "ALTER") {
-        query_type_ = QueryType::SchemaWrite;
-        boost::regex alter_table_regex{R"(ALTER\s+TABLE.*)",
-                                       boost::regex::extended | boost::regex::icase};
+        boost::regex rename_regex{R"(RENAME\s+TABLE.*)",
+                                  boost::regex::extended | boost::regex::icase};
         if (g_enable_calcite_ddl_parser &&
-            boost::regex_match(query_string, alter_table_regex)) {
+            boost::regex_match(query_string, rename_regex)) {
           is_calcite_ddl_ = true;
           is_legacy_ddl_ = false;
           return;
         }
+      } else if (ddl == "ALTER") {
+        query_type_ = QueryType::SchemaWrite;
+        boost::regex alter_regex{R"(ALTER\s+(TABLE|DATABASE|USER).*)",
+                                 boost::regex::extended | boost::regex::icase};
+        if (g_enable_calcite_ddl_parser &&
+            boost::regex_match(query_string, alter_regex)) {
+          is_calcite_ddl_ = true;
+          is_legacy_ddl_ = false;
+          return;
+        }
+      } else if (ddl == "GRANT") {
+        boost::regex grant_regex{R"(GRANT.*)",
+                                 boost::regex::extended | boost::regex::icase};
+        if (g_enable_calcite_ddl_parser &&
+            boost::regex_match(query_string, grant_regex)) {
+          is_calcite_ddl_ = true;
+          is_legacy_ddl_ = false;
+          return;
+        }
+      } else if (ddl == "REVOKE") {
+        boost::regex revoke_regex{R"(REVOKE.*)",
+                                  boost::regex::extended | boost::regex::icase};
+        if (g_enable_calcite_ddl_parser &&
+            boost::regex_match(query_string, revoke_regex)) {
+          is_calcite_ddl_ = true;
+          is_legacy_ddl_ = false;
+          return;
+        }
+      } else if (ddl == "REASSIGN") {
+        query_type_ = QueryType::SchemaWrite;
+        is_calcite_ddl_ = true;
+        is_legacy_ddl_ = false;
+        return;
       }
-      is_legacy_ddl_ = !is_calcite_ddl_;
+      // ctas may look like ddl, but is neither legacy_dll nor calcite_ddl
+      if (!is_ctas) {
+        is_legacy_ddl_ = !is_calcite_ddl_;
+      }
       return;
     }
   }
@@ -231,14 +264,11 @@ ParserWrapper::ParserWrapper(std::string query_string) {
   }
 
   if (dml_type_ == DMLType::Insert) {
-    boost::regex insert_regex{R"(INSERT\s+INTO.*VALUES\s*\(.*)",
-                              boost::regex::extended | boost::regex::icase};
-    if (!boost::regex_match(query_string, insert_regex)) {
-      boost::regex itas_regex{R"(INSERT\s+INTO.*(\s|\(|\")+SELECT.*)",
-                              boost::regex::extended | boost::regex::icase};
-      if (boost::regex_match(query_string, itas_regex)) {
-        is_itas = true;
-      }
+    boost::regex itas_regex{R"(INSERT\s+INTO\s+.*(\s+|\(|\")SELECT(\s|\(|\").*)",
+                            boost::regex::extended | boost::regex::icase};
+    if (boost::regex_match(query_string, itas_regex)) {
+      is_itas = true;
+      return;
     }
   }
 }

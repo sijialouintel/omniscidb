@@ -72,6 +72,11 @@ class QueryMemoryInitializer {
     return count_distinct_bitmap_mem_bytes_;
   }
 
+  // TODO: lazy init (maybe lazy init count distinct above, too?)
+  const auto getVarlenOutputHostPtr() const { return varlen_output_buffer_host_ptr_; }
+
+  const auto getVarlenOutputPtr() const { return varlen_output_buffer_; }
+
   ResultSet* getResultSet(const size_t index) const {
     CHECK_LT(index, result_sets_.size());
     return result_sets_[index].get();
@@ -148,11 +153,12 @@ class QueryMemoryInitializer {
                           const std::vector<int64_t>& init_vals,
                           const Executor* executor);
 
+  using QuantileParam = std::optional<double>;
   void initColumnsPerRow(const QueryMemoryDescriptor& query_mem_desc,
                          int8_t* row_ptr,
                          const std::vector<int64_t>& init_vals,
                          const std::vector<int64_t>& bitmap_sizes,
-                         const std::vector<bool>& tdigest_deferred);
+                         const std::vector<QuantileParam>& quantile_params);
 
   void allocateCountDistinctGpuMem(const QueryMemoryDescriptor& query_mem_desc);
 
@@ -165,9 +171,9 @@ class QueryMemoryInitializer {
 
   int64_t allocateCountDistinctSet();
 
-  std::vector<bool> allocateTDigests(const QueryMemoryDescriptor& query_mem_desc,
-                                     const bool deferred,
-                                     const Executor* executor);
+  std::vector<QuantileParam> allocateTDigests(const QueryMemoryDescriptor& query_mem_desc,
+                                              const bool deferred,
+                                              const Executor* executor);
 
 #ifdef HAVE_CUDA
   GpuGroupByBuffers prepareTopNHeapsDevBuffer(const QueryMemoryDescriptor& query_mem_desc,
@@ -213,14 +219,19 @@ class QueryMemoryInitializer {
                                    const unsigned total_thread_count,
                                    const int device_id);
 
+  std::shared_ptr<VarlenOutputInfo> getVarlenOutputInfo();
+
   const int64_t num_rows_;
   std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner_;
   std::vector<std::unique_ptr<ResultSet>> result_sets_;
 
   std::vector<int64_t> init_agg_vals_;
 
-  const size_t num_buffers_;
+  size_t num_buffers_;
   std::vector<int64_t*> group_by_buffers_;
+  std::shared_ptr<VarlenOutputInfo> varlen_output_info_;
+  CUdeviceptr varlen_output_buffer_;
+  int8_t* varlen_output_buffer_host_ptr_;
 
   CUdeviceptr count_distinct_bitmap_mem_;
   size_t count_distinct_bitmap_mem_bytes_;

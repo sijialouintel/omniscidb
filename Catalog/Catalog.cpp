@@ -72,6 +72,7 @@
 #include "Shared/File.h"
 #include "Shared/StringTransform.h"
 #include "Shared/measure.h"
+#include "Shared/misc.h"
 #include "StringDictionary/StringDictionaryClient.h"
 
 #include "MapDRelease.h"
@@ -509,6 +510,27 @@ void Catalog::updateDeletedColumnIndicator() {
   sqliteConnector_.query("END TRANSACTION");
 }
 
+void Catalog::updateDefaultColumnValues() {
+  cat_sqlite_lock sqlite_lock(getObjForLock());
+  sqliteConnector_.query("BEGIN TRANSACTION");
+  try {
+    sqliteConnector_.query("PRAGMA TABLE_INFO(mapd_columns)");
+    std::vector<std::string> cols;
+    for (size_t i = 0; i < sqliteConnector_.getNumRows(); i++) {
+      cols.push_back(sqliteConnector_.getData<std::string>(i, 1));
+    }
+    if (std::find(cols.begin(), cols.end(), std::string("default_value")) == cols.end()) {
+      LOG(INFO) << "Adding support for default values to mapd_columns";
+      sqliteConnector_.query("ALTER TABLE mapd_columns ADD default_value TEXT");
+    }
+  } catch (std::exception& e) {
+    LOG(ERROR) << "Failed to make metadata update for default values` support";
+    sqliteConnector_.query("ROLLBACK TRANSACTION");
+    throw;
+  }
+  sqliteConnector_.query("END TRANSACTION");
+}
+
 // introduce DB version into the dictionary tables
 // if the DB does not have a version rename all dictionary tables
 
@@ -900,6 +922,7 @@ void Catalog::CheckAndExecuteMigrations() {
     updateFsiSchemas();
   }
   updateCustomExpressionsSchema();
+  updateDefaultColumnValues();
 }
 
 void Catalog::CheckAndExecuteMigrationsPostBuildMaps() {
@@ -1005,7 +1028,8 @@ void Catalog::buildMaps() {
   string columnQuery(
       "SELECT tableid, columnid, name, coltype, colsubtype, coldim, colscale, "
       "is_notnull, compression, comp_param, "
-      "size, chunks, is_systemcol, is_virtualcol, virtual_expr, is_deletedcol from "
+      "size, chunks, is_systemcol, is_virtualcol, virtual_expr, is_deletedcol, "
+      "default_value from "
       "mapd_columns ORDER BY tableid, "
       "columnid");
   sqliteConnector_.query(columnQuery);
@@ -1029,6 +1053,11 @@ void Catalog::buildMaps() {
     cd->isVirtualCol = sqliteConnector_.getData<bool>(r, 13);
     cd->virtualExpr = sqliteConnector_.getData<string>(r, 14);
     cd->isDeletedCol = sqliteConnector_.getData<bool>(r, 15);
+    if (sqliteConnector_.isNull(r, 16)) {
+      cd->default_value = std::nullopt;
+    } else {
+      cd->default_value = std::make_optional(sqliteConnector_.getData<string>(r, 16));
+    }
     cd->isGeoPhyCol = skip_physical_cols > 0;
     ColumnKey columnKey(cd->tableId, to_upper(cd->columnName));
     columnDescriptorMap_[columnKey] = cd;
@@ -1351,7 +1380,8 @@ void Catalog::createOrUpdateDashboardSystemRole(const std::string& view_meta,
     // Dashboard role does not exist
     // create role and grant privileges
     // NOTE(wamsi): Transactionally unsafe
-    SysCatalog::instance().createRole(dash_role_name, false);
+    SysCatalog::instance().createRole(
+        dash_role_name, /*user_private_role=*/false, /*is_temporary=*/false);
     SysCatalog::instance().grantDBObjectPrivilegesBatch({dash_role_name}, objects, *this);
   } else {
     // Dashboard system role already exists
@@ -1920,16 +1950,21 @@ void Catalog::addColumn(const TableDescriptor& td, ColumnDescriptor& cd) {
     addDictionary(cd);
   }
 
+  using BindType = SqliteConnector::BindType;
+  std::vector<BindType> types(17, BindType::TEXT);
+  if (!cd.default_value.has_value()) {
+    types[16] = BindType::NULL_TYPE;
+  }
   sqliteConnector_.query_with_text_params(
       "INSERT INTO mapd_columns (tableid, columnid, name, coltype, colsubtype, coldim, "
       "colscale, is_notnull, "
       "compression, comp_param, size, chunks, is_systemcol, is_virtualcol, virtual_expr, "
-      "is_deletedcol) "
+      "is_deletedcol, default_value) "
       "VALUES (?, "
       "(SELECT max(columnid) + 1 FROM mapd_columns WHERE tableid = ?), "
       "?, ?, ?, "
       "?, "
-      "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       std::vector<std::string>{std::to_string(td.tableId),
                                std::to_string(td.tableId),
                                cd.columnName,
@@ -1945,7 +1980,9 @@ void Catalog::addColumn(const TableDescriptor& td, ColumnDescriptor& cd) {
                                std::to_string(cd.isSystemCol),
                                std::to_string(cd.isVirtualCol),
                                cd.virtualExpr,
-                               std::to_string(cd.isDeletedCol)});
+                               std::to_string(cd.isDeletedCol),
+                               cd.default_value.value_or("NULL")},
+      types);
 
   sqliteConnector_.query_with_text_params(
       "UPDATE mapd_tables SET ncolumns = ncolumns + 1 WHERE tableid = ?",
@@ -2302,14 +2339,19 @@ void Catalog::createTable(
           }
         }
 
+        using BindType = SqliteConnector::BindType;
+        std::vector<BindType> types(17, BindType::TEXT);
+        if (!cd.default_value.has_value()) {
+          types[16] = BindType::NULL_TYPE;
+        }
         sqliteConnector_.query_with_text_params(
             "INSERT INTO mapd_columns (tableid, columnid, name, coltype, colsubtype, "
             "coldim, colscale, is_notnull, "
             "compression, comp_param, size, chunks, is_systemcol, is_virtualcol, "
-            "virtual_expr, is_deletedcol) "
+            "virtual_expr, is_deletedcol, default_value) "
             "VALUES (?, ?, ?, ?, ?, "
             "?, "
-            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             std::vector<std::string>{std::to_string(td.tableId),
                                      std::to_string(colId),
                                      cd.columnName,
@@ -2325,7 +2367,9 @@ void Catalog::createTable(
                                      std::to_string(cd.isSystemCol),
                                      std::to_string(cd.isVirtualCol),
                                      cd.virtualExpr,
-                                     std::to_string(cd.isDeletedCol)});
+                                     std::to_string(cd.isDeletedCol),
+                                     cd.default_value.value_or("NULL")},
+            types);
         cd.tableId = td.tableId;
         cd.columnId = colId++;
         cds.push_back(cd);
@@ -2399,6 +2443,14 @@ void Catalog::createTable(
   }
 
   try {
+    auto cache = dataMgr_->getPersistentStorageMgr()->getDiskCache();
+    if (cache) {
+      CHECK(!cache->hasCachedMetadataForKeyPrefix({getCurrentDB().dbId, td.tableId}))
+          << "Disk cache at " + cache->getCacheDirectory()
+          << " contains preexisting data for new table.  Please "
+             "delete or clear cache before continuing";
+    }
+
     addTableToMap(&td, cds, dds);
     calciteMgr_->updateMetadata(currentDB_.dbName, td.tableName);
     if (!td.storageType.empty() && td.storageType != StorageType::FOREIGN_TABLE) {
@@ -2410,6 +2462,12 @@ void Catalog::createTable(
     throw;
   }
   sqliteConnector_.query("END TRANSACTION");
+
+  if (td.storageType != StorageType::FOREIGN_TABLE) {
+    sqlite_lock.unlock();
+    getMetadataForTable(td.tableName,
+                        true);  // cause instantiateFragmenter() to be called
+  }
 }
 
 void Catalog::serializeTableJsonUnlocked(const TableDescriptor* td,
@@ -4432,6 +4490,9 @@ std::string Catalog::dumpSchema(const TableDescriptor* td) const {
         os << " " << ti.get_type_name();
       }
       os << (ti.get_notnull() ? " NOT NULL" : "");
+      if (cd->default_value.has_value()) {
+        os << " DEFAULT " << cd->getDefaultValueLiteral();
+      }
       if (ti.is_string() || (ti.is_array() && ti.get_subtype() == kTEXT)) {
         auto size = ti.is_array() ? ti.get_logical_size() : ti.get_size();
         if (ti.get_compression() == kENCODING_DICT) {
@@ -4587,10 +4648,13 @@ std::string Catalog::dumpCreateTable(const TableDescriptor* td,
         os << " " << ti.get_type_name();
       }
       os << (ti.get_notnull() ? " NOT NULL" : "");
+      if (cd->default_value.has_value()) {
+        os << " DEFAULT " << cd->getDefaultValueLiteral();
+      }
       if (shared_dict_column_names.find(cd->columnName) ==
           shared_dict_column_names.end()) {
-        // avoids "Exception: Column ... shouldn't specify an encoding, it borrows it
-        // from the referenced column"
+        // avoids "Column ... shouldn't specify an encoding, it borrows it
+        //    from the referenced column"
         if (ti.is_string() || (ti.is_array() && ti.get_subtype() == kTEXT)) {
           auto size = ti.is_array() ? ti.get_logical_size() : ti.get_size();
           if (ti.get_compression() == kENCODING_DICT) {
@@ -5038,5 +5102,259 @@ void Catalog::deleteCustomExpressions(const std::vector<int32_t>& custom_express
     throw;
   }
   sqliteConnector_.query("END TRANSACTION");
+}
+
+namespace {
+int32_t validate_and_get_user_id(const std::string& user_name) {
+  UserMetadata user;
+  if (!SysCatalog::instance().getMetadataForUser(user_name, user)) {
+    throw std::runtime_error{"User with username \"" + user_name + "\" does not exist."};
+  }
+  return user.userId;
+}
+
+std::string convert_object_owners_map_to_string(
+    int32_t db_id,
+    int32_t new_owner_id,
+    const std::map<int32_t, std::vector<DBObject>>& old_owner_db_objects) {
+  std::stringstream result;
+  for (const auto& [old_owner_id, db_objects] : old_owner_db_objects) {
+    result << "db_id: " << db_id << ", new_owner_user_id: " << new_owner_id
+           << ", old_owner_user_id: " << old_owner_id << ", db_objects: [";
+    bool first_object{true};
+    for (const auto& db_object : db_objects) {
+      if (first_object) {
+        first_object = false;
+      } else {
+        result << ", ";
+      }
+      result << "\"object_id: " << db_object.getObjectKey().objectId
+             << ", object_type: " << DBObjectTypeToString(db_object.getType()) << "\"";
+    }
+    result << "]\n";
+  }
+  return result.str();
+}
+
+void add_db_object(const std::string& object_name,
+                   DBObjectType object_type,
+                   int32_t user_id,
+                   const AccessPrivileges& privileges,
+                   std::map<int32_t, std::vector<DBObject>>& db_objects) {
+  DBObject db_object{object_name, object_type};
+  db_object.setPrivileges(privileges);
+  db_objects[user_id].emplace_back(db_object);
+}
+}  // namespace
+
+void Catalog::reassignOwners(const std::set<std::string>& old_owners,
+                             const std::string& new_owner) {
+  CHECK(!old_owners.empty());
+  int32_t new_owner_id = validate_and_get_user_id(new_owner);
+  std::set<int32_t> old_owner_ids;
+  for (const auto& old_owner : old_owners) {
+    auto old_owner_id = validate_and_get_user_id(old_owner);
+    if (old_owner_id != new_owner_id) {
+      old_owner_ids.emplace(old_owner_id);
+    }
+  }
+
+  // An empty set after the above loop implies reassignment to the same user (i.e. all
+  // users in the old_owners set is the same as new_owner). Do nothing in this case.
+  if (old_owner_ids.empty()) {
+    return;
+  }
+
+  std::map<int32_t, std::vector<DBObject>> old_owner_db_objects;
+  {
+    cat_write_lock write_lock(this);
+    cat_sqlite_lock sqlite_lock(getObjForLock());
+    sqliteConnector_.query("BEGIN TRANSACTION");
+    try {
+      for (const auto old_user_id : old_owner_ids) {
+        sqliteConnector_.query_with_text_params(
+            "UPDATE mapd_tables SET userid = ? WHERE userid = ?",
+            std::vector<std::string>{std::to_string(new_owner_id),
+                                     std::to_string(old_user_id)});
+
+        sqliteConnector_.query_with_text_params(
+            "UPDATE mapd_dashboards SET userid = ? WHERE userid = ?",
+            std::vector<std::string>{std::to_string(new_owner_id),
+                                     std::to_string(old_user_id)});
+
+        if (g_enable_fsi) {
+          sqliteConnector_.query_with_text_params(
+              "UPDATE omnisci_foreign_servers SET owner_user_id = ? "
+              "WHERE owner_user_id = ?",
+              std::vector<std::string>{std::to_string(new_owner_id),
+                                       std::to_string(old_user_id)});
+        }
+      }
+
+      for (const auto& [table_name, td] : tableDescriptorMap_) {
+        if (shared::contains(old_owner_ids, td->userId)) {
+          if (td->isView) {
+            add_db_object(td->tableName,
+                          DBObjectType::ViewDBObjectType,
+                          td->userId,
+                          AccessPrivileges::ALL_VIEW,
+                          old_owner_db_objects);
+          } else {
+            add_db_object(td->tableName,
+                          DBObjectType::TableDBObjectType,
+                          td->userId,
+                          AccessPrivileges::ALL_TABLE,
+                          old_owner_db_objects);
+          }
+          td->userId = new_owner_id;
+        }
+      }
+
+      DashboardDescriptorMap new_owner_dashboard_map;
+      for (auto it = dashboardDescriptorMap_.begin();
+           it != dashboardDescriptorMap_.end();) {
+        if (auto dashboard = it->second;
+            shared::contains(old_owner_ids, dashboard->userId)) {
+          DBObject db_object{dashboard->dashboardId, DBObjectType::DashboardDBObjectType};
+          db_object.setPrivileges(AccessPrivileges::ALL_DASHBOARD);
+          old_owner_db_objects[dashboard->userId].emplace_back(db_object);
+
+          // Dashboards in the dashboardDescriptorMap_ use keys with the format
+          // "{user id}:{dashboard name}". Ensure that map entries are replaced
+          // with the new owner's user id.
+          std::string old_key{std::to_string(dashboard->userId) + ":" +
+                              dashboard->dashboardName};
+          CHECK_EQ(it->first, old_key);
+          std::string new_key{std::to_string(new_owner_id) + ":" +
+                              dashboard->dashboardName};
+          CHECK(dashboardDescriptorMap_.find(new_key) == dashboardDescriptorMap_.end());
+          new_owner_dashboard_map[new_key] = dashboard;
+          dashboard->userId = new_owner_id;
+          it = dashboardDescriptorMap_.erase(it);
+        } else {
+          it++;
+        }
+      }
+      dashboardDescriptorMap_.merge(new_owner_dashboard_map);
+
+      if (g_enable_fsi) {
+        for (const auto& [server_name, server] : foreignServerMap_) {
+          if (shared::contains(old_owner_ids, server->user_id)) {
+            add_db_object(server->name,
+                          DBObjectType::ServerDBObjectType,
+                          server->user_id,
+                          AccessPrivileges::ALL_SERVER,
+                          old_owner_db_objects);
+            server->user_id = new_owner_id;
+          }
+        }
+      }
+
+      // Ensure new owner is set in the DB objects.
+      for (auto& [old_owner_id, db_objects] : old_owner_db_objects) {
+        for (auto& db_object : db_objects) {
+          db_object.loadKey(*this);
+          CHECK_EQ(db_object.getOwner(), new_owner_id);
+          const auto& object_key = db_object.getObjectKey();
+          CHECK_EQ(object_key.dbId, getDatabaseId());
+          CHECK_NE(object_key.objectId, -1);
+        }
+      }
+    } catch (std::exception& e) {
+      sqliteConnector_.query("ROLLBACK TRANSACTION");
+      restoreOldOwnersInMemory(old_owner_db_objects, new_owner_id);
+      throw;
+    }
+    sqliteConnector_.query("END TRANSACTION");
+  }
+
+  try {
+    SysCatalog::instance().reassignObjectOwners(
+        old_owner_db_objects, new_owner_id, *this);
+  } catch (std::exception& e) {
+    restoreOldOwners(old_owner_db_objects, new_owner_id);
+    throw;
+  }
+}
+
+void Catalog::restoreOldOwners(
+    const std::map<int32_t, std::vector<DBObject>>& old_owner_db_objects,
+    int32_t new_owner_id) {
+  cat_write_lock write_lock(this);
+  cat_sqlite_lock sqlite_lock(getObjForLock());
+  sqliteConnector_.query("BEGIN TRANSACTION");
+  try {
+    for (const auto& [old_owner_id, db_objects] : old_owner_db_objects) {
+      for (const auto& db_object : db_objects) {
+        auto object_id = db_object.getObjectKey().objectId;
+        CHECK_GT(object_id, 0);
+        std::vector<std::string> query_params{std::to_string(old_owner_id),
+                                              std::to_string(new_owner_id),
+                                              std::to_string(object_id)};
+        auto object_type = db_object.getType();
+        if (object_type == DBObjectType::TableDBObjectType ||
+            object_type == DBObjectType::ViewDBObjectType) {
+          sqliteConnector_.query_with_text_params(
+              "UPDATE mapd_tables SET userid = ? WHERE userid = ? AND tableid = ?",
+              query_params);
+        } else if (object_type == DBObjectType::DashboardDBObjectType) {
+          sqliteConnector_.query_with_text_params(
+              "UPDATE mapd_dashboards SET userid = ? WHERE userid = ? AND id = ?",
+              query_params);
+        } else if (object_type == DBObjectType::ServerDBObjectType) {
+          CHECK(g_enable_fsi);
+          sqliteConnector_.query_with_text_params(
+              "UPDATE omnisci_foreign_servers SET owner_user_id = ? "
+              "WHERE owner_user_id = ? AND id = ?",
+              query_params);
+        } else {
+          UNREACHABLE() << "Unexpected DB object type: " << static_cast<int>(object_type);
+        }
+      }
+    }
+    restoreOldOwnersInMemory(old_owner_db_objects, new_owner_id);
+  } catch (std::exception& e) {
+    sqliteConnector_.query("ROLLBACK TRANSACTION");
+    LOG(FATAL)
+        << "Unable to restore database objects ownership after an error occurred. "
+           "Database object ownership information may be in an inconsistent state. " +
+               convert_object_owners_map_to_string(
+                   getDatabaseId(), new_owner_id, old_owner_db_objects);
+  }
+  sqliteConnector_.query("END TRANSACTION");
+}
+
+void Catalog::restoreOldOwnersInMemory(
+    const std::map<int32_t, std::vector<DBObject>>& old_owner_db_objects,
+    int32_t new_owner_id) {
+  for (const auto& [old_owner_id, db_objects] : old_owner_db_objects) {
+    for (const auto& db_object : db_objects) {
+      auto object_id = db_object.getObjectKey().objectId;
+      auto object_type = db_object.getType();
+      if (object_type == DBObjectType::TableDBObjectType ||
+          object_type == DBObjectType::ViewDBObjectType) {
+        auto it = tableDescriptorMapById_.find(object_id);
+        CHECK(it != tableDescriptorMapById_.end());
+        CHECK(it->second);
+        it->second->userId = old_owner_id;
+      } else if (object_type == DBObjectType::DashboardDBObjectType) {
+        auto it = dashboardDescriptorMap_.find(std::to_string(new_owner_id) + ":" +
+                                               db_object.getName());
+        CHECK(it != dashboardDescriptorMap_.end());
+        CHECK(it->second);
+        it->second->userId = old_owner_id;
+        dashboardDescriptorMap_[std::to_string(old_owner_id) + ":" +
+                                db_object.getName()] = it->second;
+        dashboardDescriptorMap_.erase(it);
+      } else if (object_type == DBObjectType::ServerDBObjectType) {
+        auto it = foreignServerMapById_.find(object_id);
+        CHECK(it != foreignServerMapById_.end());
+        CHECK(it->second);
+        it->second->user_id = old_owner_id;
+      } else {
+        UNREACHABLE() << "Unexpected DB object type: " << static_cast<int>(object_type);
+      }
+    }
+  }
 }
 }  // namespace Catalog_Namespace

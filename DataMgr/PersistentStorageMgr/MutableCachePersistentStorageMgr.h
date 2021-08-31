@@ -23,15 +23,19 @@
  */
 class MutableCachePersistentStorageMgr : public PersistentStorageMgr {
  public:
-  MutableCachePersistentStorageMgr(const std::string& data_dir,
-                                   const size_t num_reader_threads,
-                                   const DiskCacheConfig& disk_cache_config);
+  MutableCachePersistentStorageMgr(
+      const std::string& data_dir,
+      const size_t num_reader_threads,
+      const File_Namespace::DiskCacheConfig& disk_cache_config);
   AbstractBuffer* createBuffer(const ChunkKey& chunk_key,
                                const size_t page_size,
                                const size_t initial_size) override;
   void deleteBuffer(const ChunkKey& chunk_key, const bool purge) override;
   void deleteBuffersWithPrefix(const ChunkKey& chunk_key_prefix,
                                const bool purge) override;
+  void fetchBuffer(const ChunkKey& chunk_key,
+                   AbstractBuffer* destination_buffer,
+                   const size_t num_bytes) override;
   AbstractBuffer* putBuffer(const ChunkKey& chunk_key,
                             AbstractBuffer* source_buffer,
                             const size_t num_bytes) override;

@@ -130,6 +130,11 @@ class CodeGenerator {
     std::unique_ptr<DiamondCodegen> null_check;
   };
 
+  static ArrayLoadCodegen codegenGeoArrayLoadAndNullcheck(llvm::Value* byte_stream,
+                                                          llvm::Value* pos,
+                                                          const SQLTypeInfo& ti,
+                                                          CgenState* cgen_state);
+
  private:
   std::vector<llvm::Value*> codegen(const Analyzer::Constant*,
                                     const EncodingType enc_type,
@@ -203,6 +208,19 @@ class CodeGenerator {
 
   std::vector<llvm::Value*> codegenArrayExpr(const Analyzer::ArrayExpr*,
                                              const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoColumnVar(const Analyzer::GeoColumnVar*,
+                                                const bool fetch_columns,
+                                                const CompilationOptions& co);
+
+  std::vector<llvm::Value*> codegenGeoExpr(const Analyzer::GeoExpr*,
+                                           const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoConstant(const Analyzer::GeoConstant*,
+                                               const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoOperator(const Analyzer::GeoOperator*,
+                                               const CompilationOptions&);
 
   std::vector<llvm::Value*> codegenGeoUOper(const Analyzer::GeoUOper*,
                                             const CompilationOptions&);

@@ -64,6 +64,7 @@ extern bool g_enable_debug_timer;
 namespace logger {
 
 // Channel, ChannelNames, and ChannelSymbols must be updated together.
+// Each Channel has its own ChannelLogger declared below and defined in Logger.cpp.
 enum Channel { IR = 0, PTX, ASM, _NCHANNELS };
 
 constexpr std::array<char const*, 3> ChannelNames{"IR", "PTX", "ASM"};
@@ -154,7 +155,9 @@ using FatalFunc = void (*)() noexcept;
 void set_once_fatal_func(FatalFunc);
 
 using ChannelLogger = boost::log::sources::channel_logger_mt<Channel>;
-BOOST_LOG_GLOBAL_LOGGER(gChannelLogger, ChannelLogger)
+BOOST_LOG_GLOBAL_LOGGER(gChannelLogger_IR, ChannelLogger)
+BOOST_LOG_GLOBAL_LOGGER(gChannelLogger_PTX, ChannelLogger)
+BOOST_LOG_GLOBAL_LOGGER(gChannelLogger_ASM, ChannelLogger)
 
 using SeverityLogger = boost::log::sources::severity_logger_mt<Severity>;
 BOOST_LOG_GLOBAL_LOGGER(gSeverityLogger, SeverityLogger)
@@ -168,8 +171,8 @@ class Logger {
   std::unique_ptr<boost::log::record_ostream> stream_;
 
  public:
-  Logger(Channel);
-  Logger(Severity);
+  explicit Logger(Channel);
+  explicit Logger(Severity);
   Logger(Logger&&) = default;
   ~Logger();
   operator bool() const;
@@ -191,10 +194,13 @@ inline bool fast_logging_check(Severity severity) {
 // which are fortunately prevented by our clang-tidy requirements.
 // These can be changed to for/while loops with slight performance degradation.
 
-#define LOG(tag)                                             \
-  if (logger::fast_logging_check(logger::tag))               \
-    if (auto _omnisci_logger_ = logger::Logger(logger::tag)) \
+#define SLOG(severity_or_channel)                                                     \
+  if (auto _omnisci_logger_severity_or_channel_ = severity_or_channel;                \
+      logger::fast_logging_check(_omnisci_logger_severity_or_channel_))               \
+    if (auto _omnisci_logger_ = logger::Logger(_omnisci_logger_severity_or_channel_)) \
   _omnisci_logger_.stream(__FILE__, __LINE__)
+
+#define LOG(tag) SLOG(logger::tag)
 
 #define LOGGING(tag) logger::fast_logging_check(logger::tag)
 
@@ -308,6 +314,33 @@ class DebugTimer {
   // json is returned only when called on the root DurationTree.
   std::string stopAndGetJson();
 };
+
+using QueryId = uint64_t;
+QueryId query_id();
+
+// ~QidScopeGuard resets the thread_local g_query_id to 0 if the current value = id_.
+// In other words, only the QidScopeGuard instance which resulted from changing
+// g_query_id from zero to non-zero is responsible for resetting it back to zero when it
+// goes out of scope. All other instances have no effect.
+class QidScopeGuard {
+  QueryId id_;
+
+ public:
+  QidScopeGuard(QueryId const id) : id_{id} {}
+  QidScopeGuard(QidScopeGuard const&) = delete;
+  QidScopeGuard& operator=(QidScopeGuard const&) = delete;
+  QidScopeGuard(QidScopeGuard&& that) : id_(that.id_) { that.id_ = 0; }
+  QidScopeGuard& operator=(QidScopeGuard&& that) {
+    id_ = that.id_;
+    that.id_ = 0;
+    return *this;
+  }
+  ~QidScopeGuard();
+  QueryId id() const { return id_; }
+};
+
+// Set logger::g_query_id based on given parameter.
+QidScopeGuard set_thread_local_query_id(QueryId const);
 
 using ThreadId = uint64_t;
 

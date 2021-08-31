@@ -64,7 +64,7 @@ bool UpdelTestConfig::enableVarUpdelPerfTest = false;
 bool UpdelTestConfig::enableFixUpdelPerfTest = false;
 int64_t UpdelTestConfig::fixNumRows = fixNumRowsByDefault;
 int64_t UpdelTestConfig::varNumRows = varNumRowsByDefault;
-std::string UpdelTestConfig::fixFile = "trip_data_b.txt";
+std::string UpdelTestConfig::fixFile = "trip_data_dir/trip_data_b.txt";
 std::string UpdelTestConfig::varFile = "varlen.txt";
 std::string UpdelTestConfig::sequence = "rate_code_id";
 }  // namespace
@@ -1133,11 +1133,83 @@ TEST_F(VarLenColumnUpdateTest, UpdateOnFragmentWithSpace) {
   sqlAndCompareResult("select * from test_table;", {"c"});
 }
 
+class TableWithImmediateVacuumTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    run_ddl_statement("drop table if exists test_table;");
+    run_ddl_statement(
+        "create table test_table (i int, t text encoding none) with (vacuum = "
+        "'immediate');");
+    run_query("insert into test_table values (1, 'a');");
+  }
+
+  void TearDown() override { run_ddl_statement("drop table if exists test_table;"); }
+
+  void sqlAndAssertException(const std::string& query, const std::string& error_message) {
+    try {
+      run_query(query);
+      FAIL() << "An exception should have been thrown for this test case";
+    } catch (const std::exception& e) {
+      ASSERT_EQ(error_message, e.what());
+    }
+  }
+
+  void sqlAndCompareResult(const std::string& query,
+                           int64_t i_column,
+                           const std::string& t_column) {
+    auto result = run_query(query);
+    ASSERT_EQ(static_cast<size_t>(1), result->rowCount());
+    ASSERT_EQ(static_cast<size_t>(2), result->colCount());
+
+    auto row = result->getNextRow(true, true);
+    auto& target_value_1 = boost::get<ScalarTargetValue>(row[0]);
+    EXPECT_EQ(i_column, boost::get<int64_t>(target_value_1));
+
+    auto& target_value_2 = boost::get<ScalarTargetValue>(row[1]);
+    auto& nullable_str = boost::get<NullableString>(target_value_2);
+    EXPECT_EQ(t_column, boost::get<std::string>(nullable_str));
+  }
+};
+
+TEST_F(TableWithImmediateVacuumTest, Delete) {
+  sqlAndAssertException("delete from test_table where i = 1;",
+                        "DELETE queries are only supported on tables with the vacuum "
+                        "attribute set to 'delayed'");
+}
+
+TEST_F(TableWithImmediateVacuumTest, VarLenColumnUpdate) {
+  sqlAndAssertException("update test_table set t = 'b' where t = 'a';",
+                        "UPDATE queries involving variable length columns are only "
+                        "supported on tables with the vacuum attribute set to 'delayed'");
+}
+
+TEST_F(TableWithImmediateVacuumTest, FixedLenColumnUpdate) {
+  sqlAndCompareResult("select * from test_table;", 1, "a");
+  run_query("update test_table set i = 2 where i = 1;");
+  sqlAndCompareResult("select * from test_table;", 2, "a");
+}
+
 int main(int argc, char** argv) {
   TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
 
-  QR::init(BASE_PATH);
+  namespace po = boost::program_options;
+  po::options_description desc("Options");
+  // these two are here to allow passing correctly google testing parameters
+  desc.add_options()("gtest_list_tests", "list all test");
+  desc.add_options()("gtest_filter", "filters tests, use --help for details");
+  desc.add_options()("use-disk-cache",
+                     "Use the disk cache for all tables with default size settings.");
+  po::variables_map vm;
+  po::store(po::command_line_parser(argc, argv).options(desc).run(), vm);
+  po::notify(vm);
+  File_Namespace::DiskCacheConfig disk_cache_config{};
+  if (vm.count("use-disk-cache")) {
+    disk_cache_config = File_Namespace::DiskCacheConfig{
+        File_Namespace::DiskCacheConfig::getDefaultPath(std::string(BASE_PATH)),
+        File_Namespace::DiskCacheLevel::all};
+  }
+  QR::init(&disk_cache_config, BASE_PATH);
 
   // the data files for perf tests are too big to check in, so perf tests
   // are done privately in someone's dev host. prog option seems a overkill.

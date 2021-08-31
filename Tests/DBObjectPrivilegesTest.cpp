@@ -25,6 +25,11 @@
 using namespace TestHelpers;
 
 using QR = QueryRunner::QueryRunner;
+
+using Catalog_Namespace::DBMetadata;
+using Catalog_Namespace::SysCatalog;
+using Catalog_Namespace::UserMetadata;
+
 extern size_t g_leaf_count;
 extern bool g_enable_fsi;
 std::string g_test_binary_file_path;
@@ -53,19 +58,19 @@ inline auto sql(std::string_view sql_stmts) {
 struct Users {
   void setup_users() {
     if (!sys_cat.getMetadataForUser("Chelsea", g_user)) {
-      sys_cat.createUser("Chelsea", "password", true, "", true);
+      sys_cat.createUser("Chelsea", "password", true, "", true, false);
       CHECK(sys_cat.getMetadataForUser("Chelsea", g_user));
     }
     if (!sys_cat.getMetadataForUser("Arsenal", g_user)) {
-      sys_cat.createUser("Arsenal", "password", false, "", true);
+      sys_cat.createUser("Arsenal", "password", false, "", true, false);
       CHECK(sys_cat.getMetadataForUser("Arsenal", g_user));
     }
     if (!sys_cat.getMetadataForUser("Juventus", g_user)) {
-      sys_cat.createUser("Juventus", "password", false, "", true);
+      sys_cat.createUser("Juventus", "password", false, "", true, false);
       CHECK(sys_cat.getMetadataForUser("Juventus", g_user));
     }
     if (!sys_cat.getMetadataForUser("Bayern", g_user)) {
-      sys_cat.createUser("Bayern", "password", false, "", true);
+      sys_cat.createUser("Bayern", "password", false, "", true, false);
       CHECK(sys_cat.getMetadataForUser("Bayern", g_user));
     }
   }
@@ -128,8 +133,14 @@ struct GrantSyntax : testing::Test {
   Users user_;
   Roles role_;
 
-  void setup_tables() { run_ddl_statement("CREATE TABLE IF NOT EXISTS tbl(i INTEGER)"); }
-  void drop_tables() { run_ddl_statement("DROP TABLE IF EXISTS tbl"); }
+  void setup_tables() {
+    run_ddl_statement("CREATE TABLE IF NOT EXISTS tbl(i INTEGER)");
+    run_ddl_statement("CREATE VIEW grantView AS SELECT i FROM tbl;");
+  }
+  void drop_tables() {
+    run_ddl_statement("DROP TABLE IF EXISTS tbl");
+    run_ddl_statement("DROP VIEW IF EXISTS grantView");
+  }
   explicit GrantSyntax() {
     drop_tables();
     setup_tables();
@@ -347,25 +358,47 @@ class InvalidGrantSyntax : public DBHandlerTestFixture {};
 
 TEST_F(InvalidGrantSyntax, InvalidGrantSyntax) {
   std::string error_message;
-  error_message = "Exception: Syntax error at: ON";
+  error_message =
+      "SQL Error: Encountered \"ON\" at line 1, column 23.\nWas expecting one of:\n    "
+      "\"ALTER\" ...\n    \"CREATE\" ...\n    \"DELETE\" ...\n    \"DROP\" ...\n    "
+      "\"INSERT\" ...\n    \"SELECT\" ...\n    \"TRUNCATE\" ...\n    \"UPDATE\" ...\n    "
+      "\"USAGE\" ...\n    \"VIEW\" ...\n    \"ACCESS\" ...\n    \"EDIT\" ...\n    "
+      "\"SERVER\" ...\n    \"ALL\" ...\n    ";
 
   queryAndAssertException("GRANT SELECT, INSERT, ON TABLE tbl TO Arsenal, Juventus;",
                           error_message);
 }
 
+TEST_F(InvalidGrantSyntax, InvalidGrantType) {
+  std::string error_message;
+
+  error_message = "GRANT failed. Object 'grantView' of type TABLE not found.";
+  queryAndAssertException("GRANT SELECT ON TABLE grantView TO Arsenal;", error_message);
+
+  error_message = "REVOKE failed. Object 'grantView' of type TABLE not found.";
+  queryAndAssertException("REVOKE SELECT ON TABLE grantView FROM Arsenal;",
+                          error_message);
+
+  error_message = "GRANT failed. Object 'tbl' of type VIEW not found.";
+  queryAndAssertException("GRANT SELECT ON VIEW tbl TO Arsenal;", error_message);
+
+  error_message = "REVOKE failed. Object 'tbl' of type VIEW not found.";
+  queryAndAssertException("REVOKE SELECT ON VIEW tbl FROM Arsenal;", error_message);
+}
+
 TEST(UserRoles, InvalidGrantsRevokesTest) {
   run_ddl_statement("CREATE USER Antazin(password = 'password', is_super = 'false');");
-  run_ddl_statement("CREATE USER Max(password = 'password', is_super = 'false');");
+  run_ddl_statement("CREATE USER \"Max\"(password = 'password', is_super = 'false');");
 
   EXPECT_THROW(run_ddl_statement("GRANT Antazin to Antazin;"), std::runtime_error);
   EXPECT_THROW(run_ddl_statement("REVOKE Antazin from Antazin;"), std::runtime_error);
-  EXPECT_THROW(run_ddl_statement("GRANT Antazin to Max;"), std::runtime_error);
-  EXPECT_THROW(run_ddl_statement("REVOKE Antazin from Max;"), std::runtime_error);
-  EXPECT_THROW(run_ddl_statement("GRANT Max to Antazin;"), std::runtime_error);
-  EXPECT_THROW(run_ddl_statement("REVOKE Max from Antazin;"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("GRANT Antazin to \"Max\";"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("REVOKE Antazin from \"Max\";"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("GRANT \"Max\" to Antazin;"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("REVOKE \"Max\" from Antazin;"), std::runtime_error);
 
   run_ddl_statement("DROP USER Antazin;");
-  run_ddl_statement("DROP USER Max;");
+  run_ddl_statement("DROP USER \"Max\";");
 }
 
 TEST(UserRoles, ValidNames) {
@@ -373,26 +406,28 @@ TEST(UserRoles, ValidNames) {
       run_ddl_statement("CREATE USER \"dumm.user\" (password = 'password');"));
   EXPECT_NO_THROW(run_ddl_statement("DROP USER \"dumm.user\";"));
   EXPECT_NO_THROW(run_ddl_statement("CREATE USER vasya (password = 'password');"));
-  EXPECT_NO_THROW(
-      run_ddl_statement("CREATE USER vasya.vasya@vasya.com (password = 'password');"));
   EXPECT_NO_THROW(run_ddl_statement(
-      "CREATE USER \"vasya ivanov\"@vasya.ivanov.com (password = 'password');"));
-  EXPECT_NO_THROW(run_ddl_statement("CREATE USER vasya-vasya (password = 'password');"));
-  EXPECT_NO_THROW(run_ddl_statement("CREATE ROLE developer;"));
-  EXPECT_NO_THROW(run_ddl_statement("CREATE ROLE developer-backend;"));
-  EXPECT_NO_THROW(run_ddl_statement("CREATE ROLE developer-backend-rendering;"));
-  EXPECT_NO_THROW(run_ddl_statement("GRANT developer-backend-rendering TO vasya;"));
+      "CREATE USER \"vasya.vasya@vasya.com\" (password = 'password');"));
+  EXPECT_NO_THROW(run_ddl_statement(
+      "CREATE USER \"vasya ivanov@vasya.ivanov.com\" (password = 'password');"));
   EXPECT_NO_THROW(
-      run_ddl_statement("GRANT developer-backend TO \"vasya ivanov\"@vasya.ivanov.com;"));
-  EXPECT_NO_THROW(run_ddl_statement("GRANT developer TO vasya.vasya@vasya.com;"));
-  EXPECT_NO_THROW(run_ddl_statement("GRANT developer-backend-rendering TO vasya-vasya;"));
+      run_ddl_statement("CREATE USER \"vasya-vasya\" (password = 'password');"));
+  EXPECT_NO_THROW(run_ddl_statement("CREATE ROLE developer;"));
+  EXPECT_NO_THROW(run_ddl_statement("CREATE ROLE \"developer-backend\";"));
+  EXPECT_NO_THROW(run_ddl_statement("CREATE ROLE \"developer-backend-rendering\";"));
+  EXPECT_NO_THROW(run_ddl_statement("GRANT \"developer-backend-rendering\" TO vasya;"));
+  EXPECT_NO_THROW(run_ddl_statement(
+      "GRANT \"developer-backend\" TO \"vasya ivanov@vasya.ivanov.com\";"));
+  EXPECT_NO_THROW(run_ddl_statement("GRANT developer TO \"vasya.vasya@vasya.com\";"));
+  EXPECT_NO_THROW(
+      run_ddl_statement("GRANT \"developer-backend-rendering\" TO \"vasya-vasya\";"));
   EXPECT_NO_THROW(run_ddl_statement("DROP USER vasya;"));
-  EXPECT_NO_THROW(run_ddl_statement("DROP USER vasya.vasya@vasya.com;"));
-  EXPECT_NO_THROW(run_ddl_statement("DROP USER \"vasya ivanov\"@vasya.ivanov.com;"));
-  EXPECT_NO_THROW(run_ddl_statement("DROP USER vasya-vasya;"));
+  EXPECT_NO_THROW(run_ddl_statement("DROP USER \"vasya.vasya@vasya.com\";"));
+  EXPECT_NO_THROW(run_ddl_statement("DROP USER \"vasya ivanov@vasya.ivanov.com\";"));
+  EXPECT_NO_THROW(run_ddl_statement("DROP USER \"vasya-vasya\";"));
   EXPECT_NO_THROW(run_ddl_statement("DROP ROLE developer;"));
-  EXPECT_NO_THROW(run_ddl_statement("DROP ROLE developer-backend;"));
-  EXPECT_NO_THROW(run_ddl_statement("DROP ROLE developer-backend-rendering;"));
+  EXPECT_NO_THROW(run_ddl_statement("DROP ROLE \"developer-backend\";"));
+  EXPECT_NO_THROW(run_ddl_statement("DROP ROLE \"developer-backend-rendering\";"));
 }
 
 TEST(UserRoles, RoleHierarchies) {
@@ -1162,12 +1197,12 @@ TEST_F(ViewObject, CalciteViewResolution) {
   EXPECT_EQ(result.primary_accessed_objects.tables_inserted_into.size(), (size_t)0);
   EXPECT_EQ(result.primary_accessed_objects.tables_updated_in.size(), (size_t)0);
   EXPECT_EQ(result.primary_accessed_objects.tables_deleted_from.size(), (size_t)0);
-  EXPECT_EQ(result.primary_accessed_objects.tables_selected_from[0], "bill_table");
+  EXPECT_EQ(result.primary_accessed_objects.tables_selected_from[0][0], "bill_table");
   EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from.size(), (size_t)1);
   EXPECT_EQ(result.resolved_accessed_objects.tables_inserted_into.size(), (size_t)0);
   EXPECT_EQ(result.resolved_accessed_objects.tables_updated_in.size(), (size_t)0);
   EXPECT_EQ(result.resolved_accessed_objects.tables_deleted_from.size(), (size_t)0);
-  EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from[0], "bill_table");
+  EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from[0][0], "bill_table");
 
   auto query_state2 =
       QR::create_query_state(QR::get()->getSession(), "select * from bill_view");
@@ -1182,12 +1217,12 @@ TEST_F(ViewObject, CalciteViewResolution) {
   EXPECT_EQ(result.primary_accessed_objects.tables_inserted_into.size(), (size_t)0);
   EXPECT_EQ(result.primary_accessed_objects.tables_updated_in.size(), (size_t)0);
   EXPECT_EQ(result.primary_accessed_objects.tables_deleted_from.size(), (size_t)0);
-  EXPECT_EQ(result.primary_accessed_objects.tables_selected_from[0], "bill_view");
+  EXPECT_EQ(result.primary_accessed_objects.tables_selected_from[0][0], "bill_view");
   EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from.size(), (size_t)1);
   EXPECT_EQ(result.resolved_accessed_objects.tables_inserted_into.size(), (size_t)0);
   EXPECT_EQ(result.resolved_accessed_objects.tables_updated_in.size(), (size_t)0);
   EXPECT_EQ(result.resolved_accessed_objects.tables_deleted_from.size(), (size_t)0);
-  EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from[0], "bill_table");
+  EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from[0][0], "bill_table");
 
   auto query_state3 =
       QR::create_query_state(QR::get()->getSession(), "select * from bill_view_outer");
@@ -1202,12 +1237,13 @@ TEST_F(ViewObject, CalciteViewResolution) {
   EXPECT_EQ(result.primary_accessed_objects.tables_inserted_into.size(), (size_t)0);
   EXPECT_EQ(result.primary_accessed_objects.tables_updated_in.size(), (size_t)0);
   EXPECT_EQ(result.primary_accessed_objects.tables_deleted_from.size(), (size_t)0);
-  EXPECT_EQ(result.primary_accessed_objects.tables_selected_from[0], "bill_view_outer");
+  EXPECT_EQ(result.primary_accessed_objects.tables_selected_from[0][0],
+            "bill_view_outer");
   EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from.size(), (size_t)1);
   EXPECT_EQ(result.resolved_accessed_objects.tables_inserted_into.size(), (size_t)0);
   EXPECT_EQ(result.resolved_accessed_objects.tables_updated_in.size(), (size_t)0);
   EXPECT_EQ(result.resolved_accessed_objects.tables_deleted_from.size(), (size_t)0);
-  EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from[0], "bill_table");
+  EXPECT_EQ(result.resolved_accessed_objects.tables_selected_from[0][0], "bill_table");
 }
 
 TEST_F(DashboardObject, AccessDefaultsTest) {
@@ -2391,6 +2427,115 @@ TEST(SysCatalog, RenameDatabase_PrivsTest) {
   EXPECT_NO_THROW(quark_qr->runSQL("select * from riches;", dt));
 }
 
+TEST(SysCatalog, DropDatabase_ByOwner) {
+  if (g_aggregator) {
+    LOG(ERROR) << "Test not supported in distributed mode.";
+    return;
+  }
+
+  const std::string username = "theowner";
+  const std::string dbname = "thedb";
+
+  ScopeGuard scope_guard = [&] {
+    try {
+      run_ddl_statement("DROP USER " + username + ";");
+    } catch (...) {
+    }
+    run_ddl_statement("DROP DATABASE IF EXISTS " + dbname + ";");
+  };
+
+  run_ddl_statement("CREATE USER " + username + " (password='password');");
+  run_ddl_statement("CREATE DATABASE " + dbname + " (owner='" + username + "');");
+  run_ddl_statement("ALTER USER " + username + " (default_db='" + dbname + "');");
+
+  Catalog_Namespace::UserMetadata user_meta;
+  std::string username_out{username};
+  std::string dbname_out{dbname};
+
+  ASSERT_NO_THROW(sys_cat.login(dbname_out, username_out, "password", user_meta, false));
+  EXPECT_EQ(dbname, dbname_out);
+
+  auto qr = get_qr_for_user(dbname, user_meta);
+  EXPECT_NO_THROW(qr->runDDLStatement("DROP DATABASE " + dbname + ";"));
+}
+
+TEST(SysCatalog, DropDatabase_ByNonOwner) {
+  if (g_aggregator) {
+    LOG(ERROR) << "Test not supported in distributed mode.";
+    return;
+  }
+
+  const std::string username = "theowner";
+  const std::string dbname = "thedb";
+
+  ScopeGuard scope_guard = [&] {
+    try {
+      run_ddl_statement("DROP USER " + username + ";");
+    } catch (...) {
+    }
+    try {
+      run_ddl_statement("DROP USER not" + username + ";");
+    } catch (...) {
+    }
+    run_ddl_statement("DROP DATABASE IF EXISTS " + dbname + ";");
+  };
+
+  run_ddl_statement("CREATE USER " + username + " (password='password');");
+  run_ddl_statement("CREATE USER not" + username + " (password='password');");
+  run_ddl_statement("CREATE DATABASE " + dbname + " (owner='" + username + "');");
+  run_ddl_statement("ALTER USER " + username + " (default_db='" + dbname + "');");
+  run_ddl_statement("ALTER USER not" + username + " (default_db='" + dbname + "');");
+
+  Catalog_Namespace::UserMetadata user_meta;
+  std::string username_out{"not" + username};
+  std::string dbname_out{dbname};
+
+  ASSERT_NO_THROW(sys_cat.login(dbname_out, username_out, "password", user_meta, false));
+  EXPECT_EQ(dbname, dbname_out);
+
+  auto qr = get_qr_for_user(dbname, user_meta);
+  EXPECT_THROW(qr->runDDLStatement("DROP DATABASE " + dbname + ";"), std::runtime_error);
+}
+
+TEST(SysCatalog, DropDatabase_BySuperUser) {
+  if (g_aggregator) {
+    LOG(ERROR) << "Test not supported in distributed mode.";
+    return;
+  }
+
+  const std::string username = "theowner";
+  const std::string dbname = "thedb";
+
+  ScopeGuard scope_guard = [&] {
+    try {
+      run_ddl_statement("DROP USER " + username + ";");
+    } catch (...) {
+    }
+    try {
+      run_ddl_statement("DROP USER not" + username + ";");
+    } catch (...) {
+    }
+    run_ddl_statement("DROP DATABASE IF EXISTS " + dbname + ";");
+  };
+
+  run_ddl_statement("CREATE USER " + username + " (password='password');");
+  run_ddl_statement("CREATE USER not" + username +
+                    " (password='password',is_super='true');");
+  run_ddl_statement("CREATE DATABASE " + dbname + " (owner='" + username + "');");
+  run_ddl_statement("ALTER USER " + username + " (default_db='" + dbname + "');");
+  run_ddl_statement("ALTER USER not" + username + " (default_db='" + dbname + "');");
+
+  Catalog_Namespace::UserMetadata user_meta;
+  std::string username_out{"not" + username};
+  std::string dbname_out{dbname};
+
+  ASSERT_NO_THROW(sys_cat.login(dbname_out, username_out, "password", user_meta, false));
+  EXPECT_EQ(dbname, dbname_out);
+
+  auto alternate_qr = get_qr_for_user(dbname, user_meta);
+  EXPECT_NO_THROW(alternate_qr->runDDLStatement("DROP DATABASE " + dbname + ";"));
+}
+
 TEST(SysCatalog, GetDatabaseList) {
   static const std::string username{"test_user"};
   static const std::string username2{username + "2"};
@@ -3040,7 +3185,7 @@ TEST_F(ForeignTablePermissionsTest, ForeignTableGrantRevokeDropPrivilege) {
   std::string privilege{"DROP"};
   std::string query{"DROP FOREIGN TABLE test_table;"};
   std::string no_privilege_exception{
-      "Exception: Foreign table \"test_table\" will not be dropped. User has no DROP "
+      "Foreign table \"test_table\" will not be dropped. User has no DROP "
       "TABLE privileges."};
   createTestForeignTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
@@ -3053,7 +3198,7 @@ TEST_F(TablePermissionsTest, TableGrantRevokeDropPrivilege) {
   std::string privilege{"DROP"};
   std::string query{"DROP TABLE test_table;"};
   std::string no_privilege_exception{
-      "Exception: Table test_table will not be dropped. User has no proper privileges."};
+      "Table test_table will not be dropped. User has no proper privileges."};
   createTestTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
   grantThenRevokePrivilegeToTestUser(privilege);
@@ -3084,11 +3229,11 @@ TEST_F(ForeignTablePermissionsTest, ForeignTableGrantRevokeDeletePrivilege) {
   std::string privilege{"DELETE"};
   std::string query{"DELETE FROM test_table WHERE i = 1;"};
   std::string no_privilege_exception{
-      "Exception: Violation of access privileges: user test_user has no proper "
+      "Violation of access privileges: user test_user has no proper "
       "privileges for "
       "object test_table"};
   std::string query_exception{
-      "Exception: DELETE, INSERT, TRUNCATE, OR UPDATE commands are not "
+      "DELETE, INSERT, TRUNCATE, OR UPDATE commands are not "
       "supported for foreign tables."};
   createTestForeignTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
@@ -3101,7 +3246,7 @@ TEST_F(TablePermissionsTest, TableGrantRevokeDeletePrivilege) {
   std::string privilege{"DELETE"};
   std::string query{"DELETE FROM test_table WHERE i = 1;"};
   std::string no_privilege_exception{
-      "Exception: Violation of access privileges: user test_user has no proper "
+      "Violation of access privileges: user test_user has no proper "
       "privileges for "
       "object test_table"};
   createTestTable();
@@ -3114,10 +3259,9 @@ TEST_F(TablePermissionsTest, TableGrantRevokeDeletePrivilege) {
 TEST_F(ForeignTablePermissionsTest, ForeignTableGrantRevokeInsertPrivilege) {
   std::string privilege{"INSERT"};
   std::string query{"INSERT INTO test_table VALUES (2);"};
-  std::string no_privilege_exception{
-      "Exception: User has no insert privileges on test_table."};
+  std::string no_privilege_exception{"User has no insert privileges on test_table."};
   std::string query_exception{
-      "Exception: DELETE, INSERT, TRUNCATE, OR UPDATE commands are not "
+      "DELETE, INSERT, TRUNCATE, OR UPDATE commands are not "
       "supported for foreign tables."};
   createTestForeignTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
@@ -3129,8 +3273,7 @@ TEST_F(ForeignTablePermissionsTest, ForeignTableGrantRevokeInsertPrivilege) {
 TEST_F(TablePermissionsTest, TableGrantRevokeInsertPrivilege) {
   std::string privilege{"INSERT"};
   std::string query{"INSERT INTO test_table VALUES (2);"};
-  std::string no_privilege_exception{
-      "Exception: User has no insert privileges on test_table."};
+  std::string no_privilege_exception{"User has no insert privileges on test_table."};
   createTestTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
   grantThenRevokePrivilegeToTestUser(privilege);
@@ -3142,10 +3285,10 @@ TEST_F(ForeignTablePermissionsTest, ForeignTableGrantRevokeTruncatePrivilege) {
   std::string privilege{"TRUNCATE"};
   std::string query{"TRUNCATE TABLE test_table;"};
   std::string no_privilege_exception{
-      "Exception: Table test_table will not be truncated. User test_user has no proper "
+      "Table test_table will not be truncated. User test_user has no proper "
       "privileges."};
   std::string query_exception{
-      "Exception: DELETE, INSERT, TRUNCATE, OR UPDATE commands are not "
+      "DELETE, INSERT, TRUNCATE, OR UPDATE commands are not "
       "supported for foreign tables."};
   createTestForeignTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
@@ -3158,7 +3301,7 @@ TEST_F(TablePermissionsTest, TableGrantRevokeTruncatePrivilege) {
   std::string privilege{"TRUNCATE"};
   std::string query{"TRUNCATE TABLE test_table;"};
   std::string no_privilege_exception{
-      "Exception: Table test_table will not be truncated. User test_user has no proper "
+      "Table test_table will not be truncated. User test_user has no proper "
       "privileges."};
   createTestTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
@@ -3171,11 +3314,11 @@ TEST_F(ForeignTablePermissionsTest, ForeignTableGrantRevokeUpdatePrivilege) {
   std::string privilege{"UPDATE"};
   std::string query{"UPDATE test_table SET i = 2 WHERE i = 1;"};
   std::string no_privilege_exception{
-      "Exception: Violation of access privileges: user test_user has no proper "
+      "Violation of access privileges: user test_user has no proper "
       "privileges for "
       "object test_table"};
   std::string query_exception{
-      "Exception: DELETE, INSERT, TRUNCATE, OR UPDATE commands are not "
+      "DELETE, INSERT, TRUNCATE, OR UPDATE commands are not "
       "supported for foreign tables."};
   createTestForeignTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
@@ -3188,7 +3331,7 @@ TEST_F(TablePermissionsTest, TableGrantRevokeUpdatePrivilege) {
   std::string privilege{"UPDATE"};
   std::string query{"UPDATE test_table SET i = 2 WHERE i = 1;"};
   std::string no_privilege_exception{
-      "Exception: Violation of access privileges: user test_user has no proper "
+      "Violation of access privileges: user test_user has no proper "
       "privileges for "
       "object test_table"};
   createTestTable();
@@ -3205,7 +3348,7 @@ TEST_P(ForeignTableAndTablePermissionsTest, GrantRevokeShowCreateTablePrivilege)
   }
   std::string privilege{"DROP"};
   std::string query{"SHOW CREATE TABLE test_table;"};
-  std::string no_privilege_exception{"Exception: Table/View test_table does not exist."};
+  std::string no_privilege_exception{"Table/View test_table does not exist."};
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
   grantThenRevokePrivilegeToTestUser(privilege);
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
@@ -3216,7 +3359,7 @@ TEST_F(TablePermissionsTest, TableGrantRevokeAlterTablePrivilege) {
   std::string privilege{"ALTER"};
   std::string query{"ALTER TABLE test_table RENAME COLUMN i TO j;"};
   std::string no_privilege_exception{
-      "Exception: Current user does not have the privilege to alter table: test_table"};
+      "Current user does not have the privilege to alter table: test_table"};
   createTestTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
   grantThenRevokePrivilegeToTestUser(privilege);
@@ -3229,7 +3372,7 @@ TEST_F(ForeignTablePermissionsTest, TableGrantRevokeAlterForeignTablePrivilege) 
   std::string query{
       "ALTER FOREIGN TABLE test_table SET (refresh_update_type = 'append');"};
   std::string no_privilege_exception{
-      "Exception: Current user does not have the privilege to alter foreign table: "
+      "Current user does not have the privilege to alter foreign table: "
       "test_table"};
   createTestForeignTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
@@ -3242,7 +3385,7 @@ TEST_F(TablePermissionsTest, TableRenameTablePrivilege) {
   std::string privilege{"ALTER"};
   std::string query{"RENAME TABLE test_table TO renamed_test_table;"};
   std::string no_privilege_exception{
-      "Exception: Current user does not have the privilege to alter table: test_table"};
+      "Current user does not have the privilege to alter table: test_table"};
   createTestTable();
   queryAsTestUserWithNoPrivilegeAndAssertException(query, no_privilege_exception);
   queryAsTestUserWithPrivilege(query, privilege);
@@ -3280,7 +3423,7 @@ TEST_F(TablePermissionsTest, TableAllPrivileges) {
 TEST_F(ForeignTablePermissionsTest, ForeignTableGrantRevokeCreateTablePrivilege) {
   login("test_user", "test_pass");
   executeLambdaAndAssertException([this] { createTestForeignTable(); },
-                                  "Exception: Foreign table \"test_table\" will not be "
+                                  "Foreign table \"test_table\" will not be "
                                   "created. User has no CREATE TABLE privileges.");
 
   switchToAdmin();
@@ -3288,7 +3431,7 @@ TEST_F(ForeignTablePermissionsTest, ForeignTableGrantRevokeCreateTablePrivilege)
   sql("REVOKE CREATE TABLE ON DATABASE omnisci FROM test_user;");
   login("test_user", "test_pass");
   executeLambdaAndAssertException([this] { createTestForeignTable(); },
-                                  "Exception: Foreign table \"test_table\" will not be "
+                                  "Foreign table \"test_table\" will not be "
                                   "created. User has no CREATE TABLE privileges.");
 
   switchToAdmin();
@@ -3327,7 +3470,7 @@ TEST_F(ForeignTablePermissionsTest, ForeignTableRefreshNonOwner) {
   login("test_user", "test_pass");
   runQueryAndAssertException(
       "REFRESH FOREIGN TABLES test_table;",
-      "Exception: REFRESH FOREIGN TABLES failed on table \"test_table\". It can only be "
+      "REFRESH FOREIGN TABLES failed on table \"test_table\". It can only be "
       "executed by super user or owner of the object.");
 }
 
@@ -3605,6 +3748,468 @@ TEST_F(ServerPrivApiTest, UsageOnServerObjectPrivsSuper) {
                       {0, 0, 0, 1},
                       "test_user",
                       TDBObjectType::ServerDBObjectType);
+}
+
+TEST(Temporary, Users) {
+  auto user_cleanup = [] {
+    if (sys_cat.getMetadataForUser("username1", g_user)) {
+      sys_cat.dropUser("username1");
+    }
+    CHECK(!sys_cat.getMetadataForUser("username1", g_user));
+
+    if (sys_cat.getMetadataForUser("username2", g_user)) {
+      sys_cat.dropUser("username2");
+    }
+    CHECK(!sys_cat.getMetadataForUser("username2", g_user));
+  };
+  user_cleanup();
+
+  auto read_only = g_read_only;
+  g_read_only = true;
+  ScopeGuard scope_guard = [&] {
+    g_read_only = read_only;
+    user_cleanup();
+  };
+
+  sys_cat.createUser("username1",
+                     "password1",
+                     /*is_super=*/true,
+                     /*dbname=*/"",
+                     /*can_login=*/true,
+                     /*is_temporary=*/true);
+  CHECK(sys_cat.getMetadataForUser("username1", g_user));
+
+  EXPECT_TRUE(g_user.is_temporary);
+  EXPECT_EQ(g_user.can_login, true);
+
+  bool can_login{false};
+  EXPECT_NO_THROW(sys_cat.alterUser("username1", nullptr, nullptr, nullptr, &can_login));
+  CHECK(sys_cat.getMetadataForUser("username1", g_user));
+  EXPECT_EQ(g_user.can_login, false);
+
+  EXPECT_NO_THROW(sys_cat.renameUser("username1", "username2"));
+  CHECK(sys_cat.getMetadataForUser("username2", g_user));
+  EXPECT_EQ(g_user.userName, "username2");
+}
+
+class ReassignOwnedTest : public DBHandlerTestFixture {
+ protected:
+  static void SetUpTestSuite() {
+    createDBHandler();
+    createTestUser("test_user_1", "test_pass");
+    createTestUser("test_user_2", "test_pass");
+    createTestUser("test_user_3", "test_pass");
+    createTestUser("all_permissions_test_user", "test_pass");
+    sql("GRANT ALL ON DATABASE omnisci TO all_permissions_test_user;");
+  }
+
+  static void TearDownTestSuite() {
+    loginAdmin();
+    dropTestUser("test_user_1");
+    dropTestUser("test_user_2");
+    dropTestUser("test_user_3");
+    dropTestUser("all_permissions_test_user");
+  }
+
+  void SetUp() override { dropAllDatabaseObjects(); }
+
+  void TearDown() override { dropAllDatabaseObjects(); }
+
+  void dropAllDatabaseObjects() {
+    loginAdmin();
+    const auto& [db_handler, session_id] = getDbHandlerAndSessionId();
+    auto dashboards = getCatalog().getAllDashboardsMetadata();
+    for (const auto dashboard : dashboards) {
+      db_handler->delete_dashboard(session_id, dashboard->dashboardId);
+    }
+    sql("DROP TABLE IF EXISTS test_table_1;");
+    sql("DROP TABLE IF EXISTS test_table_2;");
+    sql("DROP VIEW IF EXISTS test_view_1;");
+    sql("DROP VIEW IF EXISTS test_view_2;");
+    sql("DROP SERVER IF EXISTS test_server_1;");
+    sql("DROP SERVER IF EXISTS test_server_2;");
+    sql("DROP DATABASE IF EXISTS test_db;");
+  }
+
+  static int32_t createTestUser(const std::string& user_name, const std::string& pass) {
+    sql("CREATE USER " + user_name + " (password = '" + pass + "');");
+    sql("GRANT ACCESS, CREATE TABLE, CREATE VIEW, CREATE DASHBOARD ON "
+        "DATABASE omnisci TO " +
+        user_name + ";");
+    if (!isDistributedMode()) {
+      // FSI is currently not supported in distributed mode.
+      sql("GRANT CREATE SERVER ON DATABASE omnisci TO " + user_name + ";");
+    }
+    UserMetadata user_metadata{};
+    SysCatalog::instance().getMetadataForUser(user_name, user_metadata);
+    return user_metadata.userId;
+  }
+
+  static void dropTestUser(const std::string& user_name) {
+    try {
+      sql("DROP USER " + user_name + ";");
+    } catch (const std::exception& e) {
+      // TODO: Remove try/catch when IF EXISTS clause is implemented.
+      // Swallow and log exceptions that may occur, since there is no "IF EXISTS" option.
+      LOG(WARNING) << e.what();
+    }
+  }
+
+  void createDatabaseObjects(const std::string& name_suffix) {
+    sql("CREATE TABLE test_table_" + name_suffix + " (i INTEGER);");
+    sql("CREATE VIEW test_view_" + name_suffix + " AS SELECT * FROM test_table_" +
+        name_suffix + ";");
+    if (!isDistributedMode()) {
+      sql("CREATE SERVER test_server_" + name_suffix +
+          " FOREIGN DATA WRAPPER omnisci_csv "
+          "WITH (storage_type = 'LOCAL_FILE', base_path = '/test_path/');");
+    }
+    const auto& [db_handler, session_id] = getDbHandlerAndSessionId();
+    db_handler->create_dashboard(
+        session_id, "test_dashboard_" + name_suffix, "state", "image", "metadata");
+  }
+
+  void assertDatabaseObjectsOwnership(const std::string& user_name,
+                                      const std::string& name_suffix) {
+    UserMetadata user;
+    SysCatalog::instance().getMetadataForUser(user_name, user);
+    auto user_id = user.userId;
+    const auto& catalog = getCatalog();
+
+    auto td = catalog.getMetadataForTable("test_table_" + name_suffix, false);
+    ASSERT_NE(td, nullptr);
+    ASSERT_EQ(user_id, td->userId);
+
+    auto view = catalog.getMetadataForTable("test_view_" + name_suffix, false);
+    ASSERT_NE(view, nullptr);
+    ASSERT_EQ(user_id, view->userId);
+
+    auto dashboard = catalog.getMetadataForDashboard(std::to_string(user_id),
+                                                     "test_dashboard_" + name_suffix);
+    ASSERT_NE(dashboard, nullptr);
+    ASSERT_EQ(user_id, dashboard->userId);
+
+    // Permission entries are not added for super users
+    if (!user.isSuper) {
+      ASSERT_TRUE(SysCatalog::instance().verifyDBObjectOwnership(
+          user, DBObject{td->tableId, TableDBObjectType}, catalog));
+      ASSERT_TRUE(SysCatalog::instance().verifyDBObjectOwnership(
+          user, DBObject{view->tableId, ViewDBObjectType}, catalog));
+      ASSERT_TRUE(SysCatalog::instance().verifyDBObjectOwnership(
+          user, DBObject{dashboard->dashboardId, DashboardDBObjectType}, catalog));
+
+      assertObjectRoleDescriptor(DBObjectType::TableDBObjectType, td->tableId, user_id);
+      assertObjectRoleDescriptor(DBObjectType::ViewDBObjectType, view->tableId, user_id);
+      assertObjectRoleDescriptor(
+          DBObjectType::DashboardDBObjectType, dashboard->dashboardId, user_id);
+    }
+
+    if (!isDistributedMode()) {
+      auto server = catalog.getForeignServer("test_server_" + name_suffix);
+      ASSERT_NE(server, nullptr);
+      ASSERT_EQ(user_id, server->user_id);
+
+      if (!user.isSuper) {
+        ASSERT_TRUE(SysCatalog::instance().verifyDBObjectOwnership(
+            user, DBObject{server->id, ServerDBObjectType}, catalog));
+        assertObjectRoleDescriptor(DBObjectType::ServerDBObjectType, server->id, user_id);
+      }
+    }
+  }
+
+  void assertObjectRoleDescriptor(DBObjectType object_type,
+                                  int32_t object_id,
+                                  int32_t owner_id) {
+    auto object_type_id = static_cast<int>(object_type);
+    for (const auto object : SysCatalog::instance().getMetadataForObject(
+             getCatalog().getDatabaseId(), object_type_id, object_id)) {
+      if (object->objectType == object_type_id && object->objectId == object_id &&
+          object->objectOwnerId == owner_id) {
+        return;
+      }
+    }
+    FAIL() << "No ObjectRoleDescriptor found for object type: " << object_type_id
+           << ", object id: " << object_id << ", owner id: " << owner_id;
+  }
+
+  void assertObjectPermissions(const std::string& user_name,
+                               const std::string& name_suffix,
+                               bool has_object_permissions,
+                               const std::string& owner_user_name) {
+    const auto& catalog = getCatalog();
+
+    auto td = catalog.getMetadataForTable("test_table_" + name_suffix, false);
+    ASSERT_NE(td, nullptr);
+    assertObjectPermissions(user_name,
+                            td->tableId,
+                            AccessPrivileges::ALL_TABLE,
+                            DBObjectType::TableDBObjectType,
+                            has_object_permissions);
+
+    auto view = catalog.getMetadataForTable("test_view_" + name_suffix, false);
+    ASSERT_NE(view, nullptr);
+    assertObjectPermissions(user_name,
+                            view->tableId,
+                            AccessPrivileges::ALL_VIEW,
+                            DBObjectType::ViewDBObjectType,
+                            has_object_permissions);
+
+    if (!isDistributedMode()) {
+      auto server = catalog.getForeignServer("test_server_" + name_suffix);
+      ASSERT_NE(server, nullptr);
+      assertObjectPermissions(user_name,
+                              server->id,
+                              AccessPrivileges::ALL_SERVER,
+                              DBObjectType::ServerDBObjectType,
+                              has_object_permissions);
+    }
+
+    UserMetadata user;
+    SysCatalog::instance().getMetadataForUser(owner_user_name, user);
+    auto dashboard = catalog.getMetadataForDashboard(std::to_string(user.userId),
+                                                     "test_dashboard_" + name_suffix);
+    ASSERT_NE(dashboard, nullptr);
+    assertObjectPermissions(user_name,
+                            dashboard->dashboardId,
+                            AccessPrivileges::ALL_DASHBOARD,
+                            DBObjectType::DashboardDBObjectType,
+                            has_object_permissions);
+  }
+
+  void assertObjectPermissions(const std::string& user_name,
+                               int32_t object_id,
+                               const AccessPrivileges& privilege_type,
+                               DBObjectType object_type,
+                               bool has_object_permissions) {
+    AccessPrivileges privileges;
+    privileges.add(privilege_type);
+    DBObject object(object_id, object_type);
+    object.loadKey(getCatalog());
+    object.setPrivileges(privileges);
+    ASSERT_EQ(SysCatalog::instance().checkPrivileges(user_name, {object}),
+              has_object_permissions);
+  }
+
+  void assertNoDashboardsForUsers(const std::vector<std::string>& user_names) {
+    const auto& catalog = getCatalog();
+    for (const auto& user_name : user_names) {
+      UserMetadata user;
+      SysCatalog::instance().getMetadataForUser(user_name, user);
+      for (const auto dashboard : catalog.getAllDashboardsMetadata()) {
+        ASSERT_NE(dashboard->userId, user.userId);
+        ASSERT_EQ(catalog.getMetadataForDashboard(std::to_string(user.userId),
+                                                  dashboard->dashboardName),
+                  nullptr);
+      }
+    }
+  }
+
+  void assertDatabaseOwnership(const std::string& db_name, const std::string& user_name) {
+    UserMetadata user;
+    SysCatalog::instance().getMetadataForUser(user_name, user);
+
+    DBMetadata database;
+    SysCatalog::instance().getMetadataForDB(db_name, database);
+    ASSERT_EQ(user.userId, database.dbOwner);
+
+    auto& catalog = getCatalog();
+    ASSERT_EQ(db_name, catalog.name());
+
+    // Permission entries are not added for super users
+    if (!user.isSuper) {
+      ASSERT_TRUE(SysCatalog::instance().verifyDBObjectOwnership(
+          user, DBObject{db_name, DatabaseDBObjectType}, catalog));
+      assertObjectRoleDescriptor(DBObjectType::DatabaseDBObjectType, -1, user.userId);
+    }
+  }
+};
+
+TEST_F(ReassignOwnedTest, SuperUser) {
+  login("test_user_1", "test_pass");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+
+  login("test_user_2", "test_pass");
+  createDatabaseObjects("2");
+  assertDatabaseObjectsOwnership("test_user_2", "2");
+  assertObjectPermissions("test_user_2", "2", true, "test_user_2");
+
+  loginAdmin();
+  sql("REASSIGN OWNED BY test_user_1, test_user_2 TO test_user_3;");
+
+  assertDatabaseObjectsOwnership("test_user_3", "1");
+  assertDatabaseObjectsOwnership("test_user_3", "2");
+  assertObjectPermissions("test_user_3", "1", true, "test_user_3");
+  assertObjectPermissions("test_user_3", "2", true, "test_user_3");
+  assertNoDashboardsForUsers({"test_user_1", "test_user_2"});
+
+  // Assert that old owners no longer have permissions to database objects
+  assertObjectPermissions("test_user_1", "1", false, "test_user_3");
+  assertObjectPermissions("test_user_2", "2", false, "test_user_3");
+}
+
+TEST_F(ReassignOwnedTest, UserWithAllPermissions) {
+  login("all_permissions_test_user", "test_pass");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("all_permissions_test_user", "1");
+  assertObjectPermissions(
+      "all_permissions_test_user", "1", true, "all_permissions_test_user");
+
+  loginAdmin();
+  sql("REASSIGN OWNED BY all_permissions_test_user TO test_user_1;");
+
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+  assertNoDashboardsForUsers({"all_permissions_test_user"});
+
+  // Assert that old owner still has permissions to database objects because of previous
+  // grant of all permissions
+  assertObjectPermissions("all_permissions_test_user", "1", true, "test_user_1");
+}
+
+TEST_F(ReassignOwnedTest, ReassignToSameUser) {
+  login("test_user_1", "test_pass");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+
+  loginAdmin();
+  sql("REASSIGN OWNED BY test_user_1 TO test_user_1;");
+
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+}
+
+TEST_F(ReassignOwnedTest, DatabaseOwner) {
+  loginAdmin();
+  sql("CREATE DATABASE test_db (owner = 'test_user_1');");
+
+  login("test_user_1", "test_pass", "test_db");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+  assertDatabaseOwnership("test_db", "test_user_1");
+
+  login("admin", "HyperInteractive", "test_db");
+  sql("REASSIGN OWNED BY test_user_1 TO test_user_2;");
+
+  assertDatabaseObjectsOwnership("test_user_2", "1");
+  assertObjectPermissions("test_user_2", "1", true, "test_user_2");
+  assertNoDashboardsForUsers({"test_user_1"});
+
+  // Assert that the old owner still owns the database
+  assertDatabaseOwnership("test_db", "test_user_1");
+
+  // Assert that the old owner still has permissions to database objects because of
+  // database ownership
+  assertObjectPermissions("test_user_1", "1", true, "test_user_2");
+}
+
+TEST_F(ReassignOwnedTest, MultipleDatabases) {
+  // Create objects in the default database
+  login("test_user_1", "test_pass");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+
+  loginAdmin();
+  sql("CREATE DATABASE test_db;");
+  sql("GRANT ALL ON DATABASE test_db TO test_user_1;");
+
+  // Create objects in the new database
+  login("test_user_1", "test_pass", "test_db");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+
+  login("admin", "HyperInteractive", "test_db");
+  sql("REASSIGN OWNED BY test_user_1 TO test_user_2;");
+
+  assertDatabaseObjectsOwnership("test_user_2", "1");
+  assertObjectPermissions("test_user_2", "1", true, "test_user_2");
+  assertNoDashboardsForUsers({"test_user_1"});
+
+  // Assert that ownership in the default database is not changed
+  loginAdmin();
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+  assertNoDashboardsForUsers({"test_user_2"});
+}
+
+TEST_F(ReassignOwnedTest, ReassignToSuperUser) {
+  login("test_user_1", "test_pass");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+
+  loginAdmin();
+  sql("REASSIGN OWNED BY test_user_1 TO admin;");
+
+  assertDatabaseObjectsOwnership("admin", "1");
+  assertObjectPermissions("admin", "1", true, "admin");
+  assertNoDashboardsForUsers({"test_user_1"});
+
+  // Assert that the old owner no longer has permissions to database objects
+  assertObjectPermissions("test_user_1", "1", false, "admin");
+}
+
+TEST_F(ReassignOwnedTest, ReassignFromSuperUser) {
+  loginAdmin();
+  // Use a different database for this test case in order to avoid changing database
+  // objects that are created outside the scope of this test in the default database.
+  sql("CREATE DATABASE test_db;");
+
+  login("admin", "HyperInteractive", "test_db");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("admin", "1");
+  assertObjectPermissions("admin", "1", true, "admin");
+
+  sql("REASSIGN OWNED BY admin TO test_user_1;");
+
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+  assertNoDashboardsForUsers({"admin"});
+
+  // Assert that the super user/admin still owns the database
+  assertDatabaseOwnership("test_db", "admin");
+
+  // Assert that the super user/admin still has permissions to database objects
+  assertObjectPermissions("admin", "1", true, "test_user_1");
+}
+
+TEST_F(ReassignOwnedTest, NonSuperUser) {
+  login("test_user_1", "test_pass");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+
+  login("test_user_2", "test_pass");
+  queryAndAssertException("REASSIGN OWNED BY test_user_1 TO test_user_2;",
+                          "Only super users can reassign ownership of database objects.");
+}
+
+TEST_F(ReassignOwnedTest, NonExistentOldOwner) {
+  login("test_user_1", "test_pass");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+
+  loginAdmin();
+  queryAndAssertException(
+      "REASSIGN OWNED BY test_user_1, nonexistent_user TO test_user_2;",
+      "User with username \"nonexistent_user\" does not exist.");
+}
+
+TEST_F(ReassignOwnedTest, NonExistentNewOwner) {
+  login("test_user_1", "test_pass");
+  createDatabaseObjects("1");
+  assertDatabaseObjectsOwnership("test_user_1", "1");
+  assertObjectPermissions("test_user_1", "1", true, "test_user_1");
+
+  loginAdmin();
+  queryAndAssertException("REASSIGN OWNED BY test_user_1 TO nonexistent_user;",
+                          "User with username \"nonexistent_user\" does not exist.");
 }
 
 int main(int argc, char* argv[]) {

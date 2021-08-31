@@ -55,12 +55,13 @@
 #include "Shared/Restriction.h"
 #include "Shared/mapd_shared_mutex.h"
 
-const std::string OMNISCI_SYSTEM_CATALOG = "omnisci_system_catalog";
-const std::string OMNISCI_DEFAULT_DB = "omnisci";
-const std::string OMNISCI_ROOT_USER = "admin";
-const int OMNISCI_ROOT_USER_ID = 0;
-const std::string OMNISCI_ROOT_USER_ID_STR = "0";
-const std::string OMNISCI_ROOT_PASSWD_DEFAULT = "HyperInteractive";
+inline const std::string OMNISCI_SYSTEM_CATALOG = "omnisci_system_catalog";
+inline const std::string OMNISCI_DEFAULT_DB = "omnisci";
+inline const std::string OMNISCI_ROOT_USER = "admin";
+inline const int OMNISCI_ROOT_USER_ID = 0;
+inline const std::string OMNISCI_ROOT_USER_ID_STR = "0";
+inline const std::string OMNISCI_ROOT_PASSWD_DEFAULT = "HyperInteractive";
+inline const int32_t OMNISCI_TEMPORARY_USER_ID_RANGE = 1000000000;
 
 class Calcite;
 
@@ -78,13 +79,15 @@ struct UserMetadata {
                const std::string& p,
                bool s,
                int32_t d,
-               bool l)
+               bool l,
+               bool t)
       : userId(u)
       , userName(n)
       , passwd_hash(p)
       , isSuper(s)
       , defaultDbId(d)
-      , can_login(l) {}
+      , can_login(l)
+      , is_temporary(t) {}
   UserMetadata() {}
   UserMetadata(UserMetadata const& user_meta)
       : UserMetadata(user_meta.userId,
@@ -92,13 +95,30 @@ struct UserMetadata {
                      user_meta.passwd_hash,
                      user_meta.isSuper.load(),
                      user_meta.defaultDbId,
-                     user_meta.can_login) {}
+                     user_meta.can_login,
+                     user_meta.is_temporary) {
+    restriction = user_meta.restriction;
+  }
+  UserMetadata& operator=(UserMetadata const& user_meta) {
+    if (this != &user_meta) {
+      userId = user_meta.userId;
+      userName = user_meta.userName;
+      passwd_hash = user_meta.passwd_hash;
+      isSuper.store(user_meta.isSuper.load());
+      defaultDbId = user_meta.defaultDbId;
+      can_login = user_meta.can_login;
+      is_temporary = user_meta.is_temporary;
+      restriction = user_meta.restriction;
+    }
+    return *this;
+  }
   int32_t userId;
   std::string userName;
   std::string passwd_hash;
   std::atomic<bool> isSuper{false};
   int32_t defaultDbId;
   bool can_login{true};
+  bool is_temporary{false};
   Restriction restriction;
 
   // Return a string that is safe to log for the username based on --log-user-id.
@@ -171,11 +191,12 @@ class SysCatalog : private CommonFileOperations {
                                           const std::string& username);
   void createUser(const std::string& name,
                   const std::string& passwd,
-                  bool issuper,
+                  bool is_super,
                   const std::string& dbname,
-                  bool can_login);
+                  bool can_login,
+                  bool is_temporary);
   void dropUser(const std::string& name);
-  void alterUser(const int32_t userid,
+  void alterUser(const std::string& name,
                  const std::string* passwd,
                  bool* issuper,
                  const std::string* dbname,
@@ -190,6 +211,7 @@ class SysCatalog : private CommonFileOperations {
                             std::string& name,
                             UserMetadata& user);
   bool getMetadataForDB(const std::string& name, DBMetadata& db);
+  bool getMetadataForDBById(const int32_t idIn, DBMetadata& db);
   Data_Namespace::DataMgr& getDataMgr() const { return *dataMgr_; }
   Calcite& getCalciteMgr() const { return *calciteMgr_; }
   const std::string& getCatalogBasePath() const { return basePath_; }
@@ -258,14 +280,20 @@ class SysCatalog : private CommonFileOperations {
                                DBObject object,
                                const Catalog_Namespace::Catalog& catalog,
                                bool revoke_privileges = true);
-  void createRole(const std::string& roleName, const bool& userPrivateRole = false);
-  void dropRole(const std::string& roleName);
+  void createRole(const std::string& roleName,
+                  const bool user_private_role,
+                  const bool is_temporary = false);
+  void dropRole(const std::string& roleName, const bool is_temporary = false);
   void grantRoleBatch(const std::vector<std::string>& roles,
                       const std::vector<std::string>& grantees);
-  void grantRole(const std::string& role, const std::string& grantee);
+  void grantRole(const std::string& role,
+                 const std::string& grantee,
+                 const bool is_temporary = false);
   void revokeRoleBatch(const std::vector<std::string>& roles,
                        const std::vector<std::string>& grantees);
-  void revokeRole(const std::string& role, const std::string& grantee);
+  void revokeRole(const std::string& role,
+                  const std::string& grantee,
+                  const bool is_temporary = false);
   // check if the user has any permissions on all the given objects
   bool hasAnyPrivileges(const UserMetadata& user, std::vector<DBObject>& privObjects);
   // check if the user has the requested permissions on all the given objects
@@ -286,8 +314,6 @@ class SysCatalog : private CommonFileOperations {
                                     bool isSuper,
                                     const std::string& userName);
   std::vector<std::string> getRoles(const std::string& userName, const int32_t dbId);
-  void revokeDashboardSystemRole(const std::string roleName,
-                                 const std::vector<std::string> grantees);
   bool isAggregator() const { return aggregator_; }
   static SysCatalog& instance() {
     if (!instance_) {
@@ -320,18 +346,26 @@ class SysCatalog : private CommonFileOperations {
 
   virtual ~SysCatalog();
 
- private:
-  using GranteeMap = std::map<std::string, Grantee*>;
-  using ObjectRoleDescriptorMap = std::multimap<std::string, ObjectRoleDescriptor*>;
+  /**
+   * Reassigns database object ownership from a set of users (old owners) to another user
+   * (new owner).
+   *
+   * @param old_owner_db_objects - map of user ids and database objects whose ownership
+   * will be reassigned
+   * @param new_owner_id - id of user who will own reassigned database objects
+   * @param catalog - catalog for database where ownership reassignment occurred
+   */
+  void reassignObjectOwners(
+      const std::map<int32_t, std::vector<DBObject>>& old_owner_db_objects,
+      int32_t new_owner_id,
+      const Catalog_Namespace::Catalog& catalog);
 
-  SysCatalog()
-      : CommonFileOperations(basePath_)
-      , aggregator_(false)
-      , sqliteMutex_()
-      , sharedMutex_()
-      , thread_holding_sqlite_lock(std::thread::id())
-      , thread_holding_write_lock(std::thread::id())
-      , dummyCatalog_(std::make_shared<Catalog>()) {}
+ private:
+  using GranteeMap = std::map<std::string, std::unique_ptr<Grantee>>;
+  using ObjectRoleDescriptorMap =
+      std::multimap<std::string, std::unique_ptr<ObjectRoleDescriptor>>;
+
+  SysCatalog();
 
   void initDB();
   void buildRoleMap();
@@ -339,7 +373,8 @@ class SysCatalog : private CommonFileOperations {
   void buildObjectDescriptorMap();
   void checkAndExecuteMigrations();
   void importDataFromOldMapdDB();
-  void createUserRoles();
+  void createRoles();
+  void fixRolesMigration();
   void addAdminUserRole();
   void migratePrivileges();
   void migratePrivileged_old();
@@ -357,14 +392,20 @@ class SysCatalog : private CommonFileOperations {
 
   // Here go functions not wrapped into transactions (necessary for nested calls)
   void grantDefaultPrivilegesToRole_unsafe(const std::string& name, bool issuper);
-  void createRole_unsafe(const std::string& roleName, const bool userPrivateRole = false);
-  void dropRole_unsafe(const std::string& roleName);
+  void createRole_unsafe(const std::string& roleName,
+                         const bool userPrivateRole,
+                         const bool is_temporary);
+  void dropRole_unsafe(const std::string& roleName, const bool is_temporary);
   void grantRoleBatch_unsafe(const std::vector<std::string>& roles,
                              const std::vector<std::string>& grantees);
-  void grantRole_unsafe(const std::string& roleName, const std::string& granteeName);
+  void grantRole_unsafe(const std::string& roleName,
+                        const std::string& granteeName,
+                        const bool is_temporary);
   void revokeRoleBatch_unsafe(const std::vector<std::string>& roles,
                               const std::vector<std::string>& grantees);
-  void revokeRole_unsafe(const std::string& roleName, const std::string& granteeName);
+  void revokeRole_unsafe(const std::string& roleName,
+                         const std::string& granteeName,
+                         const bool is_temporary);
   void updateObjectDescriptorMap(const std::string& roleName,
                                  DBObject& object,
                                  bool roleType,
@@ -397,7 +438,6 @@ class SysCatalog : private CommonFileOperations {
                                 const std::string& username,
                                 Catalog_Namespace::DBMetadata& db_meta,
                                 UserMetadata& user_meta);
-  bool getMetadataForDBById(const int32_t idIn, DBMetadata& db);
   /**
    * For servers configured to use external authentication providers, determine whether
    * users will be allowed to fallback to local login accounts. If no external providers
@@ -437,6 +477,9 @@ class SysCatalog : private CommonFileOperations {
   static thread_local bool thread_holds_read_lock;
   // used by catalog when initially creating a catalog instance
   std::shared_ptr<Catalog> dummyCatalog_;
+  std::unordered_map<std::string, std::shared_ptr<UserMetadata>> temporary_users_by_name_;
+  std::unordered_map<int32_t, std::shared_ptr<UserMetadata>> temporary_users_by_id_;
+  int32_t next_temporary_user_id_{OMNISCI_TEMPORARY_USER_ID_RANGE};
 };
 
 }  // namespace Catalog_Namespace

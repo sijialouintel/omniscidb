@@ -24,7 +24,7 @@
 PersistentStorageMgr* PersistentStorageMgr::createPersistentStorageMgr(
     const std::string& data_dir,
     const size_t num_reader_threads,
-    const DiskCacheConfig& config) {
+    const File_Namespace::DiskCacheConfig& config) {
   if (config.isEnabledForMutableTables()) {
     return new MutableCachePersistentStorageMgr(data_dir, num_reader_threads, config);
   } else {
@@ -32,9 +32,10 @@ PersistentStorageMgr* PersistentStorageMgr::createPersistentStorageMgr(
   }
 }
 
-PersistentStorageMgr::PersistentStorageMgr(const std::string& data_dir,
-                                           const size_t num_reader_threads,
-                                           const DiskCacheConfig& disk_cache_config)
+PersistentStorageMgr::PersistentStorageMgr(
+    const std::string& data_dir,
+    const size_t num_reader_threads,
+    const File_Namespace::DiskCacheConfig& disk_cache_config)
     : AbstractBufferMgr(0), disk_cache_config_(disk_cache_config) {
   fsi_ = std::make_shared<ForeignStorageInterface>();
   ::registerArrowForeignStorage(fsi_);
@@ -88,7 +89,7 @@ void PersistentStorageMgr::fetchBuffer(const ChunkKey& chunk_key,
       if (!isForeignStorage(chunk_key)) {
         // Foreign storage will read into cache buffers directly if enabled, so we do
         // not want to cache foreign table chunks here as they will already be cached.
-        disk_cache_->cacheChunk(chunk_key, destination_buffer);
+        disk_cache_->putBuffer(chunk_key, destination_buffer, num_bytes);
       }
       return;
     }
@@ -114,11 +115,10 @@ void PersistentStorageMgr::getChunkMetadataVecForKeyPrefix(
   if (isChunkPrefixCacheable(keyPrefix)) {
     if (disk_cache_->hasCachedMetadataForKeyPrefix(keyPrefix)) {
       disk_cache_->getCachedMetadataVecForKeyPrefix(chunk_metadata, keyPrefix);
-      return;
-    } else {  // if we have no cached data attempt a recovery.
-      if (disk_cache_->recoverCacheForTable(chunk_metadata, get_table_key(keyPrefix))) {
-        return;
+      if (isForeignStorage(keyPrefix)) {
+        getForeignStorageMgr()->createDataWrapperIfNotExists(keyPrefix);
       }
+      return;
     }
     getStorageMgrForTableKey(keyPrefix)->getChunkMetadataVecForKeyPrefix(chunk_metadata,
                                                                          keyPrefix);
@@ -135,10 +135,6 @@ bool PersistentStorageMgr::isBufferOnDevice(const ChunkKey& chunk_key) {
 
 std::string PersistentStorageMgr::printSlabs() {
   return global_file_mgr_->printSlabs();
-}
-
-void PersistentStorageMgr::clearSlabs() {
-  global_file_mgr_->clearSlabs();
 }
 
 size_t PersistentStorageMgr::getMaxSize() {

@@ -50,6 +50,10 @@ class DeepCopyVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::Expr>
                                        visit(bin_oper->get_right_operand()));
   }
 
+  RetType visitGeoExpr(const Analyzer::GeoExpr* geo_expr) const override {
+    return geo_expr->deep_copy();
+  }
+
   RetType visitInValues(const Analyzer::InValues* in_values) const override {
     const auto& value_list = in_values->get_value_list();
     std::list<RetType> new_list;
@@ -234,7 +238,7 @@ class DeepCopyVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::Expr>
                                        agg->get_aggtype(),
                                        arg,
                                        agg->get_is_distinct(),
-                                       agg->get_error_rate());
+                                       agg->get_arg1());
   }
 
   RetType visitOffsetInFragment(const Analyzer::OffsetInFragment*) const override {

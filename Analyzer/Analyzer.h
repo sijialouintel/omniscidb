@@ -342,7 +342,7 @@ class Constant : public Expr {
   bool operator==(const Expr& rhs) const override;
   std::string toString() const override;
 
- private:
+ protected:
   bool is_null;    // constant is NULL
   Datum constval;  // the constant value
   const std::list<std::shared_ptr<Analyzer::Expr>> value_list;
@@ -406,7 +406,7 @@ class UOper : public Expr {
                  std::list<const Expr*>& expr_list) const override;
   std::shared_ptr<Analyzer::Expr> add_cast(const SQLTypeInfo& new_type_info) override;
 
- private:
+ protected:
   SQLOps optype;  // operator type, e.g., kUMINUS, kISNULL, kEXISTS
   std::shared_ptr<Analyzer::Expr> operand;  // operand expression
 };
@@ -1080,7 +1080,7 @@ class AggExpr : public Expr {
           std::shared_ptr<Analyzer::Expr> g,
           bool d,
           std::shared_ptr<Analyzer::Constant> e)
-      : Expr(ti, true), aggtype(a), arg(g), is_distinct(d), error_rate(e) {}
+      : Expr(ti, true), aggtype(a), arg(g), is_distinct(d), arg1(e) {}
   AggExpr(SQLTypes t,
           SQLAgg a,
           Expr* g,
@@ -1091,12 +1091,12 @@ class AggExpr : public Expr {
       , aggtype(a)
       , arg(g)
       , is_distinct(d)
-      , error_rate(e) {}
+      , arg1(e) {}
   SQLAgg get_aggtype() const { return aggtype; }
   Expr* get_arg() const { return arg.get(); }
   std::shared_ptr<Analyzer::Expr> get_own_arg() const { return arg; }
   bool get_is_distinct() const { return is_distinct; }
-  std::shared_ptr<Analyzer::Constant> get_error_rate() const { return error_rate; }
+  std::shared_ptr<Analyzer::Constant> get_arg1() const { return arg1; }
   std::shared_ptr<Analyzer::Expr> deep_copy() const override;
   void group_predicates(std::list<const Expr*>& scan_predicates,
                         std::list<const Expr*>& join_predicates,
@@ -1129,7 +1129,8 @@ class AggExpr : public Expr {
   SQLAgg aggtype;                       // aggregate type: kAVG, kMIN, kMAX, kSUM, kCOUNT
   std::shared_ptr<Analyzer::Expr> arg;  // argument to aggregate
   bool is_distinct;                     // true only if it is for COUNT(DISTINCT x)
-  std::shared_ptr<Analyzer::Constant> error_rate;  // error rate of kAPPROX_COUNT_DISTINCT
+  // APPROX_COUNT_DISTINCT error_rate, APPROX_QUANTILE quantile
+  std::shared_ptr<Analyzer::Constant> arg1;
 };
 
 /*
@@ -1370,6 +1371,11 @@ class FunctionOper : public Expr {
   }
 
   std::shared_ptr<Analyzer::Expr> deep_copy() const override;
+  void collect_rte_idx(std::set<int>& rte_idx_set) const override;
+  void collect_column_var(
+      std::set<const ColumnVar*, bool (*)(const ColumnVar*, const ColumnVar*)>&
+          colvar_set,
+      bool include_agg) const override;
 
   bool operator==(const Expr& rhs) const override;
   std::string toString() const override;
@@ -1670,6 +1676,139 @@ class Query {
   int64_t limit;                   // row count for LIMIT clause.  0 means ALL
   int64_t offset;                  // offset in OFFSET clause.  0 means no offset.
 };
+
+class GeoExpr : public Expr {
+ public:
+  GeoExpr(const SQLTypeInfo& ti) : Expr(ti) {}
+
+  // geo expressions might hide child expressions (e.g. constructors). Centralize logic
+  // for pulling out child expressions for simplicity in visitors.
+  virtual std::vector<Analyzer::Expr*> getChildExprs() const { return {}; }
+};
+
+/**
+ * An umbrella column var holding all information required to generate code for
+ * subcolumns. Note that this currently inherits from ColumnVar, not the GeoExpr umbrella
+ * type, because we use the same codegen paths regardless of columnvar type.
+ */
+class GeoColumnVar : public ColumnVar {
+ public:
+  GeoColumnVar(const SQLTypeInfo& ti,
+               const int table_id,
+               const int column_id,
+               const int range_table_index,
+               const bool with_bounds,
+               const bool with_render_group)
+      : ColumnVar(ti, table_id, column_id, range_table_index)
+      , with_bounds_(with_bounds)
+      , with_render_group_(with_render_group) {}
+
+  GeoColumnVar(const Analyzer::ColumnVar* column_var,
+               const bool with_bounds,
+               const bool with_render_group)
+      : ColumnVar(column_var->get_type_info(),
+                  column_var->get_table_id(),
+                  column_var->get_column_id(),
+                  column_var->get_rte_idx())
+      , with_bounds_(with_bounds)
+      , with_render_group_(with_render_group) {}
+
+ protected:
+  bool with_bounds_;
+  bool with_render_group_;
+};
+
+class GeoConstant : public GeoExpr {
+ public:
+  GeoConstant(std::unique_ptr<Geospatial::GeoBase>&& geo, const SQLTypeInfo& ti);
+
+  std::shared_ptr<Analyzer::Expr> deep_copy() const final;
+
+  std::string toString() const final;
+
+  bool operator==(const Expr&) const final;
+
+  size_t physicalCols() const;
+
+  std::shared_ptr<Analyzer::Constant> makePhysicalConstant(const size_t index) const;
+
+  std::shared_ptr<Analyzer::Expr> add_cast(const SQLTypeInfo& new_type_info) final;
+
+  std::string getWKTString() const;
+
+ private:
+  std::unique_ptr<Geospatial::GeoBase> geo_;
+};
+
+/**
+ * GeoOperator: A geo expression that transforms or accesses an input. Typically a
+ * geospatial function prefixed with ST_
+ */
+class GeoOperator : public GeoExpr {
+ public:
+  GeoOperator(const SQLTypeInfo& ti,
+              const std::string& name,
+              const std::vector<std::shared_ptr<Analyzer::Expr>>& args);
+
+  std::shared_ptr<Analyzer::Expr> deep_copy() const override;
+
+  void collect_rte_idx(std::set<int>& rte_idx_set) const final;
+
+  void collect_column_var(
+      std::set<const ColumnVar*, bool (*)(const ColumnVar*, const ColumnVar*)>&
+          colvar_set,
+      bool include_agg) const final;
+
+  std::string toString() const override;
+
+  bool operator==(const Expr&) const override;
+
+  size_t size() const;
+
+  Analyzer::Expr* getOperand(const size_t index) const;
+
+  const std::string& getName() const { return name_; }
+
+  std::vector<Analyzer::Expr*> getChildExprs() const override {
+    std::vector<Analyzer::Expr*> ret;
+    ret.reserve(args_.size());
+    for (const auto& arg : args_) {
+      ret.push_back(arg.get());
+    }
+    return ret;
+  }
+
+  std::shared_ptr<Analyzer::Expr> add_cast(const SQLTypeInfo& new_type_info) final;
+
+ protected:
+  const std::string name_;
+  const std::vector<std::shared_ptr<Analyzer::Expr>> args_;
+};
+
+class GeoTransformOperator : public GeoOperator {
+ public:
+  GeoTransformOperator(const SQLTypeInfo& ti,
+                       const std::string& name,
+                       const std::vector<std::shared_ptr<Analyzer::Expr>>& args,
+                       const int32_t input_srid,
+                       const int32_t output_srid)
+      : GeoOperator(ti, name, args), input_srid_(input_srid), output_srid_(output_srid) {}
+
+  std::shared_ptr<Analyzer::Expr> deep_copy() const override;
+
+  std::string toString() const override;
+
+  bool operator==(const Expr&) const override;
+
+  int32_t getInputSRID() const { return input_srid_; }
+
+  int32_t getOutputSRID() const { return output_srid_; }
+
+ private:
+  const int32_t input_srid_;
+  const int32_t output_srid_;
+};
+
 }  // namespace Analyzer
 
 inline std::shared_ptr<Analyzer::Var> var_ref(const Analyzer::Expr* expr,

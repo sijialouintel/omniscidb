@@ -17,6 +17,9 @@
 #include "StringTransform.h"
 #include "Logger/Logger.h"
 
+#include <boost/algorithm/string/classification.hpp>  // Include boost::for is_any_of
+#include <boost/algorithm/string/split.hpp>           // Include for boost::split
+
 #include <numeric>
 #include <random>
 #include <regex>
@@ -57,7 +60,17 @@ std::vector<std::pair<size_t, size_t>> find_string_literals(const std::string& q
   auto prev_it = it;
   std::vector<std::pair<size_t, size_t>> positions;
   while (true) {
-    if (!boost::regex_search(it, query.end(), what, literal_string_regex)) {
+    try {
+      if (!boost::regex_search(it, query.end(), what, literal_string_regex)) {
+        break;
+      }
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Error processing literals: " << e.what()
+                   << "\nContinuing query parse...";
+      // boost::regex throws an exception about the complexity of matching when
+      // the wrong type of quotes are used or they're mismatched. Let the query
+      // through unmodified, the parser will throw a much more informative error.
+      // This can also throw on very long queries
       break;
     }
     CHECK_GT(what[1].length(), 0);
@@ -73,7 +86,9 @@ std::string hide_sensitive_data_from_query(std::string const& query_str) {
   constexpr std::regex::flag_type flags =
       std::regex::ECMAScript | std::regex::icase | std::regex::optimize;
   static const std::initializer_list<std::pair<std::regex, std::string>> rules{
-      {std::regex(R"(\b((?:password|s3_access_key|s3_secret_key)\s*=\s*)'.+?')", flags),
+      {std::regex(
+           R"(\b((?:password|s3_access_key|s3_secret_key|s3_session_token|username|credential_string)\s*=\s*)'.+?')",
+           flags),
        "$1'XXXXXXXX'"},
       {std::regex(R"((\\set_license\s+)\S+)", flags), "$1XXXXXXXX"}};
   return std::accumulate(

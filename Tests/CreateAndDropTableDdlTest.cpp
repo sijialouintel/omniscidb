@@ -20,6 +20,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <boost/filesystem.hpp>
 
 #include "Catalog/ForeignTable.h"
 #include "Catalog/TableDescriptor.h"
@@ -139,6 +140,16 @@ class CreateAndDropTableDdlTest : public DBHandlerTestFixture {
       // Swallow and log exceptions that may occur, since there is no "IF EXISTS" option.
       LOG(WARNING) << e.what();
     }
+  }
+
+  std::string getTableDirPath() {
+    const auto& catalog = getCatalog();
+    auto base_path = catalog.getDataMgr().getGlobalFileMgr()->getBasePath();
+    auto td = catalog.getMetadataForTable("test_foreign_table", false);
+    CHECK(td);
+    auto table_dir_path = base_path + "table_" + std::to_string(catalog.getDatabaseId()) +
+                          "_" + std::to_string(td->tableId);
+    return table_dir_path;
   }
 };
 
@@ -940,8 +951,7 @@ TEST_P(CreateTableTest, FixedEncodingForNonNumberOrTimeType) {
     EXPECT_ANY_THROW(sql(query));
   } else {
     queryAndAssertException(
-        query,
-        "Exception: col1: Fixed encoding is only supported for integer or time columns.");
+        query, "col1: Fixed encoding is only supported for integer or time columns.");
   }
 }
 
@@ -949,7 +959,7 @@ TEST_P(CreateTableTest, DictEncodingNonTextType) {
   std::string query =
       getCreateTableQuery(GetParam(), "test_table", "(col1 INTEGER ENCODING DICT)");
   queryAndAssertException(query,
-                          "Exception: col1: Dictionary encoding is only supported on "
+                          "col1: Dictionary encoding is only supported on "
                           "string or string array columns.");
 }
 
@@ -957,29 +967,28 @@ TEST_P(CreateTableTest, CompressedEncodingNonWGS84GeoType) {
   std::string query = getCreateTableQuery(
       GetParam(), "test_table", "(col1 GEOMETRY(POINT, 900913) ENCODING COMPRESSED(32))");
   queryAndAssertException(
-      query,
-      "Exception: col1: COMPRESSED encoding is only supported on WGS84 geo columns.");
+      query, "col1: COMPRESSED encoding is only supported on WGS84 geo columns.");
 }
 
 TEST_P(CreateTableTest, CompressedEncodingNon32Bit) {
   std::string query = getCreateTableQuery(
       GetParam(), "test_table", "(col1 GEOMETRY(POINT, 4326) ENCODING COMPRESSED(16))");
-  queryAndAssertException(
-      query, "Exception: col1: only 32-bit COMPRESSED geo encoding is supported");
+  queryAndAssertException(query,
+                          "col1: only 32-bit COMPRESSED geo encoding is supported");
 }
 
 TEST_P(CreateTableTest, DaysEncodingNonDateType) {  // Param for DECIMAL and NUMERIC
   std::string query =
       getCreateTableQuery(GetParam(), "test_table", "(col1 TIME ENCODING DAYS(16))");
-  queryAndAssertException(
-      query, "Exception: col1: Days encoding is only supported for DATE columns.");
+  queryAndAssertException(query,
+                          "col1: Days encoding is only supported for DATE columns.");
 }
 
 TEST_P(CreateTableTest, NonEncodedDictArray) {
   std::string query =
       getCreateTableQuery(GetParam(), "test_table", "(col1 TEXT[] ENCODING NONE)");
   queryAndAssertException(query,
-                          "Exception: col1: Array of strings must be dictionary encoded. "
+                          "col1: Array of strings must be dictionary encoded. "
                           "Specify ENCODING DICT");
 }
 
@@ -989,20 +998,20 @@ TEST_P(CreateTableTest, FixedLengthArrayOfVarLengthType) {
   if (g_enable_calcite_ddl_parser) {
     EXPECT_ANY_THROW(sql(query));
   } else {
-    queryAndAssertException(query, "Exception: col1: Unexpected fixed length array size");
+    queryAndAssertException(query, "col1: Unexpected fixed length array size");
   }
 }
 
 TEST_P(CreateTableTest, UnsupportedTimestampPrecision) {
   std::string query =
       getCreateTableQuery(GetParam(), "test_table", "(col1 TIMESTAMP(10))");
-  queryAndAssertException(
-      query, "Exception: Only TIMESTAMP(n) where n = (0,3,6,9) are supported now.");
+  queryAndAssertException(query,
+                          "Only TIMESTAMP(n) where n = (0,3,6,9) are supported now.");
 }
 
 TEST_P(CreateTableTest, UnsupportedTimePrecision) {
   std::string query = getCreateTableQuery(GetParam(), "test_table", "(col1 TIME(1))");
-  queryAndAssertException(query, "Exception: Only TIME(0) is supported now.");
+  queryAndAssertException(query, "Only TIME(0) is supported now.");
 }
 
 TEST_P(CreateTableTest, NotNullColumnConstraint) {
@@ -1018,7 +1027,7 @@ TEST_P(CreateTableTest, NotNullColumnConstraint) {
 TEST_P(CreateTableTest, DuplicateColumnNames) {
   std::string query =
       getCreateTableQuery(GetParam(), "test_table", "(col1 INTEGER, col1 INTEGER)");
-  queryAndAssertException(query, "Exception: Column 'col1' defined more than once");
+  queryAndAssertException(query, "Column 'col1' defined more than once");
 }
 
 TEST_P(CreateTableTest, ExistingTableWithIfNotExists) {
@@ -1040,8 +1049,8 @@ TEST_P(CreateTableTest, ExistingTableWithIfNotExists) {
 TEST_P(CreateTableTest, ExistingTableWithoutIfNotExists) {
   std::string query = getCreateTableQuery(GetParam(), "test_table", "(col1 INTEGER)");
   sql(query);
-  queryAndAssertException(
-      query, "Exception: Table or View with name \"test_table\" already exists.");
+  queryAndAssertException(query,
+                          "Table or View with name \"test_table\" already exists.");
 }
 
 TEST_P(CreateTableTest, UnauthorizedUser) {
@@ -1051,11 +1060,11 @@ TEST_P(CreateTableTest, UnauthorizedUser) {
 
   if (GetParam() == ddl_utils::TableType::FOREIGN_TABLE) {
     queryAndAssertException(query,
-                            "Exception: Foreign table \"test_table\" will not be "
+                            "Foreign table \"test_table\" will not be "
                             "created. User has no CREATE TABLE privileges.");
   } else {
     queryAndAssertException(query,
-                            "Exception: Table test_table will not be created. User has "
+                            "Table test_table will not be created. User has "
                             "no create privileges.");
   }
 }
@@ -1115,10 +1124,10 @@ TEST_P(NegativePrecisionOrDimensionTest, NegativePrecisionOrDimension) {
     FAIL() << "An exception should have been thrown for this test case.";
   } catch (const TOmniSciException& e) {
     if (table_type == ddl_utils::TableType::FOREIGN_TABLE) {
-      ASSERT_TRUE(e.error_msg.find("Exception: SQL Error") != std::string::npos);
+      ASSERT_TRUE(e.error_msg.find("SQL Error") != std::string::npos);
     } else {
       if (!g_enable_calcite_ddl_parser) {
-        ASSERT_EQ("Exception: No negative number in type definition.", e.error_msg);
+        ASSERT_EQ("No negative number in type definition.", e.error_msg);
       }
     }
   }
@@ -1144,16 +1153,16 @@ TEST_P(PrecisionAndScaleTest, MaxPrecisionExceeded) {
   const auto& [table_type, data_type] = GetParam();
   std::string query =
       getCreateTableQuery(table_type, "test_table", "(col1 " + data_type + "(20))");
-  queryAndAssertException(
-      query, "Exception: DECIMAL and NUMERIC precision cannot be larger than 19.");
+  queryAndAssertException(query,
+                          "DECIMAL and NUMERIC precision cannot be larger than 19.");
 }
 
 TEST_P(PrecisionAndScaleTest, ScaleNotLessThanPrecision) {
   const auto& [table_type, data_type] = GetParam();
   std::string query =
       getCreateTableQuery(table_type, "test_table", "(col1 " + data_type + "(10, 10))");
-  queryAndAssertException(
-      query, "Exception: DECIMAL and NUMERIC must have precision larger than scale.");
+  queryAndAssertException(query,
+                          "DECIMAL and NUMERIC must have precision larger than scale.");
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -1184,6 +1193,36 @@ class CreateForeignTableTest : public CreateAndDropTableDdlTest {
     dropTestUser();
     CreateAndDropTableDdlTest::TearDown();
   }
+
+  void assertOptionEquals(const foreign_storage::ForeignTable* table,
+                          const std::string& key,
+                          const std::string& value) {
+    if (const auto& opt_it = table->options.find(key); opt_it != table->options.end()) {
+      ASSERT_EQ(opt_it->second, value);
+    } else {
+      FAIL() << "Expected value for option " << key;
+    }
+  }
+
+  const foreign_storage::ForeignTable* getForeignTable(
+      const std::string& filename) const {
+    auto table = getCatalog().getMetadataForTable(filename, false);
+    CHECK(table);
+    auto foreign_table = dynamic_cast<const foreign_storage::ForeignTable*>(table);
+    return foreign_table;
+  }
+
+  std::unique_ptr<const foreign_storage::ForeignTable> getForeignTableFromStorage(
+      const std::string& filename) const {
+    return getCatalog().getForeignTableFromStorage(getForeignTable(filename)->tableId);
+  }
+
+  // Asserts option is as expected for in-memory table then again in catalog storage.
+  void assertOptionEquals(const std::string& key, const std::string& value) {
+    assertOptionEquals(getForeignTable("test_foreign_table"), key, value);
+    assertOptionEquals(
+        getForeignTableFromStorage("test_foreign_table").get(), key, value);
+  }
 };
 
 TEST_F(CreateForeignTableTest, NonExistentServer) {
@@ -1192,7 +1231,7 @@ TEST_F(CreateForeignTableTest, NonExistentServer) {
       "non_existent_server;"};
   queryAndAssertException(
       query,
-      "Exception: Foreign Table with name \"test_foreign_table\" can not be created. "
+      "Foreign Table with name \"test_foreign_table\" can not be created. "
       "Associated foreign server with name \"non_existent_server\" does not exist.");
 }
 
@@ -1214,8 +1253,7 @@ TEST_F(CreateForeignTableTest, InvalidTableOption) {
   std::string query{
       "CREATE FOREIGN TABLE test_foreign_table(col1 INTEGER) "
       "SERVER omnisci_local_csv WITH (invalid_option = 'value');"};
-  queryAndAssertException(query,
-                          "Exception: Invalid foreign table option \"INVALID_OPTION\".");
+  queryAndAssertException(query, "Invalid foreign table option \"INVALID_OPTION\".");
 }
 
 TEST_F(CreateForeignTableTest, WrongTableOptionCharacterSize) {
@@ -1224,9 +1262,8 @@ TEST_F(CreateForeignTableTest, WrongTableOptionCharacterSize) {
       "SERVER omnisci_local_csv WITH (delimiter = ',,', file_path = '" +
       getTestFilePath() + "');"};
   queryAndAssertException(query,
-                          "Exception: Value of \"DELIMITER\" foreign table option has "
-                          "the wrong number of characters. "
-                          "Expected 1 character(s).");
+                          "Invalid value specified for option \"DELIMITER\". "
+                          "Expected a single character, \"\\n\" or  \"\\t\".");
 }
 
 TEST_F(CreateForeignTableTest, InvalidTableOptionBooleanValue) {
@@ -1236,7 +1273,7 @@ TEST_F(CreateForeignTableTest, InvalidTableOptionBooleanValue) {
       getTestFilePath() + "');"};
   queryAndAssertException(
       query,
-      "Exception: Invalid boolean value specified for \"HEADER\" foreign table option. "
+      "Invalid boolean value specified for \"HEADER\" foreign table option. "
       "Value must be either 'true' or 'false'.");
 }
 
@@ -1252,7 +1289,7 @@ TEST_F(CreateForeignTableTest, DefaultServerWrapperPathMissingCsv) {
   queryAndAssertException(
       "CREATE FOREIGN TABLE test_foreign_table(col1 INTEGER) "
       "SERVER omnisci_local_csv;",
-      "Exception: No file_path found for Foreign Table \"test_foreign_table\". "
+      "No file_path found for Foreign Table \"test_foreign_table\". "
       "Table must have either set a \"FILE_PATH\" "
       "option, or its parent server must have set a \"BASE_PATH\" option.");
 }
@@ -1261,7 +1298,7 @@ TEST_F(CreateForeignTableTest, DefaultServerWrapperPathMissingParquet) {
   queryAndAssertException(
       "CREATE FOREIGN TABLE test_foreign_table(col1 INTEGER) "
       "SERVER omnisci_local_parquet;",
-      "Exception: No file_path found for Foreign Table \"test_foreign_table\". "
+      "No file_path found for Foreign Table \"test_foreign_table\". "
       "Table must have either set a \"FILE_PATH\" "
       "option, or its parent server must have set a \"BASE_PATH\" option.");
 }
@@ -1290,7 +1327,7 @@ TEST_F(CreateForeignTableTest, ServerPathMissingWrapperPathMissing) {
   queryAndAssertException(
       "CREATE FOREIGN TABLE test_foreign_table(t TEXT, i INTEGER[]) "
       "SERVER test_server;",
-      "Exception: No file_path found for Foreign Table \"test_foreign_table\". "
+      "No file_path found for Foreign Table \"test_foreign_table\". "
       "Table must have either set a \"FILE_PATH\" "
       "option, or its parent server must have set a \"BASE_PATH\" option.");
 }
@@ -1300,7 +1337,7 @@ TEST_F(CreateForeignTableTest, UnsupportedOption) {
       "CREATE FOREIGN TABLE test_foreign_table(col1 INTEGER) "
       "SERVER omnisci_local_csv WITH (file_path = '" +
           getTestFilePath() + "', shard_count = 4);",
-      "Exception: Invalid foreign table option \"SHARD_COUNT\".");
+      "Invalid foreign table option \"SHARD_COUNT\".");
 }
 
 TEST_F(CreateForeignTableTest, ServerPathMissingWrapperPathRelative) {
@@ -1315,7 +1352,7 @@ TEST_F(CreateForeignTableTest, S3SelectWrongServer) {
                       "file_path = '../../Tests/FsiDataFiles/0.csv');";
   queryAndAssertException(
       query,
-      "Exception: The \"S3_ACCESS_TYPE\" option is only valid for foreign tables using "
+      "The \"S3_ACCESS_TYPE\" option is only valid for foreign tables using "
       "servers with \"STORAGE_TYPE\" option value of \"AWS_S3\".");
 }
 
@@ -1328,7 +1365,7 @@ TEST_F(CreateForeignTableTest, UnauthorizedServerUsage) {
   queryAndAssertException(
       "CREATE FOREIGN TABLE test_foreign_table(t TEXT, i INTEGER[]) "
       "SERVER test_server WITH (file_path = '../../Tests/FsiDataFiles/0.csv');",
-      "Exception: Current user does not have USAGE privilege on foreign server: "
+      "Current user does not have USAGE privilege on foreign server: "
       "test_server");
 }
 
@@ -1382,7 +1419,7 @@ TEST_F(CreateForeignTableTest, RevokedServerUsage) {
   queryAndAssertException(
       "CREATE FOREIGN TABLE test_foreign_table(t TEXT, i INTEGER[]) "
       "SERVER test_server WITH (file_path = '../../Tests/FsiDataFiles/0.csv');",
-      "Exception: Current user does not have USAGE privilege on foreign server: "
+      "Current user does not have USAGE privilege on foreign server: "
       "test_server");
 }
 
@@ -1397,8 +1434,61 @@ TEST_F(CreateForeignTableTest, RevokedDatabaseServerUsage) {
   queryAndAssertException(
       "CREATE FOREIGN TABLE test_foreign_table(t TEXT, i INTEGER[]) "
       "SERVER test_server WITH (file_path = '../../Tests/FsiDataFiles/0.csv');",
-      "Exception: Current user does not have USAGE privilege on foreign server: "
+      "Current user does not have USAGE privilege on foreign server: "
       "test_server");
+}
+
+TEST_F(CreateForeignTableTest, TableDirectoryIsNotCreated) {
+  sql(getCreateTableQuery(ddl_utils::TableType::FOREIGN_TABLE,
+                          "test_foreign_table",
+                          "(t TEXT, i INTEGER[])"));
+  sql("SELECT * FROM test_foreign_table;");
+  ASSERT_FALSE(boost::filesystem::exists(getTableDirPath()));
+}
+
+class CreateTableInThrift : public DBHandlerTestFixture {
+ protected:
+  void SetUp() override {
+    DBHandlerTestFixture::SetUp();
+    sql("DROP TABLE IF EXISTS test_table");
+  }
+
+  void TearDown() override {
+    sql("DROP TABLE IF EXISTS test_table");
+    DBHandlerTestFixture::TearDown();
+  }
+};
+
+TEST_F(CreateTableInThrift, ThriftCreateTableWithDefaults) {
+  auto [handler, session] = getDbHandlerAndSessionId();
+  TColumnType c1, c2, c3;
+  c1.col_id = 1;
+  c1.col_name = "idx";
+  c1.col_type.type = TDatumType::INT;
+  c2.col_id = 2;
+  c2.col_name = "s";
+  c2.col_type.type = TDatumType::STR;
+  c2.__set_default_value("'default str'");
+  c3.col_id = 3;
+  c3.col_name = "sa";
+  c3.col_type.is_array = true;
+  c3.col_type.type = TDatumType::STR;
+  c3.col_type.encoding = TEncodingType::DICT;
+  c3.__set_default_value("ARRAY['a', 'b', 'c']");
+  TRowDescriptor row_desc = {c1, c2, c3};
+  TCreateParams cp;
+  cp.is_replicated = false;
+  handler->create_table(session, "test_table", row_desc, TFileType::DELIMITED, cp);
+  TTableDetails details;
+  handler->get_table_details(details, session, "test_table");
+  auto created_row_desc = details.row_desc;
+  EXPECT_EQ(created_row_desc.size(), row_desc.size());
+  for (size_t i = 0; i < row_desc.size(); ++i) {
+    EXPECT_EQ(created_row_desc[i].col_name, row_desc[i].col_name);
+    EXPECT_EQ(created_row_desc[i].default_value, row_desc[i].default_value);
+    EXPECT_EQ(created_row_desc[i].col_type.is_array, row_desc[i].col_type.is_array);
+    EXPECT_EQ(created_row_desc[i].col_type.type, row_desc[i].col_type.type);
+  }
 }
 
 class DropTableTest : public CreateAndDropTableDdlTest,
@@ -1431,8 +1521,8 @@ TEST_P(DropTableTest, NonExistingTableWithIfExists) {
 TEST_P(DropTableTest, NonExistentTableWithoutIfExists) {
   std::string query = getDropTableQuery(GetParam(), "test_table_2");
   queryAndAssertException(query,
-                          "Exception: Table/View test_table_2 for catalog omnisci does "
-                          "not exist, could not generate chunk key");
+                          "Table/View test_table_2 for catalog omnisci does "
+                          "not exist");
 }
 
 TEST_P(DropTableTest, UnauthorizedUser) {
@@ -1442,11 +1532,11 @@ TEST_P(DropTableTest, UnauthorizedUser) {
 
   if (GetParam() == ddl_utils::TableType::FOREIGN_TABLE) {
     queryAndAssertException(query,
-                            "Exception: Foreign table \"test_table\" will not be "
+                            "Foreign table \"test_table\" will not be "
                             "dropped. User has no DROP TABLE privileges.");
   } else {
     queryAndAssertException(query,
-                            "Exception: Table test_table will not be dropped. User has "
+                            "Table test_table will not be dropped. User has "
                             "no proper privileges.");
   }
 
@@ -1472,10 +1562,10 @@ TEST_P(CreateTableTest, InvalidSyntax) {
     FAIL() << "An exception should have been thrown for this test case.";
   } catch (const TOmniSciException& e) {
     if (GetParam() == ddl_utils::TableType::FOREIGN_TABLE) {
-      ASSERT_TRUE(e.error_msg.find("Exception: SQL Error") != std::string::npos);
+      ASSERT_TRUE(e.error_msg.find("SQL Error") != std::string::npos);
     } else {
       if (!g_enable_calcite_ddl_parser) {
-        ASSERT_EQ("Exception: Syntax error at: INTEGER", e.error_msg);
+        ASSERT_EQ("Syntax error at: INTEGER", e.error_msg);
       }
     }
   }
@@ -1489,10 +1579,8 @@ TEST_P(CreateTableTest, InvalidColumnDefinition) {
     FAIL() << "An exception should have been thrown for this test case.";
   } catch (const TOmniSciException& e) {
     if (GetParam() == ddl_utils::TableType::TABLE) {
-      ASSERT_TRUE(
-          e.error_msg.find(
-              "Exception: Exception occurred: Column definition for table test_table") !=
-          std::string::npos);
+      ASSERT_TRUE(e.error_msg.find("Column definition for table test_table") !=
+                  std::string::npos);
     }
   }
 }
@@ -1533,9 +1621,9 @@ TEST_F(DropTableTypeMismatchTest, Table_DropCommandForOtherTableTypes) {
   sql(getCreateTableQuery(ddl_utils::TableType::TABLE, "test_table", "(col1 INTEGER)"));
 
   queryAndAssertException("DROP VIEW test_table;",
-                          "Exception: test_table is a table. Use DROP TABLE.");
+                          "test_table is a table. Use DROP TABLE.");
   queryAndAssertException("DROP FOREIGN TABLE test_table;",
-                          "Exception: test_table is a table. Use DROP TABLE.");
+                          "test_table is a table. Use DROP TABLE.");
 
   sql("DROP table test_table;");
   ASSERT_EQ(nullptr, getCatalog().getMetadataForTable("test_table", false));
@@ -1545,13 +1633,13 @@ TEST_F(DropTableTypeMismatchTest, View_DropCommandForOtherTableTypes) {
   sql(getCreateTableQuery(ddl_utils::TableType::TABLE, "test_table", "(col1 INTEGER)"));
   sql("CREATE VIEW test_view AS SELECT * FROM test_table;");
 
-  queryAndAssertException("DROP table test_view;",
-                          "Exception: test_view is a view. Use DROP VIEW.");
+  queryAndAssertException("DROP table test_view;", "test_view is a view. Use DROP VIEW.");
   queryAndAssertException("DROP FOREIGN TABLE test_view;",
-                          "Exception: test_view is a view. Use DROP VIEW.");
+                          "test_view is a view. Use DROP VIEW.");
 
   sql("DROP VIEW test_view;");
   ASSERT_EQ(nullptr, getCatalog().getMetadataForTable("test_view", false));
+  sql("DROP TABLE test_table");
 }
 
 TEST_F(DropTableTypeMismatchTest, ForeignTable_DropCommandForOtherTableTypes) {
@@ -1560,10 +1648,10 @@ TEST_F(DropTableTypeMismatchTest, ForeignTable_DropCommandForOtherTableTypes) {
 
   queryAndAssertException(
       "DROP table test_foreign_table;",
-      "Exception: test_foreign_table is a foreign table. Use DROP FOREIGN TABLE.");
+      "test_foreign_table is a foreign table. Use DROP FOREIGN TABLE.");
   queryAndAssertException(
       "DROP VIEW test_foreign_table;",
-      "Exception: test_foreign_table is a foreign table. Use DROP FOREIGN TABLE.");
+      "test_foreign_table is a foreign table. Use DROP FOREIGN TABLE.");
 
   sql("DROP FOREIGN TABLE test_foreign_table;");
   ASSERT_EQ(nullptr, getCatalog().getMetadataForTable("test_foreign_table", false));
@@ -1590,7 +1678,7 @@ TEST_F(DropForeignTableTest, FsiDisabled) {
   g_enable_fsi = false;
   queryAndAssertException(
       "DROP table test_foreign_table;",
-      "Exception: test_foreign_table is a foreign table. Use DROP FOREIGN TABLE.");
+      "test_foreign_table is a foreign table. Use DROP FOREIGN TABLE.");
 }
 
 class CreateViewUnsupportedTest : public CreateAndDropTableDdlTest {
@@ -1614,7 +1702,7 @@ TEST_F(CreateViewUnsupportedTest, Basics) {
       ddl_utils::TableType::TABLE, "test_table", "(col1 INTEGER, col2 FLOAT)"));
   queryAndAssertException(
       "CREATE VIEW showcreateviewtest (c1, c2) AS SELECT * FROM showcreatetabletest;",
-      "Exception: SQL Error: Column list aliases in views are not yet supported.");
+      "SQL Error: Column list aliases in views are not yet supported.");
 }
 
 class CreateNonReservedKeywordsTest : public CreateAndDropTableDdlTest {
@@ -1737,7 +1825,7 @@ TEST_F(RenameTableTest, ErrorChecks) {
 
   executeLambdaAndAssertException(
       [] { sql("RENAME TABLE A to B"); },
-      "Exception: Error: Attempted to overwrite and lose data in table: 'B'");
+      "Error: Attempted to overwrite and lose data in table: 'B'");
 
   // verify no change
   sqlAndCompareResult("SELECT count(*) FROM A WHERE Name = 'A';", {{i(1)}});
@@ -1746,7 +1834,7 @@ TEST_F(RenameTableTest, ErrorChecks) {
   // ERROR, expect no change, as would trigger an overwrite
   executeLambdaAndAssertException(
       [] { sql("RENAME TABLE A to C, B TO C"); },
-      "Exception: Error: Attempted to overwrite and lose data in table: 'C'");
+      "Error: Attempted to overwrite and lose data in table: 'C'");
 
   // verify no name change
   sqlAndCompareResult("SELECT count(*) FROM A WHERE Name = 'A';", {{i(1)}});
@@ -1754,7 +1842,7 @@ TEST_F(RenameTableTest, ErrorChecks) {
 
   // ERROR, expect no change, table Z is non-existant
   executeLambdaAndAssertException([] { sql("RENAME TABLE Z TO A"); },
-                                  "Exception: Source table 'Z' does not exist.");
+                                  "Source table 'Z' does not exist.");
 
   // verify
   sqlAndCompareResult("SELECT count(*) FROM A WHERE Name = 'A';", {{i(1)}});
@@ -1837,6 +1925,282 @@ TEST_F(MaxRollbackEpochsTest, CreateTableDefaultValue) {
   sql("INSERT INTO test_table VALUES (10);");
   assertEpochCeilingAndFloor(DEFAULT_MAX_ROLLBACK_EPOCHS + 1, 1);
 }
+
+class DefaultValuesTest : public DBHandlerTestFixture {
+ protected:
+  void SetUp() override {
+    DBHandlerTestFixture::SetUp();
+    sql("DROP TABLE IF EXISTS defval_tbl");
+  }
+  void TearDown() override {
+    sql("DROP TABLE IF EXISTS defval_tbl");
+    DBHandlerTestFixture::TearDown();
+  }
+
+  void insertDefaultValues() {
+    EXPECT_NO_THROW(sql("INSERT INTO defval_tbl(idx) values(1)"));
+  }
+
+  void insertNotDefaultValues() {
+    EXPECT_NO_THROW(
+        sql("INSERT INTO defval_tbl(idx, i, big_i, null_i, int_a, text_a,"
+            "t, dt, ls, p, d) values(2, 15, 314958735, NULL, "
+            "ARRAY[4, 5, 6], ARRAY['b', 'c'],"
+            "'World', '!!!', 'LINESTRING (2 2,3 3, 4 4)',"
+            "'POINT (2 3)', '2012-11-24')"));
+  }
+
+  void verifyData() {
+    sqlAndCompareResult("SELECT * FROM defval_tbl WHERE idx = 1", default_values);
+    sqlAndCompareResult("SELECT * FROM defval_tbl WHERE idx = 2", not_default_values);
+  }
+
+  const std::vector<std::vector<NullableTargetValue>> default_values = {
+      {i(1),
+       i(14),
+       i(314958734),
+       Null,
+       array({i(1), i(2), i(3)}),
+       array({"a", "b"}),
+       "Hello",
+       "World",
+       "LINESTRING (1 1,2 2,3 3)",
+       "POINT (1 2)",
+       "2011-10-23"}};
+
+  const std::vector<std::vector<NullableTargetValue>> not_default_values = {
+      {i(2),
+       i(15),
+       i(314958735),
+       Null,
+       array({i(4), i(5), i(6)}),
+       array({"b", "c"}),
+       "World",
+       "!!!",
+       "LINESTRING (2 2,3 3,4 4)",
+       "POINT (2 3)",
+       "2012-11-24"}};
+
+  std::string col_defs =
+      "i integer default 14,"
+      "big_i bigint default 314958734,"
+      "null_i integer,"
+      "int_a integer[] default ARRAY[1, 2, 3],"
+      "text_a text[] default ARRAY['a', 'b'],"
+      "t text default 'Hello' encoding none ,"
+      "dt text default 'World' encoding dict,"
+      "ls LINESTRING default 'LINESTRING (1 1,2 2,3 3)',"
+      "p POINT default 'POINT (1 2)',"
+      "d date default '2011-10-23'";
+};
+
+TEST_F(DefaultValuesTest, CreateTableTest) {
+  std::string create_table_query =
+      "CREATE TABLE defval_tbl (idx integer, " + col_defs + ")";
+  sql(create_table_query);
+  insertNotDefaultValues();
+  insertDefaultValues();
+  verifyData();
+}
+
+TEST_F(DefaultValuesTest, AlterAfterInsert) {
+  std::string create_table_query = "CREATE TABLE defval_tbl (idx integer)";
+  sql(create_table_query);
+  insertDefaultValues();
+  std::string alter_table_query = "ALTER TABLE defval_tbl ADD " + col_defs;
+  sql(alter_table_query);
+  insertNotDefaultValues();
+  verifyData();
+}
+
+TEST_F(DefaultValuesTest, InsertAfterAlter) {
+  std::string create_table_query = "CREATE TABLE defval_tbl (idx integer)";
+  sql(create_table_query);
+  std::string alter_table_query = "ALTER TABLE defval_tbl ADD " + col_defs;
+  sql(alter_table_query);
+  insertDefaultValues();
+  insertNotDefaultValues();
+  verifyData();
+}
+
+TEST_F(DefaultValuesTest, ProhibitDefaultOnShardedKey) {
+  queryAndAssertException(
+      "CREATE TABLE defval_tbl (i INTEGER default -1, key text "
+      "default 'default', shard key(i)) with (shard_count = 2)",
+      "Default values for shard "
+      "keys are not supported yet.");
+}
+
+TEST_F(DefaultValuesTest, DefaultAllowsNulls) {
+  std::vector<std::string> create_sqls = {
+      "CREATE TABLE defval_tbl (idx INTEGER, a INTEGER DEFAULT 12)",
+      "CREATE TABLE defval_tbl (idx INTEGER, a INTEGER NULL DEFAULT 12)"};
+  for (auto& create_sql : create_sqls) {
+    sql("DROP TABLE IF EXISTS defval_tbl");
+    sql(create_sql);
+    sql("INSERT INTO defval_tbl(idx, a) VALUES (1, NULL)");
+    sqlAndCompareResult("SELECT idx, a FROM defval_tbl", {{i(1), Null}});
+  }
+}
+
+TEST_F(DefaultValuesTest, DefaultNotNull) {
+  std::string create_table_query =
+      "CREATE TABLE defval_tbl (idx INTEGER, a INTEGER NOT NULL DEFAULT 12)";
+  sql(create_table_query);
+  queryAndAssertException("INSERT INTO defval_tbl(idx, a) VALUES (1, NULL)",
+                          "Cannot insert NULL into column a");
+  sql("INSERT INTO defval_tbl(idx) VALUES (1)");
+  sqlAndCompareResult("SELECT idx, a FROM defval_tbl", {{i(1), i(12)}});
+}
+
+TEST_F(DefaultValuesTest, NullDefault) {
+  std::string create_table_query =
+      "CREATE TABLE defval_tbl (idx INTEGER, a INTEGER DEFAULT NULL)";
+  sql(create_table_query);
+  sql("INSERT INTO defval_tbl(idx) VALUES (1)");
+  sqlAndCompareResult("SELECT * FROM defval_tbl", {{i(1), Null}});
+}
+
+TEST_F(DefaultValuesTest, NotNullWithNullDefault) {
+  std::string create_table_query =
+      "CREATE TABLE defval_tbl (idx INTEGER, a INTEGER NOT NULL DEFAULT NULL)";
+  sql(create_table_query);
+  queryAndAssertException("INSERT INTO defval_tbl(idx) VALUES (1)", "NULL for column a");
+}
+
+struct DefaultValueParams {
+  DefaultValueParams(const SQLTypeInfo& t,
+                     const std::string& v,
+                     const std::string& e,
+                     bool n,
+                     const std::string& d)
+      : type(t), value(v), error_message(e), is_null(n), description(d) {}
+
+  SQLTypeInfo type;
+  std::string value;
+  std::string error_message;
+  bool is_null;
+  std::string description;
+
+  friend std::ostream& operator<<(std::ostream& os, const DefaultValueParams& p) {
+    return os << "Type: " << p.type.to_string() << ", Value: " << p.value
+              << ", is_null: " << p.is_null;
+  }
+};
+
+SQLTypeInfo decimal = SQLTypeInfo(SQLTypes::kDECIMAL, 3, 1, false);
+SQLTypeInfo integer = SQLTypeInfo(SQLTypes::kINT, false);
+SQLTypeInfo integer_notnull = SQLTypeInfo(SQLTypes::kINT, 0, 0, true);
+SQLTypeInfo smallint = SQLTypeInfo(SQLTypes::kSMALLINT, false);
+SQLTypeInfo integer_array =
+    SQLTypeInfo(SQLTypes::kARRAY, 0, 0, false, kENCODING_NONE, 0, SQLTypes::kINT);
+SQLTypeInfo fixed_integer_array =
+    SQLTypeInfo(SQLTypes::kARRAY, 0, 0, false, kENCODING_NONE, 0, SQLTypes::kINT);
+SQLTypeInfo timestamp = SQLTypeInfo(SQLTypes::kTIMESTAMP, false);
+SQLTypeInfo text_array =
+    SQLTypeInfo(SQLTypes::kARRAY, 0, 0, false, kENCODING_DICT, 32, SQLTypes::kTEXT);
+SQLTypeInfo fixed_text_array =
+    SQLTypeInfo(SQLTypes::kARRAY, 0, 0, false, kENCODING_DICT, 32, SQLTypes::kTEXT);
+
+class ValidateDefaultValuesTest : public testing::Test,
+                                  public testing::WithParamInterface<DefaultValueParams> {
+};
+
+TEST_P(ValidateDefaultValuesTest, InvalidLiteralTest) {
+  ColumnDescriptor cd(0, 1, "c", GetParam().type);
+  try {
+    const std::string* value = GetParam().is_null ? nullptr : &GetParam().value;
+    ddl_utils::validate_and_set_default_value(cd, value, GetParam().type.get_notnull());
+    ASSERT_TRUE(false) << "Expected an error: " << GetParam().error_message;
+  } catch (const std::exception& e) {
+    ASSERT_EQ(e.what(), GetParam().error_message);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ValidateDefaultValuesTest,
+    ValidateDefaultValuesTest,
+    testing::Values(
+        DefaultValueParams(decimal,
+                           "{1, 2, 3}",
+                           "Invalid conversion from string to NUMERIC(0,0)",
+                           false,
+                           "ArrayAsDecimalValue"),
+        DefaultValueParams(decimal,
+                           "Hello",
+                           "Invalid conversion from string to NUMERIC(0,0)",
+                           false,
+                           "TextAsDecimalValue"),
+        DefaultValueParams(integer,
+                           "Hello",
+                           "Unable to parse Hello to INTEGER",
+                           false,
+                           "TextAsIntegerValue"),
+        DefaultValueParams(integer_notnull,
+                           "Null",
+                           "c: cannot set default value to NULL for NOT NULL column",
+                           false,
+                           "NullValueForNotNullInteger"),
+        DefaultValueParams(smallint,
+                           "999999999",
+                           "Integer 999999999 is out of range for SMALLINT",
+                           false,
+                           "SmallintOverflow"),
+        DefaultValueParams(smallint,
+                           "-999999999",
+                           "Integer -999999999 is out of range for SMALLINT",
+                           false,
+                           "SmallintUnderflow"),
+        DefaultValueParams(integer_array,
+                           "{1, 2, 3",
+                           "c: arrays should start and end with curly braces",
+                           false,
+                           "ArrayWithoutClosingBrace"),
+        DefaultValueParams(integer_array,
+                           "1, 2, 3",
+                           "c: arrays should start and end with curly braces",
+                           false,
+                           "ArrayWithoutBraces"),
+        DefaultValueParams(integer_array,
+                           "ARRAY[1, 2]",
+                           "c: arrays should start and end with curly braces",
+                           false,
+                           "UnsupportedArrayFormat"),
+        DefaultValueParams(integer_array,
+                           "12309834",
+                           "c: arrays should start and end with curly braces",
+                           false,
+                           "LiteralInsteadOfIntArray"),
+        DefaultValueParams(integer_array,
+                           "{1, 2, Three}",
+                           "Unable to parse Three to INTEGER",
+                           false,
+                           "TextInIntegerArray"),
+        DefaultValueParams((fixed_integer_array.set_size(
+                                fixed_integer_array.get_elem_type().get_size() * 4),
+                            fixed_integer_array),
+                           "{1, 2, 3}",
+                           "Fixed length array column c expects 4 values, received 3",
+                           false,
+                           "NotEnoughElementsInFixedIntArray"),
+        DefaultValueParams(timestamp,
+                           "Hello",
+                           "Invalid TIMESTAMP string (Hello)",
+                           false,
+                           "TextInsteadOfTimestamp"),
+        DefaultValueParams(text_array,
+                           "Hello",
+                           "c: arrays should start and end with curly braces",
+                           false,
+                           "LiteralInsteadOfTextArray"),
+        DefaultValueParams(
+            (fixed_text_array.set_size(fixed_text_array.get_elem_type().get_size() * 4),
+             fixed_text_array),
+            "{a, b, c, d, e}",
+            "Fixed length array column c expects 4 values, received 5",
+            false,
+            "TooManyElementsInFixedTextArray")),
+    [](const auto& param_info) { return param_info.param.description; });
 
 int main(int argc, char** argv) {
   g_enable_fsi = true;

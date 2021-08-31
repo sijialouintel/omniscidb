@@ -168,7 +168,8 @@ class DataMgr {
       const bool useGpus,
       const size_t reservedGpuMem = (1 << 27),
       const size_t numReaderThreads = 0, /* 0 means use default for # of reader threads */
-      const DiskCacheConfig cacheConfig = DiskCacheConfig());
+      const File_Namespace::DiskCacheConfig cacheConfig =
+          File_Namespace::DiskCacheConfig());
   ~DataMgr();
   AbstractBuffer* createChunkBuffer(const ChunkKey& key,
                                     const MemoryLevel memoryLevel,
@@ -199,7 +200,7 @@ class DataMgr {
   void checkpoint(const int db_id, const int table_id, const MemoryLevel memory_level);
   void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
                                        const ChunkKey& keyPrefix);
-  inline bool gpusPresent() { return hasGpus_; }
+  inline bool gpusPresent() const { return hasGpus_; }
   void removeTableRelatedDS(const int db_id, const int tb_id);
   void setTableEpoch(const int db_id, const int tb_id, const int start_epoch);
   size_t getTableEpoch(const int db_id, const int tb_id);
@@ -225,14 +226,14 @@ class DataMgr {
   static size_t getTotalSystemMemory();
 
   PersistentStorageMgr* getPersistentStorageMgr() const;
-  void resetPersistentStorage(const DiskCacheConfig& cache_config,
+  void resetPersistentStorage(const File_Namespace::DiskCacheConfig& cache_config,
                               const size_t num_reader_threads,
                               const SystemParameters& sys_params);
 
  private:
   void populateMgrs(const SystemParameters& system_parameters,
                     const size_t userSpecifiedNumReaderThreads,
-                    const DiskCacheConfig& cache_config);
+                    const File_Namespace::DiskCacheConfig& cache_config);
   void convertDB(const std::string basePath);
   void checkpoint();  // checkpoint for whole DB, called from convertDB proc only
   void createTopLevelMetadata() const;

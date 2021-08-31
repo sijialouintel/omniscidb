@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2021 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,6 +42,8 @@ bool g_enable_debug_timer{false};
 #include <mutex>
 #include <regex>
 
+#include "Shared/nvtx_helpers.h"
+
 namespace logger {
 
 namespace attr = boost::log::attributes;
@@ -55,7 +57,15 @@ BOOST_LOG_ATTRIBUTE_KEYWORD(process_id, "ProcessID", attr::current_process_id::v
 BOOST_LOG_ATTRIBUTE_KEYWORD(channel, "Channel", Channel)
 BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", Severity)
 
-BOOST_LOG_GLOBAL_LOGGER_DEFAULT(gChannelLogger, ChannelLogger)
+BOOST_LOG_GLOBAL_LOGGER_CTOR_ARGS(gChannelLogger_IR,
+                                  ChannelLogger,
+                                  (keywords::channel = IR))
+BOOST_LOG_GLOBAL_LOGGER_CTOR_ARGS(gChannelLogger_PTX,
+                                  ChannelLogger,
+                                  (keywords::channel = PTX))
+BOOST_LOG_GLOBAL_LOGGER_CTOR_ARGS(gChannelLogger_ASM,
+                                  ChannelLogger,
+                                  (keywords::channel = ASM))
 BOOST_LOG_GLOBAL_LOGGER_DEFAULT(gSeverityLogger, SeverityLogger)
 
 // Return last component of path
@@ -302,6 +312,7 @@ void init(LogOptions const& log_opts) {
   }
   core->add_sink(make_sink<ClogSync>(log_opts));
   g_min_active_severity = std::min(g_min_active_severity, log_opts.severity_clog_);
+  nvtx_helpers::init();
 }
 
 void set_once_fatal_func(FatalFunc fatal_func) {
@@ -313,7 +324,10 @@ void set_once_fatal_func(FatalFunc fatal_func) {
 
 void shutdown() {
   static std::once_flag logger_flag;
-  std::call_once(logger_flag, []() { boost::log::core::get()->remove_all_sinks(); });
+  std::call_once(logger_flag, []() {
+    boost::log::core::get()->remove_all_sinks();
+    nvtx_helpers::shutdown();
+  });
 }
 
 namespace {
@@ -378,11 +392,25 @@ std::ostream& operator<<(std::ostream& out, Severity const& sev) {
   return out << SeverityNames.at(sev);
 }
 
+namespace {
+ChannelLogger& get_channel_logger(Channel const channel) {
+  switch (channel) {
+    default:
+    case IR:
+      return gChannelLogger_IR::get();
+    case PTX:
+      return gChannelLogger_PTX::get();
+    case ASM:
+      return gChannelLogger_ASM::get();
+  }
+}
+}  // namespace
+
 Logger::Logger(Channel channel)
     : is_channel_(true)
     , enum_value_(channel)
     , record_(std::make_unique<boost::log::record>(
-          gChannelLogger::get().open_record(boost::log::keywords::channel = channel))) {
+          get_channel_logger(channel).open_record())) {
   if (*record_) {
     stream_ = std::make_unique<boost::log::record_ostream>(*record_);
   }
@@ -391,8 +419,8 @@ Logger::Logger(Channel channel)
 Logger::Logger(Severity severity)
     : is_channel_(false)
     , enum_value_(severity)
-    , record_(std::make_unique<boost::log::record>(gSeverityLogger::get().open_record(
-          boost::log::keywords::severity = severity))) {
+    , record_(std::make_unique<boost::log::record>(
+          gSeverityLogger::get().open_record(keywords::severity = severity))) {
   if (*record_) {
     stream_ = std::make_unique<boost::log::record_ostream>(*record_);
   }
@@ -401,7 +429,8 @@ Logger::Logger(Severity severity)
 Logger::~Logger() {
   if (stream_) {
     if (is_channel_) {
-      gChannelLogger::get().push_record(boost::move(stream_->get_record()));
+      get_channel_logger(static_cast<Channel>(enum_value_))
+          .push_record(boost::move(stream_->get_record()));
     } else {
       gSeverityLogger::get().push_record(boost::move(stream_->get_record()));
     }
@@ -420,8 +449,31 @@ Logger::operator bool() const {
   return static_cast<bool>(stream_);
 }
 
+thread_local std::atomic<QueryId> g_query_id{0};
+
+QueryId query_id() {
+  return g_query_id.load();
+}
+
+QidScopeGuard::~QidScopeGuard() {
+  if (id_) {
+    // Ideally this CHECK would be enabled, but it's too heavy for a destructor.
+    // Would be ok for DEBUG mode.
+    // CHECK(g_query_id.compare_exchange_strong(id_, 0));
+    g_query_id = 0;
+  }
+}
+
+// Only set g_query_id if its currently 0.
+QidScopeGuard set_thread_local_query_id(QueryId const query_id) {
+  QueryId expected = 0;
+  return g_query_id.compare_exchange_strong(expected, query_id) ? QidScopeGuard(query_id)
+                                                                : QidScopeGuard(0);
+}
+
 boost::log::record_ostream& Logger::stream(char const* file, int line) {
-  return *stream_ << thread_id() << ' ' << filename(file) << ':' << line << ' ';
+  return *stream_ << query_id() << ' ' << thread_id() << ' ' << filename(file) << ':'
+                  << line << ' ';
 }
 
 // DebugTimer-related classes and functions.
@@ -525,7 +577,7 @@ using DurationTreeMap = std::unordered_map<ThreadId, std::unique_ptr<DurationTre
 std::mutex g_duration_tree_map_mutex;
 DurationTreeMap g_duration_tree_map;
 std::atomic<ThreadId> g_next_thread_id{0};
-ThreadId thread_local const g_thread_id = g_next_thread_id++;
+thread_local ThreadId const g_thread_id = g_next_thread_id++;
 
 template <typename... Ts>
 Duration* newDuration(Severity severity, Ts&&... args) {
@@ -690,10 +742,13 @@ void logAndEraseDurationTree(std::string* json_str) {
 }
 
 DebugTimer::DebugTimer(Severity severity, char const* file, int line, char const* name)
-    : duration_(newDuration(severity, file, line, name)) {}
+    : duration_(newDuration(severity, file, line, name)) {
+  nvtx_helpers::omnisci_range_push(nvtx_helpers::Category::kDebugTimer, name, file);
+}
 
 DebugTimer::~DebugTimer() {
   stop();
+  nvtx_helpers::omnisci_range_pop();
 }
 
 void DebugTimer::stop() {

@@ -49,9 +49,9 @@ QueryExecutionContext::QueryExecutionContext(
     , row_set_mem_owner_(row_set_mem_owner)
     , output_columnar_(output_columnar) {
   CHECK(executor);
-  auto& data_mgr = executor->catalog_->getDataMgr();
+  auto data_mgr = executor->getDataMgr();
   if (device_type == ExecutorDeviceType::GPU) {
-    gpu_allocator_ = std::make_unique<CudaAllocator>(&data_mgr, device_id);
+    gpu_allocator_ = std::make_unique<CudaAllocator>(data_mgr, device_id);
   }
 
   auto render_allocator_map = render_info && render_info->isPotentialInSituRender()
@@ -156,11 +156,14 @@ ResultSetPtr QueryExecutionContext::getRowSet(
   CHECK(query_buffers_);
   const auto group_by_buffers_size = query_buffers_->getNumBuffers();
   if (device_type_ == ExecutorDeviceType::CPU) {
-    CHECK_EQ(size_t(1), group_by_buffers_size);
+    const size_t expected_num_buffers = query_mem_desc.hasVarlenOutput() ? 2 : 1;
+    CHECK_EQ(expected_num_buffers, group_by_buffers_size);
     return groupBufferToResults(0);
   }
-  size_t step{query_mem_desc_.threadsShareMemory() ? executor_->blockSize() : 1};
-  for (size_t i = 0; i < group_by_buffers_size; i += step) {
+  const size_t step{query_mem_desc_.threadsShareMemory() ? executor_->blockSize() : 1};
+  const size_t group_by_output_buffers_size =
+      group_by_buffers_size - (query_mem_desc.hasVarlenOutput() ? 1 : 0);
+  for (size_t i = 0; i < group_by_output_buffers_size; i += step) {
     results_per_sm.emplace_back(groupBufferToResults(i), std::vector<size_t>{});
   }
   CHECK(device_type_ == ExecutorDeviceType::GPU);
@@ -297,16 +300,14 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
                                                             can_sort_on_gpu,
                                                             output_columnar_,
                                                             render_allocator);
-    if (ra_exe_unit.use_bump_allocator) {
-      const auto max_matched = static_cast<int32_t>(gpu_group_by_buffers.entry_count);
-      copy_to_gpu(data_mgr,
-                  kernel_params[MAX_MATCHED],
-                  &max_matched,
-                  sizeof(max_matched),
-                  device_id);
-    }
+    const auto max_matched = static_cast<int32_t>(gpu_group_by_buffers.entry_count);
+    copy_to_gpu(data_mgr,
+                kernel_params[MAX_MATCHED],
+                &max_matched,
+                sizeof(max_matched),
+                device_id);
 
-    kernel_params[GROUPBY_BUF] = gpu_group_by_buffers.first;
+    kernel_params[GROUPBY_BUF] = gpu_group_by_buffers.ptrs;
     std::vector<void*> param_ptrs;
     for (auto& param : kernel_params) {
       param_ptrs.push_back(&param);
@@ -566,6 +567,20 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
                   device_id);
   }
 
+  const auto varlen_output_gpu_buf = query_buffers_->getVarlenOutputPtr();
+  if (varlen_output_gpu_buf) {
+    CHECK(query_mem_desc_.varlenOutputBufferElemSize());
+    const size_t varlen_output_buf_bytes =
+        query_mem_desc_.getEntryCount() *
+        query_mem_desc_.varlenOutputBufferElemSize().value();
+    CHECK(query_buffers_->getVarlenOutputHostPtr());
+    copy_from_gpu(data_mgr,
+                  query_buffers_->getVarlenOutputHostPtr(),
+                  varlen_output_gpu_buf,
+                  varlen_output_buf_bytes,
+                  device_id);
+  }
+
   if (g_enable_dynamic_watchdog || (allow_runtime_interrupt && !render_allocator)) {
     cuEventRecord(stop2, 0);
     cuEventSynchronize(stop2);
@@ -592,7 +607,8 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
     const int32_t scan_limit,
     int32_t* error_code,
     const uint32_t num_tables,
-    const std::vector<int64_t>& join_hash_tables) {
+    const std::vector<int64_t>& join_hash_tables,
+    const int64_t num_rows_to_process) {
   auto timer = DEBUG_TIMER(__func__);
   INJECT_TIMER(lauchCpuCode);
 
@@ -612,8 +628,12 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
   const bool is_group_by{query_mem_desc_.isGroupBy()};
   std::vector<int64_t*> out_vec;
   if (ra_exe_unit.estimator) {
-    estimator_result_set_.reset(
-        new ResultSet(ra_exe_unit.estimator, ExecutorDeviceType::CPU, 0, nullptr));
+    // Subfragments collect the result from multiple runs in a single
+    // result set.
+    if (!estimator_result_set_) {
+      estimator_result_set_.reset(
+          new ResultSet(ra_exe_unit.estimator, ExecutorDeviceType::CPU, 0, nullptr));
+    }
     out_vec.push_back(
         reinterpret_cast<int64_t*>(estimator_result_set_->getHostEstimatorBuffer()));
   } else {
@@ -636,8 +656,14 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
         flatened_frag_offsets.end(), offsets.begin(), offsets.end());
   }
   int64_t rowid_lookup_num_rows{*error_code ? *error_code + 1 : 0};
-  auto num_rows_ptr =
-      rowid_lookup_num_rows ? &rowid_lookup_num_rows : &flatened_num_rows[0];
+  int64_t* num_rows_ptr;
+  if (num_rows_to_process > 0) {
+    flatened_num_rows[0] = num_rows_to_process;
+    num_rows_ptr = flatened_num_rows.data();
+  } else {
+    num_rows_ptr =
+        rowid_lookup_num_rows ? &rowid_lookup_num_rows : flatened_num_rows.data();
+  }
   int32_t total_matched_init{0};
 
   std::vector<int64_t> cmpt_val_buff;

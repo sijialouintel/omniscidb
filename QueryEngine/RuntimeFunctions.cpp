@@ -240,6 +240,15 @@ DEF_UMINUS_NULLABLE(double, double)
     return operand == from_null_val ? to_null_val : operand;                   \
   }
 
+#define DEF_CAST_SCALED_NULLABLE(from_type, to_type)                                  \
+  extern "C" ALWAYS_INLINE to_type cast_##from_type##_to_##to_type##_scaled_nullable( \
+      const from_type operand,                                                        \
+      const from_type from_null_val,                                                  \
+      const to_type to_null_val,                                                      \
+      const to_type multiplier) {                                                     \
+    return operand == from_null_val ? to_null_val : multiplier * operand;             \
+  }
+
 #define DEF_CAST_NULLABLE_BIDIR(type1, type2) \
   DEF_CAST_NULLABLE(type1, type2)             \
   DEF_CAST_NULLABLE(type2, type1)
@@ -261,8 +270,11 @@ DEF_CAST_NULLABLE_BIDIR(double, int32_t)
 DEF_CAST_NULLABLE_BIDIR(double, int64_t)
 DEF_CAST_NULLABLE(uint8_t, int32_t)
 DEF_CAST_NULLABLE(uint16_t, int32_t)
+DEF_CAST_SCALED_NULLABLE(int64_t, float)
+DEF_CAST_SCALED_NULLABLE(int64_t, double)
 
 #undef DEF_CAST_NULLABLE_BIDIR
+#undef DEF_CAST_SCALED_NULLABLE
 #undef DEF_CAST_NULLABLE
 
 extern "C" ALWAYS_INLINE int8_t logical_not(const int8_t operand, const int8_t null_val) {
@@ -374,6 +386,16 @@ extern "C" ALWAYS_INLINE void agg_min(int64_t* agg, const int64_t val) {
 
 extern "C" ALWAYS_INLINE void agg_id(int64_t* agg, const int64_t val) {
   *agg = val;
+}
+
+extern "C" ALWAYS_INLINE int8_t* agg_id_varlen(int8_t* varlen_buffer,
+                                               const int64_t offset,
+                                               const int8_t* value,
+                                               const int64_t size_bytes) {
+  for (auto i = 0; i < size_bytes; i++) {
+    varlen_buffer[offset + i] = value[i];
+  }
+  return &varlen_buffer[offset];
 }
 
 extern "C" ALWAYS_INLINE int32_t checked_single_agg_id(int64_t* agg,
@@ -805,6 +827,13 @@ DEF_SHARED_AGG_STUBS(agg_max)
 DEF_SHARED_AGG_STUBS(agg_min)
 DEF_SHARED_AGG_STUBS(agg_id)
 
+extern "C" GPU_RT_STUB int8_t* agg_id_varlen_shared(int8_t* varlen_buffer,
+                                                    const int64_t offset,
+                                                    const int8_t* value,
+                                                    const int64_t size_bytes) {
+  return nullptr;
+}
+
 extern "C" GPU_RT_STUB int32_t checked_single_agg_id_shared(int64_t* agg,
                                                             const int64_t val,
                                                             const int64_t null_val) {
@@ -1186,6 +1215,7 @@ extern "C" ALWAYS_INLINE void set_matching_group_value_perfect_hash_columnar(
   }
 }
 
+#include "GeoOpsRuntime.cpp"
 #include "GroupByRuntime.cpp"
 #include "JoinHashTable/Runtime/JoinHashTableQueryRuntime.cpp"
 
@@ -1311,7 +1341,7 @@ extern "C" NEVER_INLINE void linear_probabilistic_count(uint8_t* bitmap,
                                                         const uint32_t bitmap_bytes,
                                                         const uint8_t* key_bytes,
                                                         const uint32_t key_len) {
-  const uint32_t bit_pos = MurmurHash1(key_bytes, key_len, 0) % (bitmap_bytes * 8);
+  const uint32_t bit_pos = MurmurHash3(key_bytes, key_len, 0) % (bitmap_bytes * 8);
   const uint32_t word_idx = bit_pos / 32;
   const uint32_t bit_idx = bit_pos % 32;
   reinterpret_cast<uint32_t*>(bitmap)[word_idx] |= 1 << bit_idx;

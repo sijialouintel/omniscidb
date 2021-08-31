@@ -22,7 +22,6 @@ import com.mapd.parser.extension.ddl.omnisci.OmniSciSqlDataTypeSpec;
 import org.apache.calcite.schema.ColumnStrategy;
 import org.apache.calcite.sql.SqlCollation;
 import org.apache.calcite.sql.SqlDataTypeSpec;
-import org.apache.calcite.sql.SqlDrop;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
@@ -38,13 +37,14 @@ public class SqlDdlNodes {
   /** Creates a CREATE TABLE. */
   public static SqlCreateTable createTable(SqlParserPos pos,
           boolean replace,
+          boolean temporary,
           boolean ifNotExists,
           SqlIdentifier name,
           SqlNodeList columnList,
           OmniSciOptionsMap withOptions,
           SqlNode query) {
     return new SqlCreateTable(
-            pos, replace, ifNotExists, name, columnList, withOptions, query);
+            pos, replace, temporary, ifNotExists, name, columnList, withOptions, query);
   }
 
   /** Creates a CREATE VIEW. */
@@ -61,9 +61,9 @@ public class SqlDdlNodes {
   public static SqlNode column(SqlParserPos pos,
           SqlIdentifier name,
           OmniSciSqlDataTypeSpec dataType,
-          SqlNode expression,
+          SqlNode defaultValue,
           ColumnStrategy strategy) {
-    return new SqlColumnDeclaration(pos, name, dataType, expression, strategy);
+    return new SqlColumnDeclaration(pos, name, dataType, defaultValue, strategy);
   }
 
   /** Creates an attribute definition. */

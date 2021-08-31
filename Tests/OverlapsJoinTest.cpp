@@ -207,6 +207,18 @@ TargetValue execSQL(const std::string& stmt,
   return crt_row[0];
 }
 
+TargetValue execSQLWithAllowLoopJoin(const std::string& stmt,
+                                     const ExecutorDeviceType dt,
+                                     const bool geo_return_geo_tv = true) {
+  auto rows = QR::get()->runSQL(stmt, dt, true, true);
+  if (geo_return_geo_tv) {
+    rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
+  }
+  auto crt_row = rows->getNextRow(true, true);
+  CHECK_EQ(size_t(1), crt_row.size()) << stmt;
+  return crt_row[0];
+}
+
 TEST_F(OverlapsTest, SimplePointInPolyIntersects) {
   executeAllScenarios([](ExecutorDeviceType dt) -> void {
     const auto sql =
@@ -431,6 +443,24 @@ TEST_F(OverlapsTest, JoinPolyPointContains) {
   });
 }
 
+TEST_F(OverlapsTest, JoinPolyCentroidContains) {
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    auto sql =
+        "SELECT "
+        "count(*) from "
+        "does_intersect_b as b JOIN does_intersect_a as a ON "
+        "ST_Contains(a.poly, ST_SetSRID(ST_Centroid(b.poly), 4326));";
+    ASSERT_EQ(static_cast<int64_t>(1), v<int64_t>(execSQL(sql, dt)));
+
+    sql =
+        "SELECT "
+        "count(*) from "
+        "does_intersect_b as b JOIN does_intersect_a as a ON "
+        "ST_Contains(a.poly, ST_SetSRID(ST_Centroid(b.mpoly), 4326));";
+    ASSERT_EQ(static_cast<int64_t>(1), v<int64_t>(execSQL(sql, dt)));
+  });
+}
+
 TEST_F(OverlapsTest, PolyPolyDoesNotIntersect) {
   executeAllScenarios([](ExecutorDeviceType dt) -> void {
     ASSERT_EQ(static_cast<int64_t>(0),
@@ -647,15 +677,17 @@ class OverlapsJoinHashTableMock : public OverlapsJoinHashTable {
                             Executor* executor,
                             const int device_count,
                             const std::vector<ExpectedValues>& expected_values)
-      : OverlapsJoinHashTable(condition,
-                              query_infos,
-                              memory_level,
-                              column_cache,
-                              executor,
-                              normalize_column_pairs(condition.get(),
-                                                     *executor->getCatalog(),
-                                                     executor->getTemporaryTables()),
-                              device_count)
+      : OverlapsJoinHashTable(
+            condition,
+            JoinType::INVALID,  // b/c this is mock
+            query_infos,
+            memory_level,
+            column_cache,
+            executor,
+            HashJoin::normalizeColumnPairs(condition.get(),
+                                           *executor->getCatalog(),
+                                           executor->getTemporaryTables()),
+            device_count)
       , expected_values_per_step_(expected_values) {}
 
  protected:
@@ -837,6 +869,738 @@ TEST_F(BucketSizeTest, OverlapsTooBig) {
                                              expected_values));
 }
 
+void populateTablesForVarlenLinearizationTest() {
+  {
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfgeo;");  // non-null geo col val
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfgeo;");  // non-null geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS mfgeo_n;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS sfgeo_n;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfgeo3;");  // non-null geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS mfgeo3_n;");  // contains null-valued geo col val
+
+    auto table_ddl =
+        " (id INTEGER,\n"
+        "  gpt GEOMETRY(POINT),\n"
+        "  gpt4e GEOMETRY(POINT, 4326) ENCODING COMPRESSED(32),\n"
+        "  gpt4n GEOMETRY(POINT, 4326) ENCODING NONE,\n"
+        "  gl GEOMETRY(LINESTRING),\n"
+        "  gl4e GEOMETRY(LINESTRING, 4326) ENCODING COMPRESSED(32),\n"
+        "  gl4n GEOMETRY(LINESTRING, 4326) ENCODING NONE,\n"
+        "  gp GEOMETRY(POLYGON),\n"
+        "  gp4e GEOMETRY(POLYGON, 4326) ENCODING COMPRESSED(32),\n"
+        "  gp4n GEOMETRY(POLYGON, 4326) ENCODING NONE,\n"
+        "  gmp GEOMETRY(MULTIPOLYGON),\n"
+        "  gmp4e GEOMETRY(MULTIPOLYGON, 4326) ENCODING COMPRESSED(32),\n"
+        "  gmp4n GEOMETRY(MULTIPOLYGON, 4326) ENCODING NONE)";
+
+    auto create_table_ddl_gen = [&table_ddl](const std::string& tbl_name,
+                                             const bool multi_frag,
+                                             const int fragment_size = 2) {
+      std::ostringstream oss;
+      oss << "CREATE TABLE " << tbl_name << table_ddl;
+      if (multi_frag) {
+        oss << " WITH (FRAGMENT_SIZE = " << fragment_size << ")";
+      }
+      oss << ";";
+      return oss.str();
+    };
+
+    QR::get()->runDDLStatement(create_table_ddl_gen("mfgeo", true, 2));
+    QR::get()->runDDLStatement(create_table_ddl_gen("sfgeo", false));
+    QR::get()->runDDLStatement(create_table_ddl_gen("mfgeo_n", true, 2));
+    QR::get()->runDDLStatement(create_table_ddl_gen("sfgeo_n", false));
+
+    QR::get()->runDDLStatement(create_table_ddl_gen("mfgeo3", true, 3));
+    QR::get()->runDDLStatement(create_table_ddl_gen("mfgeo3_n", true, 3));
+
+    std::vector<std::vector<std::string>> input_val_non_nullable;
+    input_val_non_nullable.push_back({"0",
+                                      "\'POINT(0 0)\'",
+                                      "\'LINESTRING(0 0,1 0)\'",
+                                      "\'POLYGON((0 0,1 0,1 1,0 1,0 0))\'",
+                                      "\'MULTIPOLYGON(((0 0,1 0,1 1,0 1,0 0)))\'"});
+    input_val_non_nullable.push_back({"1",
+                                      "\'POINT(1 1)\'",
+                                      "\'LINESTRING(2 0,4 4)\'",
+                                      "\'POLYGON((0 0,2 0,0 2,0 0))\'",
+                                      "\'MULTIPOLYGON(((0 0,2 0,0 2,0 0)))\'"});
+    input_val_non_nullable.push_back(
+        {"2",
+         "\'POINT(2 2)\'",
+         "\'LINESTRING(1 0,2 2,3 3)\'",
+         "\'POLYGON((0 0,2 0,3 0,3 3,0 3,1 0,0 0))\'",
+         "\'MULTIPOLYGON(((0 0,2 0,3 0,3 3,0 3,1 0,0 0)))\'"});
+    input_val_non_nullable.push_back({"3",
+                                      "\'POINT(3 3)\'",
+                                      "\'LINESTRING(3 0,6 6,7 7)\'",
+                                      "\'POLYGON((0 0,4 0,0 4,0 0))\'",
+                                      "\'MULTIPOLYGON(((0 0,4 0,0 4,0 0)))\'"});
+    input_val_non_nullable.push_back(
+        {"4",
+         "\'POINT(4 4)\'",
+         "\'LINESTRING(1 0,2 2,3 3)\'",
+         "\'POLYGON((0 0,5 0,0 5,0 0))\'",
+         "\'MULTIPOLYGON(((0 0,2 0,3 0,3 3,0 3,1 0,0 0)))\'"});
+    input_val_non_nullable.push_back({"5",
+                                      "\'POINT(5 5)\'",
+                                      "\'LINESTRING(6 0, 12 12)\'",
+                                      "\'POLYGON((0 0,6 0,0 6,0 0))\'",
+                                      "\'MULTIPOLYGON(((0 0,6 0,0 6,0 0)))\'"});
+    input_val_non_nullable.push_back(
+        {"6",
+         "\'POINT(6 6)\'",
+         "\'LINESTRING(1 0,2 2,3 3)\'",
+         "\'POLYGON((0 0,1 1,3 0,4 1,7 0,0 7,0 4,0 1,0 0))\'",
+         "\'MULTIPOLYGON(((0 0,1 1,3 0,4 1,7 0,0 7,0 4,0 1,0 0)))\'"});
+    input_val_non_nullable.push_back({"7",
+                                      "\'POINT(7 7)\'",
+                                      "\'LINESTRING(7 0,14 14,15 15)\'",
+                                      "\'POLYGON((0 0,8 0,0 8,0 0))\'",
+                                      "\'MULTIPOLYGON(((0 0,8 0,0 8,0 0)))\'"});
+    input_val_non_nullable.push_back({"8",
+                                      "\'POINT(8 8)\'",
+                                      "\'LINESTRING(8 0,16 16)\'",
+                                      "\'POLYGON((0 0,9 0,0 9,0 0))\'",
+                                      "\'MULTIPOLYGON(((0 0,9 0,0 9,0 0)))\'"});
+    input_val_non_nullable.push_back(
+        {"9",
+         "\'POINT(9 9)\'",
+         "\'LINESTRING(9 0,18 18,19 19)\'",
+         "\'POLYGON((0 0,5 0,10 0,10 5,10 10,0 10,0 3,0 1,0 0))\'",
+         "\'MULTIPOLYGON(((0 0,5 0,10 0,10 5,10 10,0 10,0 3,0 1,0 0)))\'"});
+
+    std::vector<std::vector<std::string>> input_val_nullable;
+    input_val_nullable.push_back({"0",
+                                  "\'POINT(0 0)\'",
+                                  "\'NULL\'",
+                                  "\'POLYGON((0 0,1 0,1 1,0 1,0 0))\'",
+                                  "\'NULL\'"});
+    input_val_nullable.push_back({"1",
+                                  "\'POINT(1 1)\'",
+                                  "\'LINESTRING(2 0,4 4)\'",
+                                  "\'NULL\'",
+                                  "\'MULTIPOLYGON(((0 0,2 0,0 2,0 0)))\'"});
+    input_val_nullable.push_back({"2",
+                                  "\'NULL\'",
+                                  "\'LINESTRING(1 0,2 2,3 3)\'",
+                                  "\'POLYGON((0 0,2 0,3 0,3 3,0 3,1 0,0 0))\'",
+                                  "\'MULTIPOLYGON(((0 0,2 0,3 0,3 3,0 3,1 0,0 0)))\'"});
+    input_val_nullable.push_back({"3",
+                                  "\'POINT(3 3)\'",
+                                  "\'LINESTRING(3 0,6 6,7 7)\'",
+                                  "\'POLYGON((0 0,4 0,0 4,0 0))\'",
+                                  "\'NULL\'"});
+    input_val_nullable.push_back({"4",
+                                  "\'POINT(4 4)\'",
+                                  "\'LINESTRING(1 0,2 2,3 3)\'",
+                                  "\'POLYGON((0 0,5 0,0 5,0 0))\'",
+                                  "\'MULTIPOLYGON(((0 0,2 0,3 0,3 3,0 3,1 0,0 0)))\'"});
+    input_val_nullable.push_back({"5",
+                                  "\'NULL\'",
+                                  "\'LINESTRING(6 0, 12 12)\'",
+                                  "\'POLYGON((0 0,6 0,0 6,0 0))\'",
+                                  "\'MULTIPOLYGON(((0 0,6 0,0 6,0 0)))\'"});
+    input_val_nullable.push_back(
+        {"6",
+         "\'POINT(6 6)\'",
+         "\'LINESTRING(1 0,2 2,3 3)\'",
+         "\'POLYGON((0 0,1 1,3 0,4 1,7 0,0 7,0 4,0 1,0 0))\'",
+         "\'MULTIPOLYGON(((0 0,1 1,3 0,4 1,7 0,0 7,0 4,0 1,0 0)))\'"});
+    input_val_nullable.push_back({"7",
+                                  "\'POINT(7 7)\'",
+                                  "\'NULL\'",
+                                  "\'POLYGON((0 0,8 0,0 8,0 0))\'",
+                                  "\'MULTIPOLYGON(((0 0,8 0,0 8,0 0)))\'"});
+    input_val_nullable.push_back({"8",
+                                  "\'POINT(8 8)\'",
+                                  "\'LINESTRING(8 0,16 16)\'",
+                                  "\'NULL\'",
+                                  "\'MULTIPOLYGON(((0 0,9 0,0 9,0 0)))\'"});
+    input_val_nullable.push_back(
+        {"9",
+         "\'POINT(9 9)\'",
+         "\'LINESTRING(9 0,18 18,19 19)\'",
+         "\'POLYGON((0 0,5 0,10 0,10 5,10 10,0 10,0 3,0 1,0 0))\'",
+         "\'MULTIPOLYGON(((0 0,5 0,10 0,10 5,10 10,0 10,0 3,0 1,0 0)))\'"});
+
+    auto insert_stmt_gen = [](const std::vector<std::vector<std::string>>& input_col_vals,
+                              const std::string& tbl_name) {
+      for (auto& vec : input_col_vals) {
+        int type_idx = 0;
+        size_t num_rows = 0;
+        std::ostringstream oss;
+        oss << "INSERT INTO " << tbl_name << " VALUES(";
+        std::vector<std::string> vals;
+        for (auto& val : vec) {
+          switch (type_idx) {
+            case 0: {  // ID
+              num_rows = 1;
+              break;
+            }
+            case 1:    // POINT
+            case 2:    // LINESTRING
+            case 3:    // POLYGON
+            case 4: {  // MULTIPOLYGON
+              num_rows = 3;
+              break;
+            }
+            default:
+              break;
+          }
+          for (size_t i = 0; i < num_rows; i++) {
+            vals.push_back(val);
+          }
+          type_idx++;
+        }
+        auto val_str = boost::join(vals, ",");
+        oss << val_str << ");";
+        QR::get()->runSQL(oss.str(), ExecutorDeviceType::CPU);
+      }
+    };
+
+    insert_stmt_gen(input_val_non_nullable, "mfgeo");
+    insert_stmt_gen(input_val_non_nullable, "sfgeo");
+    insert_stmt_gen(input_val_nullable, "mfgeo_n");
+    insert_stmt_gen(input_val_nullable, "sfgeo_n");
+
+    insert_stmt_gen(input_val_non_nullable, "mfgeo3");
+    insert_stmt_gen(input_val_nullable, "mfgeo3_n");
+
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfgeo_n_v2;");
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfgeo_n_v2;");
+    QR::get()->runDDLStatement(
+        "CREATE TABLE sfgeo_n_v2 (pt GEOMETRY(POINT, 4326), l GEOMETRY(LINESTRING, "
+        "4326), p GEOMETRY(POLYGON, 4326), mp GEOMETRY(MULTIPOLYGON, 4326));");
+    QR::get()->runDDLStatement(
+        "CREATE TABLE mfgeo_n_v2 (pt GEOMETRY(POINT, 4326), l GEOMETRY(LINESTRING, "
+        "4326), p GEOMETRY(POLYGON, 4326), mp GEOMETRY(MULTIPOLYGON, 4326)) WITH "
+        "(FRAGMENT_SIZE = 5);");
+
+    auto insert_dml_specialized_null_test = [](const std::string& tbl_name) {
+      std::vector<std::string> dml_vec;
+      auto common_part = "INSERT INTO " + tbl_name + " VALUES (";
+      auto null = "NULL,NULL,NULL,NULL";
+      auto v = [](int i) { return i % 90; };
+      auto gpt = [&v](int i) {
+        std::ostringstream oss;
+        oss << "\'POINT(" << v(i) << " " << v(i) << ")\'";
+        return oss.str();
+      };
+      auto gl = [&v](int i) {
+        std::ostringstream oss;
+        if (i % 3 == 1) {
+          oss << "\'LINESTRING(0 0," << v(i) << " 0," << v(i + 2) << " " << v(i + 2)
+              << "," << v(3 * i) << " " << v(2 * i) << ",0 " << v(i) << ")\'";
+        } else if (i % 3 == 2) {
+          oss << "\'LINESTRING(" << v(i) << " 0,0 " << v(i) << ")\'";
+        } else {
+          oss << "\'LINESTRING(0 0," << v(i) << " 0," << v(i) << " " << v(i) << ",0 "
+              << v(i) << ")\'";
+        }
+        return oss.str();
+      };
+      auto gp = [&v](int i) {
+        std::ostringstream oss;
+        if (i % 3 == 1) {
+          oss << "\'POLYGON((0 0," << v(i) << " 0," << v(i + 2) << " " << v(i + 2) << ","
+              << v(3 * i) << " " << v(2 * i) << ",0 " << v(i) << ",0 0))\'";
+        } else if (i % 3 == 2) {
+          oss << "\'POLYGON((0 0," << v(i) << " 0,0 " << v(i) << ",0 0))\'";
+        } else {
+          oss << "\'POLYGON((" << v(i) << " 0," << v(i) << " " << v(i) << ",0 " << v(i)
+              << "))\'";
+        }
+        return oss.str();
+      };
+      auto gmp = [&v](int i) {
+        std::ostringstream oss;
+        if (i % 3 == 1) {
+          oss << "\'MULTIPOLYGON(((0 0," << v(i) << " 0," << v(i + 2) << " " << v(i + 2)
+              << "," << v(3 * i) << " " << v(2 * i) << ",0 " << v(i) << ",0 0)))\'";
+        } else if (i % 3 == 2) {
+          oss << "\'MULTIPOLYGON(((0 0," << v(i) << " 0,0 " << v(i) << ",0 0)))\'";
+        } else {
+          oss << "\'MULTIPOLYGON(((" << v(i) << " 0," << v(i) << " " << v(i) << ",0 "
+              << v(i) << ")))\'";
+        }
+        return oss.str();
+      };
+      auto g = [&gpt, &gl, &gp, &gmp, &null, &common_part](const int i, bool null_row) {
+        std::ostringstream oss;
+        oss << common_part;
+        if (null_row) {
+          oss << null << ");";
+        } else {
+          oss << gpt(i) << "," << gl(i) << "," << gp(i) << "," << gmp(i) << ");";
+        }
+        return oss.str();
+      };
+      int i = 1;
+      // create length-5 bitstring corresponding to 0 ~ 31: 00000, 00001, ... , 11110,
+      // 11111 where 1's position indicates a row having null value among five rows we
+      // specify a fragment_size as five, so a chunk of bitstring 00010 means its fourth
+      // row contains null value
+      for (int chunk_idx = 0; chunk_idx < 32; chunk_idx++) {
+        std::string str = std::bitset<5>(chunk_idx).to_string();
+        for (int row_idx = 0; row_idx < 5; row_idx++, i++) {
+          bool null_row = str.at(row_idx) == '1';
+          if (null_row) {
+            dml_vec.push_back(g(0, true));
+          } else {
+            dml_vec.push_back(g(i, false));
+          }
+        }
+      }
+      for (auto& insert_dml : dml_vec) {
+        QR::get()->runSQL(insert_dml, ExecutorDeviceType::CPU);
+      }
+    };
+    insert_dml_specialized_null_test("sfgeo_n_v2");
+    insert_dml_specialized_null_test("mfgeo_n_v2");
+  }
+
+  {
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfgeo_p;");  // non-null geo col val
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfgeo_p;");  // non-null geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS mfgeo_n_p;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS sfgeo_n_p;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS mfgeo_n2_p;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS sfgeo_n2_p;");  // contains null-valued geo col val
+
+    auto table_ddl =
+        " (pt GEOMETRY(POINT, 4326),\n"
+        "  l GEOMETRY(LINESTRING, 4326),\n"
+        "  p GEOMETRY(POLYGON, 4326),\n"
+        "  mp GEOMETRY(MULTIPOLYGON, 4326))";
+
+    auto create_table_ddl_gen = [&table_ddl](const std::string& tbl_name,
+                                             const bool multi_frag,
+                                             const int fragment_size = 100) {
+      std::ostringstream oss;
+      oss << "CREATE TABLE " << tbl_name << table_ddl;
+      if (multi_frag) {
+        oss << " WITH (FRAGMENT_SIZE = " << fragment_size << ")";
+      }
+      oss << ";";
+      return oss.str();
+    };
+
+    QR::get()->runDDLStatement(create_table_ddl_gen("mfgeo_p", true));
+    QR::get()->runDDLStatement(create_table_ddl_gen("sfgeo_p", false));
+    QR::get()->runDDLStatement(create_table_ddl_gen("mfgeo_n_p", true));
+    QR::get()->runDDLStatement(create_table_ddl_gen("sfgeo_n_p", false));
+    QR::get()->runDDLStatement(create_table_ddl_gen("mfgeo_n2_p", true));
+    QR::get()->runDDLStatement(create_table_ddl_gen("sfgeo_n2_p", false));
+
+    auto insert_table = [](const std::string& tbl_name,
+                           int num_tuples,
+                           int frag_size,
+                           bool allow_null,
+                           bool first_frag_row_null) {
+      std::vector<std::string> dml_vec;
+      auto common_part = "INSERT INTO " + tbl_name + " VALUES (";
+      auto null = "NULL,NULL,NULL,NULL";
+      auto v = [](int i) { return i % 90; };
+      auto gpt = [&v](int i) {
+        std::ostringstream oss;
+        oss << "\'POINT(" << v(i) << " " << v(i) << ")\'";
+        return oss.str();
+      };
+      auto gl = [&v](int i) {
+        std::ostringstream oss;
+        if (i % 3 == 1) {
+          oss << "\'LINESTRING(0 0," << v(i) << " 0," << v(i + 2) << " " << v(i + 2)
+              << "," << v(3 * i) << " " << v(2 * i) << ",0 " << v(i) << ")\'";
+        } else if (i % 3 == 2) {
+          oss << "\'LINESTRING(" << v(i) << " 0,0 " << v(i) << ")\'";
+        } else {
+          oss << "\'LINESTRING(0 0," << v(i) << " 0," << v(i) << " " << v(i) << ",0 "
+              << v(i) << ")\'";
+        }
+        return oss.str();
+      };
+      auto gp = [&v](int i) {
+        std::ostringstream oss;
+        if (i % 3 == 1) {
+          oss << "\'POLYGON((0 0," << v(i) << " 0," << v(i + 2) << " " << v(i + 2) << ","
+              << v(3 * i) << " " << v(2 * i) << ",0 " << v(i) << ",0 0))\'";
+        } else if (i % 3 == 2) {
+          oss << "\'POLYGON((0 0," << v(i) << " 0,0 " << v(i) << ",0 0))\'";
+        } else {
+          oss << "\'POLYGON((0 0," << v(i) << " 0," << v(i) << " " << v(i) << ",0 "
+              << v(i) << ",0 0))\'";
+        }
+        return oss.str();
+      };
+      auto gmp = [&v](int i) {
+        std::ostringstream oss;
+        if (i % 3 == 1) {
+          oss << "\'MULTIPOLYGON(((0 0," << v(i) << " 0," << v(i + 2) << " " << v(i + 2)
+              << "," << v(3 * i) << " " << v(2 * i) << ",0 " << v(i) << ",0 0)))\'";
+        } else if (i % 3 == 2) {
+          oss << "\'MULTIPOLYGON(((0 0," << v(i) << " 0,0 " << v(i) << ",0 0)))\'";
+        } else {
+          oss << "\'MULTIPOLYGON(((0 0," << v(i) << " 0," << v(i) << " " << v(i) << ",0 "
+              << v(i) << ",0 0)))\'";
+        }
+        return oss.str();
+      };
+      auto g = [&gpt, &gl, &gp, &gmp, &null, &common_part](const int i, bool null_row) {
+        std::ostringstream oss;
+        oss << common_part;
+        if (null_row) {
+          oss << null << ");";
+        } else {
+          oss << gpt(i) << "," << gl(i) << "," << gp(i) << "," << gmp(i) << ");";
+        }
+        return oss.str();
+      };
+
+      if (allow_null) {
+        for (int i = 0; i < num_tuples; i++) {
+          if ((first_frag_row_null && (i % frag_size) == 0) || (i % 17 == 5)) {
+            dml_vec.push_back(g(0, true));
+          } else {
+            dml_vec.push_back(g(i, false));
+          }
+        }
+      } else {
+        for (int i = 0; i < num_tuples; i++) {
+          dml_vec.push_back(g(i, false));
+        }
+      }
+      for (auto& insert_dml : dml_vec) {
+        QR::get()->runSQL(insert_dml, ExecutorDeviceType::CPU);
+      }
+    };
+    insert_table("sfgeo_p", 300, 100, false, false);
+    insert_table("mfgeo_p", 300, 100, false, false);
+    insert_table("sfgeo_n_p", 300, 100, true, true);
+    insert_table("mfgeo_n_p", 300, 100, true, true);
+    insert_table("sfgeo_n2_p", 300, 100, true, false);
+    insert_table("mfgeo_n2_p", 300, 100, true, false);
+  }
+}
+
+void dropTablesForVarlenLinearizationTest() {
+  {
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfgeo;");  // non-null geo col val
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfgeo;");  // non-null geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS mfgeo_n;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS sfgeo_n;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfgeo3;");  // non-null geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS mfgeo3_n;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfgeo_n_v2;");
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfgeo_n_v2;");
+  }
+
+  {
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfgeo_p;");  // non-null geo col val
+    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfgeo_p;");  // non-null geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS mfgeo_n_p;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS sfgeo_n_p;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS mfgeo_n2_p;");  // contains null-valued geo col val
+    QR::get()->runDDLStatement(
+        "DROP TABLE IF EXISTS sfgeo_n2_p;");  // contains null-valued geo col val
+  }
+}
+
+class MultiFragGeoOverlapsJoinTest : public ::testing::Test {
+ protected:
+  void SetUp() override {}
+  void TearDown() override {}
+};
+
+TEST_F(MultiFragGeoOverlapsJoinTest, Point) {
+  // point - point by stwithin
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    std::vector<std::string> cols{"gpt", "gpt4e", "gpt4n"};
+    int64_t single_frag_res = 10;
+    auto execute_tests = [&](std::vector<std::string>& col_names) {
+      for (auto& c : col_names) {
+        std::ostringstream mq1, mq2;
+        mq1 << "SELECT COUNT(1) FROM mfgeo s, mfgeo r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        mq2 << "SELECT COUNT(1) FROM mfgeo3 s, mfgeo3 r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+        auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+        ASSERT_EQ(single_frag_res, multi_frag_res1) << mq1.str();
+        ASSERT_EQ(single_frag_res, multi_frag_res2) << mq2.str();
+      }
+    };
+    execute_tests(cols);
+  });
+}
+
+TEST_F(MultiFragGeoOverlapsJoinTest, Linestring) {
+  // linestring - polygon by st_intersect
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    std::vector<std::string> cols{"gl", "gl4e", "gl4n"};
+    int64_t single_frag_res = 22;
+    auto execute_tests = [&](std::vector<std::string>& col_names) {
+      for (auto& c : col_names) {
+        std::ostringstream mq1, mq2;
+        mq1 << "SELECT COUNT(1) FROM mfgeo s, mfgeo r WHERE ST_INTERSECTS(s." << c
+            << ", r." << c << ");";
+        mq2 << "SELECT COUNT(1) FROM mfgeo3 s, mfgeo3 r WHERE ST_INTERSECTS(s." << c
+            << ", r." << c << ");";
+        auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+        auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+        ASSERT_EQ(single_frag_res, multi_frag_res1) << mq1.str();
+        ASSERT_EQ(single_frag_res, multi_frag_res2) << mq2.str();
+      }
+    };
+    execute_tests(cols);
+  });
+}
+
+TEST_F(MultiFragGeoOverlapsJoinTest, Polygon) {
+  // polygon - point by st_intersects
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    std::vector<std::string> cols{"gp", "gp4e", "gp4n"};
+    int64_t single_frag_res = 100;
+    auto execute_tests = [&](std::vector<std::string>& col_names) {
+      for (auto& c : col_names) {
+        std::ostringstream mq1, mq2;
+        mq1 << "SELECT COUNT(1) FROM mfgeo s, mfgeo r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        mq2 << "SELECT COUNT(1) FROM mfgeo3 s, mfgeo3 r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+        auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+        ASSERT_EQ(single_frag_res, multi_frag_res1) << mq1.str();
+        ASSERT_EQ(single_frag_res, multi_frag_res2) << mq2.str();
+      }
+    };
+    execute_tests(cols);
+  });
+}
+
+TEST_F(MultiFragGeoOverlapsJoinTest, MultiPolygon) {
+  // multipolygon - polygon by st_intersects
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    std::vector<std::string> cols{"gmp", "gmp4e", "gmp4n"};
+    int64_t single_frag_res = 100;
+    auto execute_tests = [&](std::vector<std::string>& col_names) {
+      for (auto& c : col_names) {
+        std::ostringstream mq1, mq2;
+        mq1 << "SELECT COUNT(1) FROM mfgeo s, mfgeo r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        mq2 << "SELECT COUNT(1) FROM mfgeo3 s, mfgeo3 r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+        auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+        ASSERT_EQ(single_frag_res, multi_frag_res1) << mq1.str();
+        ASSERT_EQ(single_frag_res, multi_frag_res2) << mq2.str();
+      }
+    };
+    execute_tests(cols);
+  });
+}
+
+TEST_F(MultiFragGeoOverlapsJoinTest, Point_Nullable) {
+  // point - point by stwithin
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    std::vector<std::string> cols{"gpt", "gpt4e", "gpt4n"};
+    int64_t single_frag_res = 8;
+    auto execute_tests = [&](std::vector<std::string>& col_names) {
+      for (auto& c : col_names) {
+        std::ostringstream mq1, mq2;
+        mq1 << "SELECT COUNT(1) FROM mfgeo_n s, mfgeo_n r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        mq2 << "SELECT COUNT(1) FROM mfgeo3_n s, mfgeo3_n r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+        auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+        ASSERT_EQ(single_frag_res, multi_frag_res1) << mq1.str();
+        ASSERT_EQ(single_frag_res, multi_frag_res2) << mq2.str();
+      }
+    };
+    execute_tests(cols);
+  });
+}
+
+TEST_F(MultiFragGeoOverlapsJoinTest, Linestring_Nullable) {
+  // linestring - polygon by st_intersect
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    std::vector<std::string> cols{"gl", "gl4e", "gl4n"};
+    int64_t single_frag_res = 14;
+    auto execute_tests = [&](std::vector<std::string>& col_names) {
+      for (auto& c : col_names) {
+        std::ostringstream mq1, mq2;
+        mq1 << "SELECT COUNT(1) FROM mfgeo_n s, mfgeo_n r WHERE ST_INTERSECTS(s." << c
+            << ", r." << c << ");";
+        mq2 << "SELECT COUNT(1) FROM mfgeo3_n s, mfgeo3_n r WHERE ST_INTERSECTS(s." << c
+            << ", r." << c << ");";
+        auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+        auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+        ASSERT_EQ(single_frag_res, multi_frag_res1) << mq1.str();
+        ASSERT_EQ(single_frag_res, multi_frag_res2) << mq2.str();
+      }
+    };
+    execute_tests(cols);
+  });
+}
+
+TEST_F(MultiFragGeoOverlapsJoinTest, Polygon_Nullable) {
+  // polygon - point by st_intersects
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    std::vector<std::string> cols{"gp", "gp4e", "gp4n"};
+    int64_t single_frag_res = 64;
+    auto execute_tests = [&](std::vector<std::string>& col_names) {
+      for (auto& c : col_names) {
+        std::ostringstream mq1, mq2;
+        mq1 << "SELECT COUNT(1) FROM mfgeo_n s, mfgeo_n r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        mq2 << "SELECT COUNT(1) FROM mfgeo3_n s, mfgeo3_n r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+        auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+        ASSERT_EQ(single_frag_res, multi_frag_res1) << mq1.str();
+        ASSERT_EQ(single_frag_res, multi_frag_res2) << mq2.str();
+      }
+    };
+    execute_tests(cols);
+  });
+}
+
+TEST_F(MultiFragGeoOverlapsJoinTest, MultiPolygon_Nullable) {
+  // multipolygon - polygon by st_intersects
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    std::vector<std::string> cols{"gmp", "gmp4e", "gmp4n"};
+    int64_t single_frag_res = 64;
+    auto execute_tests = [&](std::vector<std::string>& col_names) {
+      for (auto& c : col_names) {
+        std::ostringstream mq1, mq2;
+        mq1 << "SELECT COUNT(1) FROM mfgeo_n s, mfgeo_n r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        mq2 << "SELECT COUNT(1) FROM mfgeo3_n s, mfgeo3_n r WHERE ST_INTERSECTS(r." << c
+            << ", s." << c << ");";
+        auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+        auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+        ASSERT_EQ(single_frag_res, multi_frag_res1) << mq1.str();
+        ASSERT_EQ(single_frag_res, multi_frag_res2) << mq2.str();
+      }
+    };
+    execute_tests(cols);
+  });
+}
+
+TEST_F(MultiFragGeoOverlapsJoinTest, Nullable_Geo_Exhaustive) {
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    int64_t single_frag_res1 = 114;
+    int64_t single_frag_res2 = 5163;
+    int64_t single_frag_res3 = 2178;
+    int64_t single_frag_res4 = 2178;
+    std::ostringstream mq1, mq2, mq3, mq4;
+    mq1 << "SELECT COUNT(1) FROM mfgeo_n_v2 r, mfgeo_n_v2 s WHERE ST_INTERSECTS(r.pt, "
+           "s.pt);";
+    mq2 << "SELECT COUNT(1) FROM mfgeo_n_v2 r, mfgeo_n_v2 s WHERE ST_INTERSECTS(s.p, "
+           "r.l);";
+    mq3 << "SELECT COUNT(1) FROM mfgeo_n_v2 r, mfgeo_n_v2 s WHERE ST_INTERSECTS(r.p, "
+           "s.pt);";
+    mq4 << "SELECT COUNT(1) FROM mfgeo_n_v2 r, mfgeo_n_v2 s WHERE ST_INTERSECTS(r.mp, "
+           "s.pt);";
+    auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+    auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+    auto multi_frag_res3 = v<int64_t>(execSQLWithAllowLoopJoin(mq3.str(), dt));
+    auto multi_frag_res4 = v<int64_t>(execSQLWithAllowLoopJoin(mq4.str(), dt));
+    ASSERT_EQ(single_frag_res1, multi_frag_res1) << mq1.str();
+    ASSERT_EQ(single_frag_res2, multi_frag_res2) << mq2.str();
+    ASSERT_EQ(single_frag_res3, multi_frag_res3) << mq3.str();
+    ASSERT_EQ(single_frag_res4, multi_frag_res4) << mq4.str();
+  });
+}
+
+class ParallelLinearization : public ::testing::Test {
+ protected:
+  void SetUp() override { g_enable_parallel_linearization = 10; }
+  void TearDown() override { g_enable_parallel_linearization = 20000; }
+};
+
+TEST_F(ParallelLinearization, GeoJoin) {
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    int64_t single_frag_res1 = 1020;
+    int64_t single_frag_res2 = 80940;
+    int64_t single_frag_res3 = 38378;
+    int64_t single_frag_res4 = 38378;
+    std::ostringstream mq1, mq2, mq3, mq4;
+    mq1 << "SELECT COUNT(1) FROM mfgeo_p r, mfgeo_p s WHERE ST_INTERSECTS(r.pt, s.pt);";
+    mq2 << "SELECT COUNT(1) FROM mfgeo_p r, mfgeo_p s WHERE ST_INTERSECTS(s.p, r.l);";
+    mq3 << "SELECT COUNT(1) FROM mfgeo_p r, mfgeo_p s WHERE ST_INTERSECTS(r.p, s.pt);";
+    mq4 << "SELECT COUNT(1) FROM mfgeo_p r, mfgeo_p s WHERE ST_INTERSECTS(r.mp, s.pt);";
+    auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+    auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+    auto multi_frag_res3 = v<int64_t>(execSQLWithAllowLoopJoin(mq3.str(), dt));
+    auto multi_frag_res4 = v<int64_t>(execSQLWithAllowLoopJoin(mq4.str(), dt));
+    ASSERT_EQ(single_frag_res1, multi_frag_res1) << mq1.str();
+    ASSERT_EQ(single_frag_res2, multi_frag_res2) << mq2.str();
+    ASSERT_EQ(single_frag_res3, multi_frag_res3) << mq3.str();
+    ASSERT_EQ(single_frag_res4, multi_frag_res4) << mq4.str();
+  });
+
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    int64_t single_frag_res1 = 895;
+    int64_t single_frag_res2 = 70115;
+    int64_t single_frag_res3 = 33096;
+    int64_t single_frag_res4 = 33096;
+    std::ostringstream mq1, mq2, mq3, mq4;
+    mq1 << "SELECT COUNT(1) FROM mfgeo_n_p r, mfgeo_n_p s WHERE ST_INTERSECTS(r.pt, "
+           "s.pt);";
+    mq2 << "SELECT COUNT(1) FROM mfgeo_n_p r, mfgeo_n_p s WHERE ST_INTERSECTS(s.p, r.l);";
+    mq3 << "SELECT COUNT(1) FROM mfgeo_n_p r, mfgeo_n_p s WHERE ST_INTERSECTS(r.p, "
+           "s.pt);";
+    mq4 << "SELECT COUNT(1) FROM mfgeo_n_p r, mfgeo_n_p s WHERE ST_INTERSECTS(r.mp, "
+           "s.pt);";
+    auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+    auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+    auto multi_frag_res3 = v<int64_t>(execSQLWithAllowLoopJoin(mq3.str(), dt));
+    auto multi_frag_res4 = v<int64_t>(execSQLWithAllowLoopJoin(mq4.str(), dt));
+    ASSERT_EQ(single_frag_res1, multi_frag_res1) << mq1.str();
+    ASSERT_EQ(single_frag_res2, multi_frag_res2) << mq2.str();
+    ASSERT_EQ(single_frag_res3, multi_frag_res3) << mq3.str();
+    ASSERT_EQ(single_frag_res4, multi_frag_res4) << mq4.str();
+  });
+
+  executeAllScenarios([](ExecutorDeviceType dt) -> void {
+    int64_t single_frag_res1 = 914;
+    int64_t single_frag_res2 = 71556;
+    int64_t single_frag_res3 = 33905;
+    int64_t single_frag_res4 = 33905;
+    std::ostringstream mq1, mq2, mq3, mq4;
+    mq1 << "SELECT COUNT(1) FROM mfgeo_n2_p r, mfgeo_n2_p s WHERE ST_INTERSECTS(r.pt, "
+           "s.pt);";
+    mq2 << "SELECT COUNT(1) FROM mfgeo_n2_p r, mfgeo_n2_p s WHERE ST_INTERSECTS(s.p, "
+           "r.l);";
+    mq3 << "SELECT COUNT(1) FROM mfgeo_n2_p r, mfgeo_n2_p s WHERE ST_INTERSECTS(r.p, "
+           "s.pt);";
+    mq4 << "SELECT COUNT(1) FROM mfgeo_n2_p r, mfgeo_n2_p s WHERE ST_INTERSECTS(r.mp, "
+           "s.pt);";
+    auto multi_frag_res1 = v<int64_t>(execSQLWithAllowLoopJoin(mq1.str(), dt));
+    auto multi_frag_res2 = v<int64_t>(execSQLWithAllowLoopJoin(mq2.str(), dt));
+    auto multi_frag_res3 = v<int64_t>(execSQLWithAllowLoopJoin(mq3.str(), dt));
+    auto multi_frag_res4 = v<int64_t>(execSQLWithAllowLoopJoin(mq4.str(), dt));
+    ASSERT_EQ(single_frag_res1, multi_frag_res1) << mq1.str();
+    ASSERT_EQ(single_frag_res2, multi_frag_res2) << mq2.str();
+    ASSERT_EQ(single_frag_res3, multi_frag_res3) << mq3.str();
+    ASSERT_EQ(single_frag_res4, multi_frag_res4) << mq4.str();
+  });
+}
+
 int main(int argc, char* argv[]) {
   TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
@@ -845,7 +1609,9 @@ int main(int argc, char* argv[]) {
 
   int err{0};
   try {
+    populateTablesForVarlenLinearizationTest();
     err = RUN_ALL_TESTS();
+    dropTablesForVarlenLinearizationTest();
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
   }

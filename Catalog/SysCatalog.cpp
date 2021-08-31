@@ -42,12 +42,13 @@
 #include <boost/range/adaptor/map.hpp>
 #include <boost/version.hpp>
 
-#include "../Parser/ParserNode.h"
-#include "../Shared/File.h"
-#include "../Shared/StringTransform.h"
-#include "../Shared/measure.h"
 #include "MapDRelease.h"
+#include "Parser/ParserNode.h"
 #include "RWLocks.h"
+#include "Shared/File.h"
+#include "Shared/StringTransform.h"
+#include "Shared/measure.h"
+#include "Shared/misc.h"
 #include "include/bcrypt.h"
 
 using std::list;
@@ -60,9 +61,9 @@ using std::vector;
 using namespace std::string_literals;
 
 std::string g_base_path;
+bool g_enable_idp_temporary_users{true};
 
 extern bool g_enable_fsi;
-extern bool g_enable_s3_fsi;
 extern bool g_read_only;
 
 namespace {
@@ -191,19 +192,19 @@ void SysCatalog::init(const std::string& basePath,
   }
 }
 
+SysCatalog::SysCatalog()
+    : CommonFileOperations{basePath_}
+    , aggregator_{false}
+    , sqliteMutex_{}
+    , sharedMutex_{}
+    , thread_holding_sqlite_lock{std::thread::id()}
+    , thread_holding_write_lock{std::thread::id()}
+    , dummyCatalog_{std::make_shared<Catalog>()} {}
+
 SysCatalog::~SysCatalog() {
   sys_write_lock write_lock(this);
-  for (auto grantee = granteeMap_.begin(); grantee != granteeMap_.end(); ++grantee) {
-    delete grantee->second;
-  }
   granteeMap_.clear();
-  for (ObjectRoleDescriptorMap::iterator objectIt = objectDescriptorMap_.begin();
-       objectIt != objectDescriptorMap_.end();) {
-    ObjectRoleDescriptorMap::iterator eraseIt = objectIt++;
-    delete eraseIt->second;
-  }
   objectDescriptorMap_.clear();
-
   cat_map_.clear();
 }
 
@@ -243,12 +244,13 @@ void SysCatalog::initDB() {
   }
   sqliteConnector_->query("END TRANSACTION");
   createDatabase(OMNISCI_DEFAULT_DB, OMNISCI_ROOT_USER_ID);
-  createRole_unsafe(OMNISCI_ROOT_USER, true);
+  createRole_unsafe(OMNISCI_ROOT_USER, /*userPrivateRole=*/true, /*is_temporary=*/false);
 }
 
 void SysCatalog::checkAndExecuteMigrations() {
   migratePrivileged_old();
-  createUserRoles();
+  createRoles();
+  fixRolesMigration();
   migratePrivileges();
   migrateDBAccessPrivileges();
   updateUserSchema();  // must come before updatePasswordsToHashes()
@@ -331,7 +333,7 @@ void SysCatalog::importDataFromOldMapdDB() {
   }
 }
 
-void SysCatalog::createUserRoles() {
+void SysCatalog::createRoles() {
   sys_sqlite_lock sqlite_lock(this);
   sqliteConnector_->query("BEGIN TRANSACTION");
   try {
@@ -345,20 +347,32 @@ void SysCatalog::createUserRoles() {
     sqliteConnector_->query(
         "CREATE TABLE mapd_roles(roleName text, userName text, UNIQUE(roleName, "
         "userName))");
-    // need to account for old conversions where we are building and moving
-    // from pre version 4.0 and 'mapd' was default superuser
-    sqliteConnector_->query("SELECT name FROM mapd_users WHERE name NOT IN ( \'" +
-                            OMNISCI_ROOT_USER + "\', 'mapd')");
-    size_t numRows = sqliteConnector_->getNumRows();
-    vector<string> user_names;
-    for (size_t i = 0; i < numRows; ++i) {
-      user_names.push_back(sqliteConnector_->getData<string>(i, 0));
+  } catch (const std::exception&) {
+    sqliteConnector_->query("ROLLBACK TRANSACTION");
+    throw;
+  }
+  sqliteConnector_->query("END TRANSACTION");
+}
+
+/*
+  There was an error in how we migrated users from pre-4.0 versions where we would copy
+  all user names into the mapd_roles table.  This table should never have usernames in it
+  (the correct migration was to copy users into the mapd_object_permissions table instead)
+  so this migration function prunes such cases out.
+ */
+void SysCatalog::fixRolesMigration() {
+  sys_sqlite_lock sqlite_lock(this);
+  sqliteConnector_->query("BEGIN TRANSACTION");
+  try {
+    sqliteConnector_->query("SELECT name FROM mapd_users");
+    auto num_rows = sqliteConnector_->getNumRows();
+    std::vector<std::string> user_names;
+    for (size_t i = 0; i < num_rows; ++i) {
+      user_names.push_back(sqliteConnector_->getData<std::string>(i, 0));
     }
     for (const auto& user_name : user_names) {
-      // for each user, create a fake role with the same name
-      sqliteConnector_->query_with_text_params(
-          "INSERT INTO mapd_roles(roleName, userName) VALUES (?, ?)",
-          vector<string>{user_name, user_name});
+      sqliteConnector_->query_with_text_param("DELETE FROM mapd_roles WHERE roleName = ?",
+                                              user_name);
     }
   } catch (const std::exception&) {
     sqliteConnector_->query("ROLLBACK TRANSACTION");
@@ -391,7 +405,7 @@ void deleteObjectPrivileges(std::unique_ptr<SqliteConnector>& sqliteConnector,
 void insertOrUpdateObjectPrivileges(std::unique_ptr<SqliteConnector>& sqliteConnector,
                                     std::string roleName,
                                     bool userRole,
-                                    DBObject& object) {
+                                    const DBObject& object) {
   CHECK(object.valid());
   DBObjectKey key = object.getObjectKey();
 
@@ -481,34 +495,33 @@ void SysCatalog::migratePrivileges() {
       auto dbName = dbs_by_id[grantee.second];
       {
         // table level permissions
-        DBObjectKey key;
-        key.permissionType = DBObjectType::TableDBObjectType;
-        key.dbId = grantee.second;
-        DBObject object(key, AccessPrivileges::ALL_TABLE_MIGRATE, OMNISCI_ROOT_USER_ID);
-        object.setName(dbName);
+        auto type = DBObjectType::TableDBObjectType;
+        DBObjectKey key{type, grantee.second};
+        DBObject object(
+            dbName, type, key, AccessPrivileges::ALL_TABLE_MIGRATE, OMNISCI_ROOT_USER_ID);
         insertOrUpdateObjectPrivileges(
             sqliteConnector_, users_by_id[grantee.first], true, object);
       }
 
       {
         // dashboard level permissions
-        DBObjectKey key;
-        key.permissionType = DBObjectType::DashboardDBObjectType;
-        key.dbId = grantee.second;
-        DBObject object(
-            key, AccessPrivileges::ALL_DASHBOARD_MIGRATE, OMNISCI_ROOT_USER_ID);
-        object.setName(dbName);
+        auto type = DBObjectType::DashboardDBObjectType;
+        DBObjectKey key{type, grantee.second};
+        DBObject object(dbName,
+                        type,
+                        key,
+                        AccessPrivileges::ALL_DASHBOARD_MIGRATE,
+                        OMNISCI_ROOT_USER_ID);
         insertOrUpdateObjectPrivileges(
             sqliteConnector_, users_by_id[grantee.first], true, object);
       }
 
       {
         // view level permissions
-        DBObjectKey key;
-        key.permissionType = DBObjectType::ViewDBObjectType;
-        key.dbId = grantee.second;
-        DBObject object(key, AccessPrivileges::ALL_VIEW_MIGRATE, OMNISCI_ROOT_USER_ID);
-        object.setName(dbName);
+        auto type = DBObjectType::ViewDBObjectType;
+        DBObjectKey key{type, grantee.second};
+        DBObject object(
+            dbName, type, key, AccessPrivileges::ALL_VIEW_MIGRATE, OMNISCI_ROOT_USER_ID);
         insertOrUpdateObjectPrivileges(
             sqliteConnector_, users_by_id[grantee.first], true, object);
       }
@@ -517,11 +530,10 @@ void SysCatalog::migratePrivileges() {
       auto dbName = dbs_by_id[0];
       if (user.second == false && user.first != OMNISCI_ROOT_USER_ID) {
         {
-          DBObjectKey key;
-          key.permissionType = DBObjectType::DatabaseDBObjectType;
-          key.dbId = 0;
-          DBObject object(key, AccessPrivileges::NONE, OMNISCI_ROOT_USER_ID);
-          object.setName(dbName);
+          auto type = DBObjectType::DatabaseDBObjectType;
+          DBObjectKey key{type, 0};
+          DBObject object(
+              dbName, type, key, AccessPrivileges::NONE, OMNISCI_ROOT_USER_ID);
           insertOrUpdateObjectPrivileges(
               sqliteConnector_, users_by_id[user.first], true, object);
         }
@@ -547,7 +559,8 @@ void SysCatalog::addAdminUserRole() {
       return;
     }
 
-    createRole_unsafe(OMNISCI_ROOT_USER, true);
+    createRole_unsafe(
+        OMNISCI_ROOT_USER, /*userPrivateRole=*/true, /*is_temporary=*/false);
   } catch (const std::exception&) {
     sqliteConnector_->query("ROLLBACK TRANSACTION");
     throw;
@@ -726,7 +739,7 @@ void SysCatalog::migrateDBAccessPrivileges() {
     // and view sql editor privileges
     DBMetadata dbmeta;
     for (auto db_ : databases) {
-      CHECK(SysCatalog::instance().getMetadataForDB(db_.second, dbmeta));
+      CHECK(getMetadataForDB(db_.second, dbmeta));
       for (auto user : users) {
         if (user.first != OMNISCI_ROOT_USER_ID) {
           {
@@ -842,9 +855,10 @@ void SysCatalog::check_for_session_encryption(const std::string& pki_cert,
 
 void SysCatalog::createUser(const string& name,
                             const string& passwd,
-                            bool issuper,
+                            bool is_super,
                             const std::string& dbname,
-                            bool can_login) {
+                            bool can_login,
+                            bool is_temporary) {
   sys_write_lock write_lock(this);
   sys_sqlite_lock sqlite_lock(this);
 
@@ -852,23 +866,48 @@ void SysCatalog::createUser(const string& name,
   if (getMetadataForUser(name, user)) {
     throw runtime_error("User " + user.userLoggable() + " already exists.");
   }
+  std::string const loggable = g_log_user_id ? std::string("") : name + ' ';
   if (getGrantee(name)) {
-    std::string const loggable = g_log_user_id ? std::string("") : name + ' ';
     throw runtime_error(
         "User " + loggable +
         "is same as one of existing grantees. User and role names should be unique.");
   }
+  DBMetadata db;
+  if (!dbname.empty()) {
+    if (!getMetadataForDB(dbname, db)) {
+      throw runtime_error("DEFAULT_DB " + dbname + " not found.");
+    }
+  }
+
+  // Temporary user.
+  if (is_temporary) {
+    if (!g_read_only) {
+      throw std::runtime_error("Temporary users require read-only mode.");
+      // NOTE(sy): We can remove this restriction when we're confident that
+      // nothing permanent can depend on a temporary user.
+    }
+    auto user2 = std::make_shared<UserMetadata>(next_temporary_user_id_++,
+                                                name,
+                                                hash_with_bcrypt(passwd),
+                                                is_super,
+                                                !dbname.empty() ? db.dbId : -1,
+                                                can_login,
+                                                true);
+    temporary_users_by_name_[name] = user2;
+    temporary_users_by_id_[user2->userId] = user2;
+    createRole_unsafe(name, /*userPrivateRole=*/true, /*is_temporary=*/true);
+    VLOG(1) << "Created temporary user: " << loggable;
+    return;
+  }
+
+  // Normal user.
   sqliteConnector_->query("BEGIN TRANSACTION");
   try {
     std::vector<std::string> vals;
     if (!dbname.empty()) {
-      DBMetadata db;
-      if (!SysCatalog::instance().getMetadataForDB(dbname, db)) {
-        throw runtime_error("DEFAULT_DB " + dbname + " not found.");
-      }
       vals = {name,
               hash_with_bcrypt(passwd),
-              std::to_string(issuper),
+              std::to_string(is_super),
               std::to_string(db.dbId),
               std::to_string(can_login)};
       sqliteConnector_->query_with_text_params(
@@ -878,33 +917,49 @@ void SysCatalog::createUser(const string& name,
     } else {
       vals = {name,
               hash_with_bcrypt(passwd),
-              std::to_string(issuper),
+              std::to_string(is_super),
               std::to_string(can_login)};
       sqliteConnector_->query_with_text_params(
           "INSERT INTO mapd_users (name, passwd_hash, issuper, can_login) "
           "VALUES (?, ?, ?, ?)",
           vals);
     }
-    createRole_unsafe(name, true);
+    createRole_unsafe(name, /*userPrivateRole=*/true, /*is_temporary=*/false);
   } catch (const std::exception& e) {
     sqliteConnector_->query("ROLLBACK TRANSACTION");
     throw;
   }
   sqliteConnector_->query("END TRANSACTION");
+  VLOG(1) << "Created user: " << loggable;
 }
 
 void SysCatalog::dropUser(const string& name) {
   sys_write_lock write_lock(this);
   sys_sqlite_lock sqlite_lock(this);
 
+  UserMetadata user;
+  if (!getMetadataForUser(name, user)) {
+    std::string const loggable = g_log_user_id ? std::string("") : name + ' ';
+    throw runtime_error("Cannot drop user. User " + loggable + "does not exist.");
+  }
+
+  // Temporary user.
+  if (user.is_temporary) {
+    auto it1 = temporary_users_by_name_.find(name);
+    CHECK(it1 != temporary_users_by_name_.end());
+    auto it2 = temporary_users_by_id_.find(it1->second->userId);
+    CHECK(it2 != temporary_users_by_id_.end());
+    dropRole_unsafe(name, /*is_temporary=*/true);
+    deleteObjectDescriptorMap(name);
+    temporary_users_by_name_.erase(it1);
+    temporary_users_by_id_.erase(it2);
+    return;
+  }
+
+  // Normal user.
   sqliteConnector_->query("BEGIN TRANSACTION");
   try {
-    UserMetadata user;
-    if (!getMetadataForUser(name, user)) {
-      std::string const loggable = g_log_user_id ? std::string("") : name + ' ';
-      throw runtime_error("Cannot drop user. User " + loggable + "does not exist.");
-    }
-    dropRole_unsafe(name);
+    dropRole_unsafe(name, /*is_temporary=*/false);
     deleteObjectDescriptorMap(name);
     const std::string& roleName(name);
     sqliteConnector_->query_with_text_param("DELETE FROM mapd_roles WHERE userName = ?",
@@ -940,29 +995,63 @@ auto append_with_commas = [](string& s, const string& t) {
 
 }  // anonymous namespace
 
-void SysCatalog::alterUser(const int32_t userid,
+void SysCatalog::alterUser(const string& name,
                            const string* passwd,
-                           bool* issuper,
+                           bool* is_super,
                            const string* dbname,
                            bool* can_login) {
   sys_sqlite_lock sqlite_lock(this);
+
+  UserMetadata user;
+  if (!getMetadataForUser(name, user)) {
+    std::string const loggable = g_log_user_id ? std::string("") : name + ' ';
+    throw runtime_error("Cannot alter user. User " + loggable + "does not exist.");
+  }
+
+  // Temporary user.
+  if (user.is_temporary) {
+    if (passwd) {
+      user.passwd_hash = hash_with_bcrypt(*passwd);
+    }
+    if (is_super) {
+      user.isSuper = *is_super;
+    }
+    if (dbname) {
+      if (!dbname->empty()) {
+        DBMetadata db;
+        if (!getMetadataForDB(*dbname, db)) {
+          throw runtime_error(string("DEFAULT_DB ") + *dbname + " not found.");
+        }
+        user.defaultDbId = db.dbId;
+      } else {
+        user.defaultDbId = -1;
+      }
+    }
+    if (can_login) {
+      user.can_login = *can_login;
+    }
+    *temporary_users_by_name_[name] = user;
+    return;
+  }
+
+  // Normal user.
   sqliteConnector_->query("BEGIN TRANSACTION");
   try {
     string sql;
     std::vector<std::string> values;
-    if (passwd != nullptr) {
+    if (passwd) {
       append_with_commas(sql, "passwd_hash = ?");
       values.push_back(hash_with_bcrypt(*passwd));
     }
-    if (issuper != nullptr) {
+    if (is_super) {
       append_with_commas(sql, "issuper = ?");
-      values.push_back(std::to_string(*issuper));
+      values.push_back(std::to_string(*is_super));
     }
-    if (dbname != nullptr) {
+    if (dbname) {
       if (!dbname->empty()) {
         append_with_commas(sql, "default_db = ?");
         DBMetadata db;
-        if (!SysCatalog::instance().getMetadataForDB(*dbname, db)) {
+        if (!getMetadataForDB(*dbname, db)) {
           throw runtime_error(string("DEFAULT_DB ") + *dbname + " not found.");
         }
         values.push_back(std::to_string(db.dbId));
@@ -970,13 +1059,13 @@ void SysCatalog::alterUser(const int32_t userid,
         append_with_commas(sql, "default_db = NULL");
       }
     }
-    if (can_login != nullptr) {
+    if (can_login) {
       append_with_commas(sql, "can_login = ?");
       values.push_back(std::to_string(*can_login));
     }
 
     sql = "UPDATE mapd_users SET " + sql + " WHERE userid = ?";
-    values.push_back(std::to_string(userid));
+    values.push_back(std::to_string(user.userId));
 
     sqliteConnector_->query_with_text_params(sql, values);
   } catch (const std::exception& e) {
@@ -1044,6 +1133,19 @@ void SysCatalog::renameUser(std::string const& old_name, std::string const& new_
         "is same as one of existing grantees. User and role names should be unique.");
   }
 
+  // Temporary user.
+  if (old_user.is_temporary) {
+    auto userit = temporary_users_by_name_.find(old_name);
+    CHECK(userit != temporary_users_by_name_.end());
+    auto node = temporary_users_by_name_.extract(userit);
+    node.key() = new_name;
+    temporary_users_by_name_.insert(std::move(node));
+    userit->second->userName = new_name;
+    updateUserRoleName(old_name, new_name);
+    return;
+  }
+
+  // Normal user.
   auto transaction_streamer = yieldTransactionStreamer();
   auto failure_handler = [] {};
   auto success_handler = [this, &old_name, &new_name] {
@@ -1053,7 +1155,8 @@ void SysCatalog::renameUser(std::string const& old_name, std::string const& new_
   auto q2 = {"UPDATE mapd_object_permissions set roleName=?1 WHERE roleName=?2;"s,
              new_name,
              old_name};
-  transaction_streamer(sqliteConnector_, success_handler, failure_handler, q1, q2);
+  auto q3 = {"UPDATE mapd_roles set userName=?1 WHERE userName=?2;"s, new_name, old_name};
+  transaction_streamer(sqliteConnector_, success_handler, failure_handler, q1, q2, q3);
 }
 
 void SysCatalog::renameDatabase(std::string const& old_name,
@@ -1139,7 +1242,7 @@ void SysCatalog::createDatabase(const string& name, int owner) {
         "boolean, compression integer, "
         "comp_param integer, size integer, chunks text, is_systemcol boolean, "
         "is_virtualcol boolean, virtual_expr "
-        "text, is_deletedcol boolean, version_num BIGINT, "
+        "text, is_deletedcol boolean, version_num BIGINT, default_value text, "
         "primary key(tableid, columnid), unique(tableid, name))");
     dbConn->query(
         "CREATE TABLE mapd_views (tableid integer references mapd_tables, sql text)");
@@ -1245,7 +1348,8 @@ void SysCatalog::dropDatabase(const DBMetadata& db) {
     /* revoke object privileges to the database being dropped */
     for (const auto& grantee : granteeMap_) {
       if (grantee.second->hasAnyPrivilegesOnDb(db.dbId, true)) {
-        revokeAllOnDatabase_unsafe(grantee.second->getName(), db.dbId, grantee.second);
+        revokeAllOnDatabase_unsafe(
+            grantee.second->getName(), db.dbId, grantee.second.get());
       }
     }
     sqliteConnector_->query_with_text_param("DELETE FROM mapd_databases WHERE dbid = ?",
@@ -1287,24 +1391,25 @@ bool SysCatalog::checkPasswordForUserImpl(const std::string& passwd,
 }
 
 static bool parseUserMetadataFromSQLite(const std::unique_ptr<SqliteConnector>& conn,
-                                        UserMetadata& user) {
+                                        UserMetadata& user,
+                                        int row) {
   int numRows = conn->getNumRows();
   if (numRows == 0) {
     return false;
   }
-  user.userId = conn->getData<int>(0, 0);
-  user.userName = conn->getData<string>(0, 1);
-  user.passwd_hash = conn->getData<string>(0, 2);
-  user.isSuper = conn->getData<bool>(0, 3);
-  user.defaultDbId = conn->isNull(0, 4) ? -1 : conn->getData<int>(0, 4);
-  if (conn->isNull(0, 5)) {
+  user.userId = conn->getData<int>(row, 0);
+  user.userName = conn->getData<string>(row, 1);
+  user.passwd_hash = conn->getData<string>(row, 2);
+  user.isSuper = conn->getData<bool>(row, 3);
+  user.defaultDbId = conn->isNull(row, 4) ? -1 : conn->getData<int>(row, 4);
+  if (conn->isNull(row, 5)) {
     LOG(WARNING)
         << "User property 'can_login' not set for user " << user.userLoggable()
         << ". Disabling login ability. Set the users login ability with \"ALTER USER "
         << (g_log_user_id ? std::string("[username]") : user.userName)
         << " (can_login='true');\".";
   }
-  user.can_login = conn->isNull(0, 5) ? false : conn->getData<bool>(0, 5);
+  user.can_login = conn->isNull(row, 5) ? false : conn->getData<bool>(row, 5);
   return true;
 }
 
@@ -1315,7 +1420,17 @@ bool SysCatalog::getMetadataForUser(const string& name, UserMetadata& user) {
       "SELECT userid, name, passwd_hash, issuper, default_db, can_login FROM mapd_users "
       "WHERE name = ?",
       name);
-  return parseUserMetadataFromSQLite(sqliteConnector_, user);
+  int numRows = sqliteConnector_->getNumRows();
+  if (numRows == 0) {
+    auto userit = temporary_users_by_name_.find(name);
+    if (userit != temporary_users_by_name_.end()) {
+      user = *userit->second;
+      return true;
+    } else {
+      return false;
+    }
+  }
+  return parseUserMetadataFromSQLite(sqliteConnector_, user, 0);
 }
 
 bool SysCatalog::getMetadataForUserById(const int32_t idIn, UserMetadata& user) {
@@ -1324,7 +1439,17 @@ bool SysCatalog::getMetadataForUserById(const int32_t idIn, UserMetadata& user) 
       "SELECT userid, name, passwd_hash, issuper, default_db, can_login FROM mapd_users "
       "WHERE userid = ?",
       std::to_string(idIn));
-  return parseUserMetadataFromSQLite(sqliteConnector_, user);
+  int numRows = sqliteConnector_->getNumRows();
+  if (numRows == 0) {
+    auto userit = temporary_users_by_id_.find(idIn);
+    if (userit != temporary_users_by_id_.end()) {
+      user = *userit->second;
+      return true;
+    } else {
+      return false;
+    }
+  }
+  return parseUserMetadataFromSQLite(sqliteConnector_, user, 0);
 }
 
 list<DBMetadata> SysCatalog::getAllDBMetadata() {
@@ -1344,33 +1469,37 @@ list<DBMetadata> SysCatalog::getAllDBMetadata() {
 
 namespace {
 
-auto get_users(std::unique_ptr<SqliteConnector>& sqliteConnector,
+auto get_users(SysCatalog& syscat,
+               std::unique_ptr<SqliteConnector>& sqliteConnector,
                const int32_t dbId = -1) {
-  sqliteConnector->query("SELECT userid, name, issuper, can_login FROM mapd_users");
+  // Normal users.
+  sqliteConnector->query(
+      "SELECT userid, name, passwd_hash, issuper, default_db, can_login FROM mapd_users");
   int numRows = sqliteConnector->getNumRows();
   list<UserMetadata> user_list;
   const bool return_all_users = dbId == -1;
-  auto has_any_privilege = [&return_all_users, &dbId](const std::string& name) {
+  auto has_any_privilege = [&return_all_users, &dbId, &syscat](const std::string& name) {
     if (!return_all_users) {
-      const auto grantee = SysCatalog::instance().getUserGrantee(name);
+      const auto grantee = syscat.getUserGrantee(name);
       return grantee ? grantee->hasAnyPrivilegesOnDb(dbId, false) : false;
     }
     return true;
   };
-  auto add_user = [&user_list, &has_any_privilege](const int32_t id,
-                                                   const std::string& name,
-                                                   const bool super,
-                                                   const bool can_login) {
-    if (has_any_privilege(name)) {
-      user_list.emplace_back(id, name, "", super, -1, can_login);
-    };
-  };
   for (int r = 0; r < numRows; ++r) {
-    add_user(sqliteConnector->getData<int>(r, 0),
-             sqliteConnector->getData<string>(r, 1),
-             sqliteConnector->getData<bool>(r, 2),
-             sqliteConnector->getData<bool>(r, 3));
+    Catalog_Namespace::UserMetadata user;
+    parseUserMetadataFromSQLite(sqliteConnector, user, r);
+    if (has_any_privilege(user.userName)) {
+      user_list.emplace_back(std::move(user));
+    }
   }
+
+  // Temporary users.
+  for (const auto& [id, userptr] : syscat.temporary_users_by_id_) {
+    if (has_any_privilege(userptr->userName)) {
+      user_list.emplace_back(*userptr);
+    }
+  }
+
   return user_list;
 }
 
@@ -1380,12 +1509,12 @@ list<UserMetadata> SysCatalog::getAllUserMetadata(const int64_t dbId) {
   // this call is to return users that have some form of permissions to objects in the db
   // sadly mapd_object_permissions table is also misused to manage user roles.
   sys_sqlite_lock sqlite_lock(this);
-  return get_users(sqliteConnector_, dbId);
+  return get_users(*this, sqliteConnector_, dbId);
 }
 
 list<UserMetadata> SysCatalog::getAllUserMetadata() {
   sys_sqlite_lock sqlite_lock(this);
-  return get_users(sqliteConnector_);
+  return get_users(*this, sqliteConnector_);
 }
 
 void SysCatalog::getMetadataWithDefaultDB(std::string& dbname,
@@ -1571,11 +1700,13 @@ void SysCatalog::grantDBObjectPrivileges_unsafe(
   sys_write_lock write_lock(this);
 
   UserMetadata user_meta;
+  bool is_temporary_user{false};
   if (instance().getMetadataForUser(granteeName, user_meta)) {
     if (user_meta.isSuper) {
       // super doesn't have explicit privileges so nothing to do
       return;
     }
+    is_temporary_user = user_meta.is_temporary;
   }
   auto* grantee = instance().getGrantee(granteeName);
   if (!grantee) {
@@ -1589,9 +1720,11 @@ void SysCatalog::grantDBObjectPrivileges_unsafe(
   object.resetPrivileges();
   grantee->getPrivileges(object, true);
 
-  sys_sqlite_lock sqlite_lock(this);
-  insertOrUpdateObjectPrivileges(
-      sqliteConnector_, granteeName, grantee->isUser(), object);
+  if (!is_temporary_user) {
+    sys_sqlite_lock sqlite_lock(this);
+    insertOrUpdateObjectPrivileges(
+        sqliteConnector_, granteeName, grantee->isUser(), object);
+  }
   updateObjectDescriptorMap(granteeName, object, grantee->isUser(), catalog);
 }
 
@@ -1654,11 +1787,13 @@ void SysCatalog::revokeDBObjectPrivileges_unsafe(
   sys_write_lock write_lock(this);
 
   UserMetadata user_meta;
+  bool is_temporary_user{false};
   if (instance().getMetadataForUser(granteeName, user_meta)) {
     if (user_meta.isSuper) {
       // super doesn't have explicit privileges so nothing to do
       return;
     }
+    is_temporary_user = user_meta.is_temporary;
   }
   auto* grantee = getGrantee(granteeName);
   if (!grantee) {
@@ -1674,13 +1809,17 @@ void SysCatalog::revokeDBObjectPrivileges_unsafe(
 
   auto ret_object = grantee->revokePrivileges(object);
   if (ret_object) {
-    sys_sqlite_lock sqlite_lock(this);
-    insertOrUpdateObjectPrivileges(
-        sqliteConnector_, granteeName, grantee->isUser(), *ret_object);
+    if (!is_temporary_user) {
+      sys_sqlite_lock sqlite_lock(this);
+      insertOrUpdateObjectPrivileges(
+          sqliteConnector_, granteeName, grantee->isUser(), *ret_object);
+    }
     updateObjectDescriptorMap(granteeName, *ret_object, grantee->isUser(), catalog);
   } else {
-    sys_sqlite_lock sqlite_lock(this);
-    deleteObjectPrivileges(sqliteConnector_, granteeName, grantee->isUser(), object);
+    if (!is_temporary_user) {
+      sys_sqlite_lock sqlite_lock(this);
+      deleteObjectPrivileges(sqliteConnector_, granteeName, grantee->isUser(), object);
+    }
     deleteObjectDescriptorMap(granteeName, object, catalog);
   }
 }
@@ -1688,14 +1827,17 @@ void SysCatalog::revokeDBObjectPrivileges_unsafe(
 void SysCatalog::revokeAllOnDatabase_unsafe(const std::string& roleName,
                                             int32_t dbId,
                                             Grantee* grantee) {
-  sys_sqlite_lock sqlite_lock(this);
-  sqliteConnector_->query_with_text_params(
-      "DELETE FROM mapd_object_permissions WHERE roleName = ?1 and dbId = ?2",
-      std::vector<std::string>{roleName, std::to_string(dbId)});
+  bool is_temporary =
+      (temporary_users_by_name_.find(roleName) != temporary_users_by_name_.end());
+  if (!is_temporary) {
+    sys_sqlite_lock sqlite_lock(this);
+    sqliteConnector_->query_with_text_params(
+        "DELETE FROM mapd_object_permissions WHERE roleName = ?1 and dbId = ?2",
+        std::vector<std::string>{roleName, std::to_string(dbId)});
+  }
   grantee->revokeAllOnDatabase(dbId);
   for (auto d = objectDescriptorMap_.begin(); d != objectDescriptorMap_.end();) {
     if (d->second->roleName == roleName && d->second->dbId == dbId) {
-      delete d->second;
       d = objectDescriptorMap_.erase(d);
     } else {
       d++;
@@ -1742,6 +1884,9 @@ void SysCatalog::changeDBObjectOwnership(const UserMetadata& new_owner,
                                          const Catalog_Namespace::Catalog& catalog,
                                          bool revoke_privileges) {
   sys_write_lock write_lock(this);
+  if (new_owner.is_temporary || previous_owner.is_temporary) {
+    throw std::runtime_error("ownership change not allowed for temporary user(s)");
+  }
   sys_sqlite_lock sqlite_lock(this);
   object.loadKey(catalog);
   switch (object.getType()) {
@@ -1803,7 +1948,8 @@ void SysCatalog::getDBObjectPrivileges(const std::string& granteeName,
 }
 
 void SysCatalog::createRole_unsafe(const std::string& roleName,
-                                   const bool userPrivateRole) {
+                                   const bool user_private_role,
+                                   const bool is_temporary) {
   sys_write_lock write_lock(this);
 
   auto* grantee = getGrantee(roleName);
@@ -1811,12 +1957,14 @@ void SysCatalog::createRole_unsafe(const std::string& roleName,
     throw std::runtime_error("CREATE ROLE " + roleName +
                              " failed because grantee with this name already exists.");
   }
-  if (userPrivateRole) {
-    grantee = new User(roleName);
+  std::unique_ptr<Grantee> g;
+  if (user_private_role) {
+    g.reset(new User(roleName));
   } else {
-    grantee = new Role(roleName);
+    g.reset(new Role(roleName));
   }
-  granteeMap_[to_upper(roleName)] = grantee;
+  grantee = g.get();
+  granteeMap_[to_upper(roleName)] = std::move(g);
 
   // NOTE (max): Why create an empty privileges record for a role?
   /* grant none privileges to this role and add it to sqlite DB */
@@ -1828,39 +1976,46 @@ void SysCatalog::createRole_unsafe(const std::string& roleName,
   dbObject.setObjectKey(objKey);
   grantee->grantPrivileges(dbObject);
 
-  sys_sqlite_lock sqlite_lock(this);
-  insertOrUpdateObjectPrivileges(sqliteConnector_, roleName, userPrivateRole, dbObject);
+  if (!is_temporary) {
+    sys_sqlite_lock sqlite_lock(this);
+    insertOrUpdateObjectPrivileges(
+        sqliteConnector_, roleName, user_private_role, dbObject);
+  }
 }
 
-void SysCatalog::dropRole_unsafe(const std::string& roleName) {
+void SysCatalog::dropRole_unsafe(const std::string& roleName, const bool is_temporary) {
   sys_write_lock write_lock(this);
 
   // it may very well be a user "role", so keep it generic
-  auto* rl = getGrantee(roleName);
-  if (rl) {  // admin super user may not exist in roles
-    delete rl;
-  }
   granteeMap_.erase(to_upper(roleName));
 
-  sys_sqlite_lock sqlite_lock(this);
-  sqliteConnector_->query_with_text_param("DELETE FROM mapd_roles WHERE roleName = ?",
-                                          roleName);
-  sqliteConnector_->query_with_text_param(
-      "DELETE FROM mapd_object_permissions WHERE roleName = ?", roleName);
+  if (!is_temporary) {
+    sys_sqlite_lock sqlite_lock(this);
+    sqliteConnector_->query_with_text_param("DELETE FROM mapd_roles WHERE roleName = ?",
+                                            roleName);
+    sqliteConnector_->query_with_text_param(
+        "DELETE FROM mapd_object_permissions WHERE roleName = ?", roleName);
+  }
 }
 
 void SysCatalog::grantRoleBatch_unsafe(const std::vector<std::string>& roles,
                                        const std::vector<std::string>& grantees) {
   for (const auto& role : roles) {
     for (const auto& grantee : grantees) {
-      grantRole_unsafe(role, grantee);
+      bool is_temporary_user{false};
+      UserMetadata user;
+      if (getMetadataForUser(grantee, user)) {
+        is_temporary_user = user.is_temporary;
+      }
+      grantRole_unsafe(role, grantee, is_temporary_user);
     }
   }
 }
 
 // GRANT ROLE payroll_dept_role TO joe;
 void SysCatalog::grantRole_unsafe(const std::string& roleName,
-                                  const std::string& granteeName) {
+                                  const std::string& granteeName,
+                                  const bool is_temporary) {
   auto* rl = getRoleGrantee(roleName);
   if (!rl) {
     throw runtime_error("Request to grant role " + roleName +
@@ -1874,10 +2029,12 @@ void SysCatalog::grantRole_unsafe(const std::string& roleName,
   sys_write_lock write_lock(this);
   if (!grantee->hasRole(rl, true)) {
     grantee->grantRole(rl);
-    sys_sqlite_lock sqlite_lock(this);
-    sqliteConnector_->query_with_text_params(
-        "INSERT INTO mapd_roles(roleName, userName) VALUES (?, ?)",
-        std::vector<std::string>{rl->getName(), grantee->getName()});
+    if (!is_temporary) {
+      sys_sqlite_lock sqlite_lock(this);
+      sqliteConnector_->query_with_text_params(
+          "INSERT INTO mapd_roles(roleName, userName) VALUES (?, ?)",
+          std::vector<std::string>{rl->getName(), grantee->getName()});
+    }
   }
 }
 
@@ -1885,14 +2042,20 @@ void SysCatalog::revokeRoleBatch_unsafe(const std::vector<std::string>& roles,
                                         const std::vector<std::string>& grantees) {
   for (const auto& role : roles) {
     for (const auto& grantee : grantees) {
-      revokeRole_unsafe(role, grantee);
+      bool is_temporary_user{false};
+      UserMetadata user;
+      if (getMetadataForUser(grantee, user)) {
+        is_temporary_user = user.is_temporary;
+      }
+      revokeRole_unsafe(role, grantee, is_temporary_user);
     }
   }
 }
 
 // REVOKE ROLE payroll_dept_role FROM joe;
 void SysCatalog::revokeRole_unsafe(const std::string& roleName,
-                                   const std::string& granteeName) {
+                                   const std::string& granteeName,
+                                   const bool is_temporary) {
   auto* rl = getRoleGrantee(roleName);
   if (!rl) {
     throw runtime_error("Request to revoke role " + roleName +
@@ -1905,10 +2068,12 @@ void SysCatalog::revokeRole_unsafe(const std::string& roleName,
   }
   sys_write_lock write_lock(this);
   grantee->revokeRole(rl);
-  sys_sqlite_lock sqlite_lock(this);
-  sqliteConnector_->query_with_text_params(
-      "DELETE FROM mapd_roles WHERE roleName = ? AND userName = ?",
-      std::vector<std::string>{rl->getName(), grantee->getName()});
+  if (!is_temporary) {
+    sys_sqlite_lock sqlite_lock(this);
+    sqliteConnector_->query_with_text_params(
+        "DELETE FROM mapd_roles WHERE roleName = ? AND userName = ?",
+        std::vector<std::string>{rl->getName(), grantee->getName()});
+  }
 }
 
 // Update or add element in ObjectRoleDescriptorMap
@@ -1931,7 +2096,7 @@ void SysCatalog::updateObjectDescriptorMap(const std::string& roleName,
     }
   }
   if (!present) {
-    ObjectRoleDescriptor* od = new ObjectRoleDescriptor();
+    auto od = std::make_unique<ObjectRoleDescriptor>();
     od->roleName = roleName;
     od->roleType = roleType;
     od->objectType = object.getObjectKey().permissionType;
@@ -1943,7 +2108,7 @@ void SysCatalog::updateObjectDescriptorMap(const std::string& roleName,
     objectDescriptorMap_.insert(ObjectRoleDescriptorMap::value_type(
         std::to_string(od->dbId) + ":" + std::to_string(od->objectType) + ":" +
             std::to_string(od->objectId),
-        od));
+        std::move(od)));
   }
 }
 
@@ -1982,7 +2147,6 @@ void SysCatalog::deleteObjectDescriptorMap(const std::string& roleName) {
 
   for (auto d = objectDescriptorMap_.begin(); d != objectDescriptorMap_.end();) {
     if (d->second->roleName == roleName) {
-      delete d->second;
       d = objectDescriptorMap_.erase(d);
     } else {
       d++;
@@ -2002,7 +2166,6 @@ void SysCatalog::deleteObjectDescriptorMap(const std::string& roleName,
   for (auto d = range.first; d != range.second;) {
     // remove the entry
     if (d->second->roleName == roleName) {
-      delete d->second;
       d = objectDescriptorMap_.erase(d);
     } else {
       d++;
@@ -2068,7 +2231,7 @@ Grantee* SysCatalog::getGrantee(const std::string& name) const {
   if (grantee == granteeMap_.end()) {  // check to make sure role exists
     return nullptr;
   }
-  return grantee->second;  // returns pointer to role
+  return grantee->second.get();  // returns pointer to role
 }
 
 Role* SysCatalog::getRoleGrantee(const std::string& name) const {
@@ -2088,7 +2251,7 @@ SysCatalog::getMetadataForObject(int32_t dbId, int32_t dbType, int32_t objectId)
                                                 std::to_string(dbType) + ":" +
                                                 std::to_string(objectId));
   for (auto d = range.first; d != range.second; ++d) {
-    objectsList.push_back(d->second);
+    objectsList.push_back(d->second.get());
   }
   return objectsList;  // return pointers to objects
 }
@@ -2160,18 +2323,6 @@ std::vector<std::string> SysCatalog::getRoles(bool userPrivateRole,
   return roles;
 }
 
-void SysCatalog::revokeDashboardSystemRole(const std::string roleName,
-                                           const std::vector<std::string> grantees) {
-  auto* rl = getRoleGrantee(roleName);
-  for (auto granteeName : grantees) {
-    const auto* grantee = SysCatalog::instance().getGrantee(granteeName);
-    if (rl && grantee->hasRole(rl, true)) {
-      // Grantees existence have been already validated
-      SysCatalog::instance().revokeRole(roleName, granteeName);
-    }
-  }
-}
-
 void SysCatalog::buildRoleMap() {
   sys_write_lock write_lock(this);
   sys_sqlite_lock sqlite_lock(this);
@@ -2208,12 +2359,14 @@ void SysCatalog::buildRoleMap() {
 
     auto* rl = getGrantee(roleName);
     if (!rl) {
+      std::unique_ptr<Grantee> g;
       if (userPrivateRole) {
-        rl = new User(roleName);
+        g.reset(new User(roleName));
       } else {
-        rl = new Role(roleName);
+        g.reset(new Role(roleName));
       }
-      granteeMap_[to_upper(roleName)] = rl;
+      rl = g.get();
+      granteeMap_[to_upper(roleName)] = std::move(g);
     }
     rl->grantPrivileges(dbObject);
   }
@@ -2245,7 +2398,7 @@ void SysCatalog::populateRoleDbObjects(const std::vector<DBObject>& objects) {
 void SysCatalog::buildUserRoleMap() {
   sys_write_lock write_lock(this);
   sys_sqlite_lock sqlite_lock(this);
-  std::vector<std::pair<std::string, std::string>> granteeRooles;
+  std::vector<std::pair<std::string, std::string>> granteeRoles;
   string userRoleQuery("SELECT roleName, userName from mapd_roles");
   sqliteConnector_->query(userRoleQuery);
   size_t numRows = sqliteConnector_->getNumRows();
@@ -2267,12 +2420,10 @@ void SysCatalog::buildUserRoleMap() {
                           " from db not found in the map.");
     }
     std::pair<std::string, std::string> roleVecElem(roleName, userName);
-    granteeRooles.push_back(roleVecElem);
+    granteeRoles.push_back(roleVecElem);
   }
 
-  for (size_t i = 0; i < granteeRooles.size(); i++) {
-    std::string roleName = granteeRooles[i].first;
-    std::string granteeName = granteeRooles[i].second;
+  for (const auto& [roleName, granteeName] : granteeRoles) {
     auto* grantee = getGrantee(granteeName);
     if (!grantee) {
       throw runtime_error("Data inconsistency when building role map. Grantee " +
@@ -2300,7 +2451,7 @@ void SysCatalog::buildObjectDescriptorMap() {
   sqliteConnector_->query(objectQuery);
   size_t numRows = sqliteConnector_->getNumRows();
   for (size_t r = 0; r < numRows; ++r) {
-    ObjectRoleDescriptor* od = new ObjectRoleDescriptor();
+    auto od = std::make_unique<ObjectRoleDescriptor>();
     od->roleName = sqliteConnector_->getData<string>(r, 0);
     od->roleType = sqliteConnector_->getData<bool>(r, 1);
     od->objectType = sqliteConnector_->getData<int>(r, 2);
@@ -2312,7 +2463,7 @@ void SysCatalog::buildObjectDescriptorMap() {
     objectDescriptorMap_.insert(ObjectRoleDescriptorMap::value_type(
         std::to_string(od->dbId) + ":" + std::to_string(od->objectType) + ":" +
             std::to_string(od->objectId),
-        od));
+        std::move(od)));
   }
 }
 
@@ -2330,12 +2481,15 @@ void SysCatalog::execInTransaction(F&& f, Args&&... args) {
   sqliteConnector_->query("END TRANSACTION");
 }
 
-void SysCatalog::createRole(const std::string& roleName, const bool& userPrivateRole) {
-  execInTransaction(&SysCatalog::createRole_unsafe, roleName, userPrivateRole);
+void SysCatalog::createRole(const std::string& roleName,
+                            const bool user_private_role,
+                            const bool is_temporary) {
+  execInTransaction(
+      &SysCatalog::createRole_unsafe, roleName, user_private_role, is_temporary);
 }
 
-void SysCatalog::dropRole(const std::string& roleName) {
-  execInTransaction(&SysCatalog::dropRole_unsafe, roleName);
+void SysCatalog::dropRole(const std::string& roleName, const bool is_temporary) {
+  execInTransaction(&SysCatalog::dropRole_unsafe, roleName, is_temporary);
 }
 
 void SysCatalog::grantRoleBatch(const std::vector<std::string>& roles,
@@ -2343,8 +2497,10 @@ void SysCatalog::grantRoleBatch(const std::vector<std::string>& roles,
   execInTransaction(&SysCatalog::grantRoleBatch_unsafe, roles, grantees);
 }
 
-void SysCatalog::grantRole(const std::string& role, const std::string& grantee) {
-  execInTransaction(&SysCatalog::grantRole_unsafe, role, grantee);
+void SysCatalog::grantRole(const std::string& role,
+                           const std::string& grantee,
+                           const bool is_temporary) {
+  execInTransaction(&SysCatalog::grantRole_unsafe, role, grantee, is_temporary);
 }
 
 void SysCatalog::revokeRoleBatch(const std::vector<std::string>& roles,
@@ -2352,8 +2508,10 @@ void SysCatalog::revokeRoleBatch(const std::vector<std::string>& roles,
   execInTransaction(&SysCatalog::revokeRoleBatch_unsafe, roles, grantees);
 }
 
-void SysCatalog::revokeRole(const std::string& role, const std::string& grantee) {
-  execInTransaction(&SysCatalog::revokeRole_unsafe, role, grantee);
+void SysCatalog::revokeRole(const std::string& role,
+                            const std::string& grantee,
+                            const bool is_temporary) {
+  execInTransaction(&SysCatalog::revokeRole_unsafe, role, grantee, is_temporary);
 }
 
 void SysCatalog::grantDBObjectPrivileges(const string& grantee,
@@ -2405,12 +2563,18 @@ void SysCatalog::syncUserWithRemoteProvider(const std::string& user_name,
   sys_read_lock read_lock(this);
   read_lock.unlock();
   sys_write_lock write_lock(this);
+  bool enable_idp_temporary_users{g_enable_idp_temporary_users && g_read_only};
   if (!getMetadataForUser(user_name, user_meta)) {
-    createUser(user_name, generate_random_string(72), is_super_user, "", true);
+    createUser(user_name,
+               generate_random_string(72),
+               is_super_user,
+               "",
+               /*can_login=*/true,
+               /*is_temporary=*/enable_idp_temporary_users);
     LOG(INFO) << "User " << user_name << " has been created by remote identity provider"
               << " with IS_SUPER = " << (is_super_user ? "'TRUE'" : "'FALSE'");
   } else if (is_super && is_super_user != user_meta.isSuper) {
-    alterUser(user_meta.userId, nullptr, is_super, nullptr, nullptr);
+    alterUser(user_meta.userName, nullptr, is_super, nullptr, nullptr);
     LOG(INFO) << "IS_SUPER for user " << user_name << " has been changed to "
               << (is_super_user ? "TRUE" : "FALSE") << " by remote identity provider";
   }
@@ -2427,7 +2591,9 @@ void SysCatalog::syncUserWithRemoteProvider(const std::string& user_name,
   for (auto& current_role_name : current_roles) {
     if (std::find(idp_roles.begin(), idp_roles.end(), current_role_name) ==
         idp_roles.end()) {
-      revokeRole(current_role_name, user_name);
+      revokeRole(current_role_name,
+                 user_name,
+                 /*is_temporary=*/enable_idp_temporary_users);
       roles_revoked.push_back(current_role_name);
     }
   }
@@ -2436,7 +2602,9 @@ void SysCatalog::syncUserWithRemoteProvider(const std::string& user_name,
         current_roles.end()) {
       auto* rl = getRoleGrantee(role_name);
       if (rl) {
-        grantRole(role_name, user_name);
+        grantRole(role_name,
+                  user_name,
+                  /*is_temporary=*/enable_idp_temporary_users);
         roles_granted.push_back(role_name);
       } else {
         LOG(WARNING) << "Error synchronizing roles for user " << user_name << ": role "
@@ -2496,7 +2664,12 @@ std::shared_ptr<Catalog> SysCatalog::getCatalog(const std::string& dbName) {
   if (cat_map_.find(cata, dbName)) {
     return cata->second;
   } else {
-    return nullptr;
+    Catalog_Namespace::DBMetadata db_meta;
+    if (getMetadataForDB(dbName, db_meta)) {
+      return getCatalog(db_meta, false);
+    } else {
+      return nullptr;
+    }
   }
 }
 
@@ -2512,14 +2685,16 @@ std::shared_ptr<Catalog> SysCatalog::getCatalog(const int32_t db_id) {
 }
 
 std::shared_ptr<Catalog> SysCatalog::getCatalog(const DBMetadata& curDB, bool is_new_db) {
-  auto cat = getCatalog(curDB.dbName);
-  if (cat) {
-    return cat;
+  {
+    dbid_to_cat_map::const_accessor cata;
+    if (cat_map_.find(cata, curDB.dbName)) {
+      return cata->second;
+    }
   }
 
   // Catalog doesnt exist
   // has to be made outside of lock as migration uses cat
-  cat = std::make_shared<Catalog>(
+  auto cat = std::make_shared<Catalog>(
       basePath_, curDB, dataMgr_, string_dict_hosts_, calciteMgr_, is_new_db);
 
   dbid_to_cat_map::accessor cata;
@@ -2538,4 +2713,63 @@ void SysCatalog::removeCatalog(const std::string& dbName) {
   cat_map_.erase(dbName);
 }
 
+void SysCatalog::reassignObjectOwners(
+    const std::map<int32_t, std::vector<DBObject>>& old_owner_db_objects,
+    int32_t new_owner_id,
+    const Catalog_Namespace::Catalog& catalog) {
+  sys_write_lock write_lock(this);
+  sys_sqlite_lock sqlite_lock(this);
+
+  sqliteConnector_->query("BEGIN TRANSACTION");
+  try {
+    UserMetadata new_owner;
+    CHECK(getMetadataForUserById(new_owner_id, new_owner));
+    for (const auto& [old_owner_id, db_objects] : old_owner_db_objects) {
+      UserMetadata old_owner;
+      CHECK(getMetadataForUserById(old_owner_id, old_owner));
+      if (!old_owner.isSuper) {
+        revokeDBObjectPrivilegesBatch_unsafe({old_owner.userName}, db_objects, catalog);
+      }
+      if (!new_owner.isSuper) {
+        grantDBObjectPrivilegesBatch_unsafe({new_owner.userName}, db_objects, catalog);
+      }
+    }
+
+    std::set<int32_t> old_owner_ids;
+    for (const auto& [old_owner_id, db_objects] : old_owner_db_objects) {
+      old_owner_ids.emplace(old_owner_id);
+    }
+
+    auto db_id = catalog.getDatabaseId();
+    for (const auto old_user_id : old_owner_ids) {
+      sqliteConnector_->query_with_text_params(
+          "UPDATE mapd_object_permissions SET objectOwnerId = ? WHERE objectOwnerId = ? "
+          "AND dbId = ? AND objectId != -1",
+          std::vector<std::string>{std::to_string(new_owner_id),
+                                   std::to_string(old_user_id),
+                                   std::to_string(db_id)});
+    }
+
+    for (const auto& [user_or_role, grantee] : granteeMap_) {
+      grantee->reassignObjectOwners(old_owner_ids, new_owner_id, db_id);
+    }
+
+    for (const auto& [object_key, object_descriptor] : objectDescriptorMap_) {
+      if (object_descriptor->objectId != -1 && object_descriptor->dbId == db_id &&
+          shared::contains(old_owner_ids, object_descriptor->objectOwnerId)) {
+        object_descriptor->objectOwnerId = new_owner_id;
+      }
+    }
+  } catch (std::exception& e) {
+    sqliteConnector_->query("ROLLBACK TRANSACTION");
+
+    // Rebuild updated maps from storage
+    granteeMap_.clear();
+    buildRoleMap();
+    objectDescriptorMap_.clear();
+    buildObjectDescriptorMap();
+    throw;
+  }
+  sqliteConnector_->query("END TRANSACTION");
+}
 }  // namespace Catalog_Namespace

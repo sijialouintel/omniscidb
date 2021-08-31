@@ -376,12 +376,185 @@ TEST_F(ShowUserSessionsTest, PRIVILEGES_NONSUPERUSER) {
     FAIL() << "An exception should have been thrown for this test case.";
   } catch (const TOmniSciException& e) {
     ASSERT_EQ(
-        "Exception: SHOW USER SESSIONS failed, because it can only be executed by super "
+        "SHOW USER SESSIONS failed, because it can only be executed by super "
         "user.",
         e.error_msg);
   }
 
   logout(usersession);
+}
+
+class ShowUserDetailsTest : public DBHandlerTestFixture {
+ public:
+  void SetUp() override { DBHandlerTestFixture::SetUp(); }
+
+  static void SetUpTestSuite() {
+    createDBHandler();
+    users_ = {"user1", "user2"};
+    superusers_ = {"super1", "super2"};
+    dbs_ = {"omnisci"};
+    createUsers();
+    createSuperUsers();
+  }
+
+  static void TearDownTestSuite() {
+    dropUsers();
+    dropSuperUsers();
+  }
+
+  void TearDown() override { DBHandlerTestFixture::TearDown(); }
+
+  static void createUsers() {
+    for (const auto& user : users_) {
+      std::stringstream create;
+      create << "CREATE USER " << user
+             << " (password = 'HyperInteractive', is_super = 'false', "
+                "default_db='omnisci');";
+      sql(create.str());
+      for (const auto& db : dbs_) {
+        std::stringstream grant;
+        grant << "GRANT ALL ON DATABASE  " << db << " to " << user << ";";
+        sql(grant.str());
+      }
+    }
+  }
+
+  static void createSuperUsers() {
+    for (const auto& user : superusers_) {
+      std::stringstream create;
+      create
+          << "CREATE USER " << user
+          << " (password = 'HyperInteractive', is_super = 'true', default_db='omnisci');";
+      sql(create.str());
+      for (const auto& db : dbs_) {
+        std::stringstream grant;
+        grant << "GRANT ALL ON DATABASE  " << db << " to " << user << ";";
+        sql(grant.str());
+      }
+    }
+  }
+
+  static void dropUsers() {
+    for (const auto& user : users_) {
+      std::stringstream drop;
+      drop << "DROP USER " << user << ";";
+      sql(drop.str());
+    }
+  }
+
+  static void dropSuperUsers() {
+    for (const auto& user : superusers_) {
+      std::stringstream drop;
+      drop << "DROP USER " << user << ";";
+      sql(drop.str());
+    }
+  }
+
+  enum ColumnIndex { NAME, ID, IS_SUPER, DEFAULT_DB, CAN_LOGIN };
+
+  void assertExpectedFormat(const TQueryResult& result) {
+    ASSERT_EQ(result.row_set.is_columnar, true);
+    ASSERT_EQ(result.row_set.columns.size(), size_t(5));
+    ASSERT_EQ(result.row_set.row_desc[NAME].col_type.type, TDatumType::STR);
+    ASSERT_EQ(result.row_set.row_desc[NAME].col_name, "NAME");
+    ASSERT_EQ(result.row_set.row_desc[ID].col_type.type, TDatumType::BIGINT);
+    ASSERT_EQ(result.row_set.row_desc[ID].col_name, "ID");
+    ASSERT_EQ(result.row_set.row_desc[IS_SUPER].col_type.type, TDatumType::BOOL);
+    ASSERT_EQ(result.row_set.row_desc[IS_SUPER].col_name, "IS_SUPER");
+    ASSERT_EQ(result.row_set.row_desc[DEFAULT_DB].col_type.type, TDatumType::STR);
+    ASSERT_EQ(result.row_set.row_desc[DEFAULT_DB].col_name, "DEFAULT_DB");
+    ASSERT_EQ(result.row_set.row_desc[CAN_LOGIN].col_type.type, TDatumType::BOOL);
+    ASSERT_EQ(result.row_set.row_desc[CAN_LOGIN].col_name, "CAN_LOGIN");
+  }
+
+  void assertUserResultFound(const TQueryResult& result, const std::string& username) {
+    int num_matches = 0;
+    for (size_t i = 0; i < result.row_set.columns[NAME].data.str_col.size(); ++i) {
+      if (result.row_set.columns[NAME].data.str_col[i] == username) {
+        num_matches++;
+      }
+    }
+    ASSERT_EQ(num_matches, 1);
+  }
+
+  template <typename T>
+  void assertUserResultFound(const TQueryResult& result,
+                             const std::string& username,
+                             ColumnIndex col,
+                             T val) {
+    using CLEANT = std::remove_reference_t<std::remove_cv_t<T>>;
+    static_assert(std::is_integral_v<CLEANT> || std::is_floating_point_v<CLEANT> ||
+                  std::is_same_v<std::string, CLEANT>);
+    int num_matches = 0;
+    for (size_t i = 0; i < result.row_set.columns[NAME].data.str_col.size(); ++i) {
+      if (result.row_set.columns[NAME].data.str_col[i] == username) {
+        num_matches++;
+        // integral
+        if constexpr (std::is_integral_v<CLEANT>) {
+          ASSERT_EQ(result.row_set.columns[col].data.int_col[i], val);
+        }
+        // floating point
+        else if constexpr (std::is_floating_point_v<CLEANT>) {
+          ASSERT_EQ(result.row_set.columns[col].data.real_col[i], val);
+        }
+        // string
+        else if constexpr (std::is_same_v<std::string, CLEANT>) {
+          ASSERT_EQ(result.row_set.columns[col].data.str_col[i], val);
+        }
+      }
+    }
+    ASSERT_EQ(num_matches, 1);
+  }
+
+  void assertNumUsers(const TQueryResult& result, size_t num_users) {
+    ASSERT_EQ(num_users, result.row_set.columns[NAME].data.str_col.size());
+  }
+  std::vector<std::string> get_users() { return users_; }
+  std::vector<std::string> get_superusers() { return superusers_; }
+
+ private:
+  static inline std::vector<std::string> users_;
+  static inline std::vector<std::string> superusers_;
+  static inline std::vector<std::string> dbs_;
+
+  std::string admin_id;
+};
+
+TEST_F(ShowUserDetailsTest, AllUsers) {
+  TQueryResult result;
+  sql(result, "SHOW USER DETAILS;");
+  assertExpectedFormat(result);
+  assertNumUsers(result, 5);
+  assertUserResultFound(result, "admin");
+  assertUserResultFound(result, "user1");
+  assertUserResultFound(result, "user2");
+  assertUserResultFound(result, "super1");
+  assertUserResultFound(result, "super2");
+}
+
+TEST_F(ShowUserDetailsTest, OneUser) {
+  TQueryResult result;
+  sql(result, "SHOW USER DETAILS user1;");
+  assertNumUsers(result, 1);
+  assertUserResultFound(result, "user1");
+}
+
+TEST_F(ShowUserDetailsTest, MultipleUsers) {
+  TQueryResult result;
+  sql(result, "SHOW USER DETAILS user1,super1;");
+  assertNumUsers(result, 2);
+  assertUserResultFound(result, "user1");
+  assertUserResultFound(result, "super1");
+}
+
+TEST_F(ShowUserDetailsTest, Columns) {
+  using namespace std::string_literals;
+  TQueryResult result;
+  sql(result, "SHOW USER DETAILS user1;");
+  assertNumUsers(result, 1);
+  assertUserResultFound(result, "user1", IS_SUPER, false);
+  assertUserResultFound(result, "user1", DEFAULT_DB, "omnisci(1)"s);
+  assertUserResultFound(result, "user1", CAN_LOGIN, true);
 }
 
 class ShowTest : public DBHandlerTestFixture {
@@ -1010,6 +1183,29 @@ TEST_F(ShowCreateTableTest, TableWithMaxRollbackEpochs) {
                         "(MAX_ROLLBACK_EPOCHS=10);"}});
 }
 
+TEST_F(ShowCreateTableTest, DefaultColumnValues) {
+  sql("CREATE TABLE showcreatetabletest (idx INTEGER NOT NULL, i INTEGER DEFAULT 14,"
+      "big_i BIGINT DEFAULT 314958734, null_i INTEGER, int_a INTEGER[] "
+      "DEFAULT ARRAY[1, 2, 3], text_a TEXT[] DEFAULT ARRAY['a', 'b'] ENCODING DICT(32),"
+      "dt TEXT DEFAULT 'World' ENCODING DICT(32), ls GEOMETRY(LINESTRING) "
+      "DEFAULT 'LINESTRING (1 1,2 2,3 3)' ENCODING NONE, p GEOMETRY(POINT) DEFAULT "
+      "'POINT (1 2)' ENCODING NONE,  d DATE DEFAULT '2011-10-23' ENCODING DAYS(32), "
+      "ta TIMESTAMP[] DEFAULT ARRAY['2011-10-23 07:15:01', '2012-09-17 11:59:11'], "
+      "f FLOAT DEFAULT 1.15, n DECIMAL(3,2) DEFAULT 1.25 ENCODING FIXED(16));");
+  sqlAndCompareResult(
+      "SHOW CREATE TABLE showcreatetabletest;",
+      {{"CREATE TABLE showcreatetabletest (\n  idx INTEGER NOT NULL,\n  i INTEGER "
+        "DEFAULT 14,\n  big_i "
+        "BIGINT DEFAULT 314958734,\n  null_i INTEGER,\n  int_a INTEGER[] DEFAULT "
+        "ARRAY[1, 2, 3],\n  text_a TEXT[] DEFAULT ARRAY['a', 'b'] ENCODING DICT(32),\n  "
+        "dt TEXT DEFAULT 'World' ENCODING DICT(32),\n  ls GEOMETRY(LINESTRING) DEFAULT "
+        "'LINESTRING (1 1,2 2,3 3)' ENCODING NONE,\n  p GEOMETRY(POINT) DEFAULT 'POINT "
+        "(1 2)' ENCODING NONE,\n  d DATE DEFAULT '2011-10-23' ENCODING DAYS(32),\n  ta "
+        "TIMESTAMP(0)[] DEFAULT ARRAY['2011-10-23 07:15:01', '2012-09-17 11:59:11'],\n  "
+        "f "
+        "FLOAT DEFAULT 1.15,\n  n DECIMAL(3,2) DEFAULT 1.25 ENCODING FIXED(16));"}});
+}
+
 namespace {
 const int64_t PAGES_PER_DATA_FILE =
     File_Namespace::FileMgr::DEFAULT_NUM_PAGES_PER_DATA_FILE;
@@ -1074,7 +1270,7 @@ class ShowDiskCacheUsageTest : public ShowTest {
         "');");
   }
 
-  uint64_t getWrapperSizeForTable(std::string& table_name) {
+  uint64_t getWrapperSizeForTable(const std::string& table_name) {
     uint64_t space_used = 0;
     auto& cat = getCatalog();
     auto td = cat.getMetadataForTable(table_name, false);
@@ -1131,7 +1327,7 @@ TEST_F(ShowDiskCacheUsageTest, NoTables) {
 
 TEST_F(ShowDiskCacheUsageTest, NoTablesFiltered) {
   queryAndAssertException("SHOW DISK CACHE USAGE foreign_table;",
-                          "Exception: Can not show disk cache usage for table: "
+                          "Can not show disk cache usage for table: "
                           "foreign_table. Table does not exist.");
 }
 
@@ -1217,15 +1413,15 @@ class ShowDiskCacheUsageForNormalTableTest : public ShowDiskCacheUsageTest {
  public:
   static void SetUpTestSuite() {
     ShowDiskCacheUsageTest::SetUpTestSuite();
-    resetPersistentStorageMgr(DiskCacheLevel::all);
+    resetPersistentStorageMgr(File_Namespace::DiskCacheLevel::all);
   }
 
   static void TearDownTestSuite() {
-    resetPersistentStorageMgr(DiskCacheLevel::fsi);
+    resetPersistentStorageMgr(File_Namespace::DiskCacheLevel::fsi);
     ShowDiskCacheUsageTest::TearDownTestSuite();
   }
 
-  static void resetPersistentStorageMgr(DiskCacheLevel cache_level) {
+  static void resetPersistentStorageMgr(File_Namespace::DiskCacheLevel cache_level) {
     for (auto table_it : getCatalog().getAllTableMetadata()) {
       getCatalog().removeFragmenterForTable(table_it->tableId);
     }
@@ -1399,8 +1595,8 @@ class ShowTableDetailsTest : public ShowTest,
     if (isDistributedMode()) {
       assertResultSetEqual({{i(0), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                              i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                             i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                             i(NULL_BIGINT)},
+                             i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                             i(0)},
                             {i(0), i(2), "test_table_2", i(5), True, i(1), i(DEFAULT_MAX_ROWS),
                              i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(1), i(1),
                              i(0), i(0), i(1), i(DEFAULT_METADATA_FILE_SIZE),
@@ -1413,8 +1609,8 @@ class ShowTableDetailsTest : public ShowTest,
                              i(data_file_size), i(PAGES_PER_DATA_FILE), i(PAGES_PER_DATA_FILE - 2)},
                             {i(1), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                              i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                             i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                             i(NULL_BIGINT)},
+                             i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                             i(0)},
                             {i(1), i(2), "test_table_2", i(5), True, i(1), i(DEFAULT_MAX_ROWS),
                              i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(1), i(1),
                              i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0)},
@@ -1453,8 +1649,8 @@ class ShowTableDetailsTest : public ShowTest,
     if (isDistributedMode()) {
       assertResultSetEqual({{i(0), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                              i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                             i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                             i(NULL_BIGINT)},
+                             i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                             i(0)},
                             {i(0), i(2), "test_table_2", i(5), True, i(1), i(DEFAULT_MAX_ROWS),
                              i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(1), i(1),
                              i(0), i(0), i(0), i(0), i(0), i(0), i(1), i(data_file_size),
@@ -1465,8 +1661,8 @@ class ShowTableDetailsTest : public ShowTest,
                              i(PAGES_PER_DATA_FILE), i(PAGES_PER_DATA_FILE - 4)},
                             {i(1), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                              i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                             i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                             i(NULL_BIGINT)},
+                             i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                             i(0)},
                             {i(1), i(2), "test_table_2", i(5), True, i(1), i(DEFAULT_MAX_ROWS),
                              i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(1), i(1),
                              i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0)},
@@ -1528,39 +1724,39 @@ TEST_F(ShowTableDetailsTest, EmptyTables) {
   if (isDistributedMode()) {
     assertResultSetEqual({{i(0), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(0), i(2), "test_table_2", i(5), True, i(1), i(10),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(0), i(4), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(5), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0), i(0), i(0), i(0),
-                           i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0), i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0)},
                           {i(1), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(1), i(2), "test_table_2", i(5), True, i(1), i(10),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(1), i(4), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(5), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0), i(0), i(0), i(0),
-                           i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0), i(NULL_BIGINT)}},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0)}},
                          result);
   } else {
     assertResultSetEqual({{i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(2), "test_table_2", i(5), True, i(2), i(10),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(5), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(5), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0), i(0), i(0), i(0),
-                           i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0), i(NULL_BIGINT)}},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0)}},
                          result);
   }
   // clang-format on
@@ -1577,19 +1773,19 @@ TEST_F(ShowTableDetailsTest, NotCaseSensitive) {
   if (isDistributedMode()) {
     assertResultSetEqual({{i(0), i(1), "TEST_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(1), i(1), "TEST_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)}}, 
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)}},
                          result);
   }
   else {
     assertResultSetEqual({{i(1), "TEST_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)}}, 
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)}},
                          result);
   }
   // clang-format on
@@ -1667,30 +1863,30 @@ TEST_F(ShowTableDetailsTest, CommandWithTableNames) {
   if (isDistributedMode()) {
     assertResultSetEqual({{i(0), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(0), i(4), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(1), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(1), i(4), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)}},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)}},
                          result);
   } else {
     assertResultSetEqual({{i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(5), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)}},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)}},
                          result);
   }
   // clang-format on
@@ -1713,18 +1909,18 @@ TEST_F(ShowTableDetailsTest, UserSpecificTables) {
   if (isDistributedMode()) {
     assertResultSetEqual({{i(0), i(4), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(1), i(4), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)}},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)}},
                          result);
   } else {
     assertResultSetEqual({{i(5), "test_table_3", i(3), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)}},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)}},
                          result);
   }
   // clang-format on
@@ -1738,7 +1934,7 @@ TEST_F(ShowTableDetailsTest, InaccessibleTable) {
 
   loginTestUser();
   queryAndAssertException("show table details test_table_1;",
-                          "Exception: Unable to show table details for table: "
+                          "Unable to show table details for table: "
                           "test_table_1. Table does not exist.");
 }
 
@@ -1749,7 +1945,7 @@ TEST_F(ShowTableDetailsTest, NonExistentTable) {
   sql("create table test_table_3 (c1 int) with (partitions = 'REPLICATED');");
 
   queryAndAssertException("show table details test_table_4;",
-                          "Exception: Unable to show table details for table: "
+                          "Unable to show table details for table: "
                           "test_table_4. Table does not exist.");
 }
 
@@ -1775,18 +1971,18 @@ TEST_F(ShowTableDetailsTest, UnsupportedTableTypes) {
   if (isDistributedMode()) {
     assertResultSetEqual({{i(0), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)},
                           {i(1), i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)}},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)}},
                          result);
   } else {
     assertResultSetEqual({{i(1), "test_table_1", i(4), False, i(0), i(DEFAULT_MAX_ROWS),
                            i(DEFAULT_FRAGMENT_ROWS), i(DEFAULT_MAX_ROLLBACK_EPOCHS), i(0), i(0),
-                           i(0), i(0), i(0), i(0), i(0), i(NULL_BIGINT), i(0), i(0), i(0),
-                           i(NULL_BIGINT)}},
+                           i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
+                           i(0)}},
                          result);
   }
   // clang-format on
@@ -1803,7 +1999,7 @@ TEST_F(ShowTableDetailsTest, FsiTableSpecified) {
       boost::filesystem::canonical("../../Tests/FsiDataFiles/0.csv").string() + "');");
 
   queryAndAssertException("show table details test_foreign_table;",
-                          "Exception: SHOW TABLE DETAILS is not supported for foreign "
+                          "SHOW TABLE DETAILS is not supported for foreign "
                           "tables. Table name: test_foreign_table.");
 }
 
@@ -1811,7 +2007,7 @@ TEST_F(ShowTableDetailsTest, TemporaryTableSpecified) {
   sql("create temporary table test_temp_table (c1 int, c2 text);");
 
   queryAndAssertException("show table details test_temp_table;",
-                          "Exception: SHOW TABLE DETAILS is not supported for temporary "
+                          "SHOW TABLE DETAILS is not supported for temporary "
                           "tables. Table name: test_temp_table.");
 }
 
@@ -1820,7 +2016,7 @@ TEST_F(ShowTableDetailsTest, ArrowFsiTableSpecified) {
       boost::filesystem::canonical("../../Tests/FsiDataFiles/0.csv").string() + "';");
 
   queryAndAssertException("show table details test_arrow_table;",
-                          "Exception: SHOW TABLE DETAILS is not supported for temporary "
+                          "SHOW TABLE DETAILS is not supported for temporary "
                           "tables. Table name: test_arrow_table.");
 }
 
@@ -1829,7 +2025,7 @@ TEST_F(ShowTableDetailsTest, ViewSpecified) {
   sql("create view test_view as select * from test_table_1;");
 
   queryAndAssertException("show table details test_view;",
-                          "Exception: Unable to show table details for table: "
+                          "Unable to show table details for table: "
                           "test_view. Table does not exist.");
 }
 

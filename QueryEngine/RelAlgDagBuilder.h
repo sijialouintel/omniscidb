@@ -28,6 +28,7 @@
 
 #include <rapidjson/document.h>
 #include <boost/core/noncopyable.hpp>
+#include <boost/functional/hash.hpp>
 
 #include "Catalog/Catalog.h"
 #include "QueryEngine/QueryHint.h"
@@ -44,7 +45,13 @@ class Rex {
  public:
   virtual std::string toString() const = 0;
 
+  // return hashed value of string representation of this rex
+  virtual size_t toHash() const = 0;
+
   virtual ~Rex() {}
+
+ protected:
+  mutable std::optional<size_t> hash_;
 };
 
 class RexScalar : public Rex {};
@@ -62,6 +69,14 @@ class RexAbstractInput : public RexScalar {
     return cat(::typeName(this), "(", std::to_string(in_index_), ")");
   }
 
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RexAbstractInput).hash_code();
+      boost::hash_combine(*hash_, in_index_);
+    }
+    return *hash_;
+  }
+
  private:
   mutable unsigned in_index_;
 };
@@ -73,15 +88,15 @@ class RexLiteral : public RexScalar {
              const SQLTypes target_type,
              const unsigned scale,
              const unsigned precision,
-             const unsigned type_scale,
-             const unsigned type_precision)
+             const unsigned target_scale,
+             const unsigned target_precision)
       : literal_(val)
       , type_(type)
       , target_type_(target_type)
       , scale_(scale)
       , precision_(precision)
-      , type_scale_(type_scale)
-      , type_precision_(type_precision) {
+      , target_scale_(target_scale)
+      , target_precision_(target_precision) {
     CHECK(type == kDECIMAL || type == kINTERVAL_DAY_TIME ||
           type == kINTERVAL_YEAR_MONTH || is_datetime(type) || type == kBIGINT ||
           type == kINT);
@@ -92,15 +107,15 @@ class RexLiteral : public RexScalar {
              const SQLTypes target_type,
              const unsigned scale,
              const unsigned precision,
-             const unsigned type_scale,
-             const unsigned type_precision)
+             const unsigned target_scale,
+             const unsigned target_precision)
       : literal_(val)
       , type_(type)
       , target_type_(target_type)
       , scale_(scale)
       , precision_(precision)
-      , type_scale_(type_scale)
-      , type_precision_(type_precision) {
+      , target_scale_(target_scale)
+      , target_precision_(target_precision) {
     CHECK_EQ(kDOUBLE, type);
   }
 
@@ -109,15 +124,15 @@ class RexLiteral : public RexScalar {
              const SQLTypes target_type,
              const unsigned scale,
              const unsigned precision,
-             const unsigned type_scale,
-             const unsigned type_precision)
+             const unsigned target_scale,
+             const unsigned target_precision)
       : literal_(val)
       , type_(type)
       , target_type_(target_type)
       , scale_(scale)
       , precision_(precision)
-      , type_scale_(type_scale)
-      , type_precision_(type_precision) {
+      , target_scale_(target_scale)
+      , target_precision_(target_precision) {
     CHECK_EQ(kTEXT, type);
   }
 
@@ -126,15 +141,15 @@ class RexLiteral : public RexScalar {
              const SQLTypes target_type,
              const unsigned scale,
              const unsigned precision,
-             const unsigned type_scale,
-             const unsigned type_precision)
+             const unsigned target_scale,
+             const unsigned target_precision)
       : literal_(val)
       , type_(type)
       , target_type_(target_type)
       , scale_(scale)
       , precision_(precision)
-      , type_scale_(type_scale)
-      , type_precision_(type_precision) {
+      , target_scale_(target_scale)
+      , target_precision_(target_precision) {
     CHECK_EQ(kBOOLEAN, type);
   }
 
@@ -144,8 +159,8 @@ class RexLiteral : public RexScalar {
       , target_type_(target_type)
       , scale_(0)
       , precision_(0)
-      , type_scale_(0)
-      , type_precision_(0) {}
+      , target_scale_(0)
+      , target_precision_(0) {}
 
   template <class T>
   T getVal() const {
@@ -162,50 +177,34 @@ class RexLiteral : public RexScalar {
 
   unsigned getPrecision() const { return precision_; }
 
-  unsigned getTypeScale() const { return type_scale_; }
+  unsigned getTargetScale() const { return target_scale_; }
 
-  unsigned getTypePrecision() const { return type_precision_; }
+  unsigned getTargetPrecision() const { return target_precision_; }
 
   std::string toString() const override {
-    return cat(::typeName(this),
-               "(",
-               boost::lexical_cast<std::string>(literal_),
-               ", type=",
-               (type_ == kNULLT ? "null" : ::toString(type_)),
-               ", target_type=",
-               (target_type_ == kNULLT ? "null" : ::toString(target_type_)),
-               ")");
+    std::ostringstream oss;
+    oss << "RexLiteral(" << literal_ << " type=" << type_ << '(' << precision_ << ','
+        << scale_ << ") target_type=" << target_type_ << '(' << target_precision_ << ','
+        << target_scale_ << "))";
+    return oss.str();
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RexLiteral).hash_code();
+      boost::hash_combine(*hash_, literal_);
+      boost::hash_combine(*hash_, type_);
+      boost::hash_combine(*hash_, target_type_);
+      boost::hash_combine(*hash_, scale_);
+      boost::hash_combine(*hash_, precision_);
+      boost::hash_combine(*hash_, target_scale_);
+      boost::hash_combine(*hash_, target_precision_);
+    }
+    return *hash_;
   }
 
   std::unique_ptr<RexLiteral> deepCopy() const {
-    switch (literal_.which()) {
-      case 0: {
-        int64_t val = getVal<int64_t>();
-        return std::make_unique<RexLiteral>(
-            val, type_, target_type_, scale_, precision_, type_scale_, type_precision_);
-      }
-      case 1: {
-        double val = getVal<double>();
-        return std::make_unique<RexLiteral>(
-            val, type_, target_type_, scale_, precision_, type_scale_, type_precision_);
-      }
-      case 2: {
-        auto val = getVal<std::string>();
-        return std::make_unique<RexLiteral>(
-            val, type_, target_type_, scale_, precision_, type_scale_, type_precision_);
-      }
-      case 3: {
-        bool val = getVal<bool>();
-        return std::make_unique<RexLiteral>(
-            val, type_, target_type_, scale_, precision_, type_scale_, type_precision_);
-      }
-      case 4: {
-        return std::make_unique<RexLiteral>(target_type_);
-      }
-      default:
-        CHECK(false);
-    }
-    return nullptr;
+    return std::make_unique<RexLiteral>(*this);
   }
 
  private:
@@ -214,8 +213,8 @@ class RexLiteral : public RexScalar {
   const SQLTypes target_type_;
   const unsigned scale_;
   const unsigned precision_;
-  const unsigned type_scale_;
-  const unsigned type_precision_;
+  const unsigned target_scale_;
+  const unsigned target_precision_;
 };
 
 using RexLiteralArray = std::vector<RexLiteral>;
@@ -259,6 +258,18 @@ class RexOperator : public RexScalar {
                type_.to_string(),
                ")");
   };
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RexOperator).hash_code();
+      boost::hash_combine(*hash_, op_);
+      for (auto& operand : operands_) {
+        boost::hash_combine(*hash_, operand->toHash());
+      }
+      boost::hash_combine(*hash_, getType().get_type_name());
+    }
+    return *hash_;
+  }
 
  protected:
   const SQLOps op_;
@@ -309,6 +320,8 @@ class RexSubQuery : public RexScalar {
 
   std::string toString() const override;
 
+  size_t toHash() const override;
+
   std::unique_ptr<RexSubQuery> deepCopy() const;
 
   void setExecutionResult(const std::shared_ptr<const ExecutionResult> result);
@@ -338,6 +351,8 @@ class RexInput : public RexAbstractInput {
   }
 
   std::string toString() const override;
+
+  size_t toHash() const override;
 
   std::unique_ptr<RexInput> deepCopy() const {
     return std::make_unique<RexInput>(node_, getIndex());
@@ -391,6 +406,19 @@ class RexCase : public RexScalar {
                ")");
   }
 
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RexCase).hash_code();
+      for (size_t i = 0; i < branchCount(); ++i) {
+        boost::hash_combine(*hash_, getWhen(i)->toHash());
+        boost::hash_combine(*hash_, getThen(i)->toHash());
+      }
+      boost::hash_combine(*hash_,
+                          getElse() ? getElse()->toHash() : boost::hash_value("n"));
+    }
+    return *hash_;
+  }
+
  private:
   std::vector<
       std::pair<std::unique_ptr<const RexScalar>, std::unique_ptr<const RexScalar>>>
@@ -418,6 +446,19 @@ class RexFunctionOperator : public RexOperator {
 
   std::string toString() const override {
     return cat(::typeName(this), "(", name_, ", operands=", ::toString(operands_), ")");
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RexFunctionOperator).hash_code();
+      boost::hash_combine(*hash_, ::toString(op_));
+      boost::hash_combine(*hash_, getType().get_type_name());
+      for (auto& operand : operands_) {
+        boost::hash_combine(*hash_, operand->toHash());
+      }
+      boost::hash_combine(*hash_, name_);
+    }
+    return *hash_;
   }
 
  private:
@@ -455,6 +496,13 @@ class SortField {
                ", null_pos=",
                (nulls_pos_ == NullSortedPosition::First ? "nulls_first" : "nulls_last"),
                ")");
+  }
+
+  size_t toHash() const {
+    auto hash = boost::hash_value(field_);
+    boost::hash_combine(hash, sort_dir_ == SortDirection::Ascending ? "a" : "d");
+    boost::hash_combine(hash, nulls_pos_ == NullSortedPosition::First ? "f" : "l");
+    return hash;
   }
 
  private:
@@ -544,6 +592,41 @@ class RexWindowFunctionOperator : public RexFunctionOperator {
                ")");
   }
 
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RexWindowFunctionOperator).hash_code();
+      boost::hash_combine(*hash_, getType().get_type_name());
+      boost::hash_combine(*hash_, getName());
+      boost::hash_combine(*hash_, is_rows_);
+      for (auto& collation : collation_) {
+        boost::hash_combine(*hash_, collation.toHash());
+      }
+      for (auto& operand : operands_) {
+        boost::hash_combine(*hash_, operand->toHash());
+      }
+      for (auto& key : partition_keys_) {
+        boost::hash_combine(*hash_, key->toHash());
+      }
+      for (auto& key : order_keys_) {
+        boost::hash_combine(*hash_, key->toHash());
+      }
+      auto get_window_bound_hash =
+          [](const RexWindowFunctionOperator::RexWindowBound& bound) {
+            auto h = boost::hash_value(bound.offset ? bound.offset->toHash()
+                                                    : boost::hash_value("n"));
+            boost::hash_combine(h, bound.unbounded);
+            boost::hash_combine(h, bound.preceding);
+            boost::hash_combine(h, bound.following);
+            boost::hash_combine(h, bound.is_current_row);
+            boost::hash_combine(h, bound.order_key);
+            return h;
+          };
+      boost::hash_combine(*hash_, get_window_bound_hash(lower_bound_));
+      boost::hash_combine(*hash_, get_window_bound_hash(upper_bound_));
+    }
+    return *hash_;
+  }
+
  private:
   const SqlWindowFunctionKind kind_;
   mutable ConstRexScalarPtrVector partition_keys_;
@@ -564,6 +647,14 @@ class RexRef : public RexScalar {
 
   std::string toString() const override {
     return cat(::typeName(this), "(", std::to_string(index_), ")");
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RexRef).hash_code();
+      boost::hash_combine(*hash_, index_);
+    }
+    return *hash_;
   }
 
   std::unique_ptr<RexRef> deepCopy() const { return std::make_unique<RexRef>(index_); }
@@ -591,6 +682,19 @@ class RexAgg : public Rex {
                ", operands=",
                ::toString(operands_),
                ")");
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RexAgg).hash_code();
+      for (auto& operand : operands_) {
+        boost::hash_combine(*hash_, operand);
+      }
+      boost::hash_combine(*hash_, agg_);
+      boost::hash_combine(*hash_, distinct_);
+      boost::hash_combine(*hash_, type_.get_type_name());
+    }
+    return *hash_;
   }
 
   SQLAgg getKind() const { return agg_; }
@@ -686,11 +790,19 @@ class RelAlgNode {
     }
   }
 
+  // to keep an assigned DAG node id for data recycler
+  void setRelNodeDagId(const size_t id) const { dag_node_id_ = id; }
+
+  size_t getRelNodeDagId() const { return dag_node_id_; }
+
   bool isNop() const { return is_nop_; }
 
   void markAsNop() { is_nop_ = true; }
 
   virtual std::string toString() const = 0;
+
+  // return hashed value of a string representation of this rel node
+  virtual size_t toHash() const = 0;
 
   virtual size_t size() const = 0;
 
@@ -707,12 +819,14 @@ class RelAlgNode {
  protected:
   RelAlgInputs inputs_;
   const unsigned id_;
+  mutable std::optional<size_t> hash_;
 
  private:
   mutable const void* context_data_;
   bool is_nop_;
   mutable std::vector<TargetMetaInfo> targets_metainfo_;
   static thread_local unsigned crt_id_;
+  mutable size_t dag_node_id_;
 };
 
 class RelScan : public RelAlgNode {
@@ -734,6 +848,16 @@ class RelScan : public RelAlgNode {
   std::string toString() const override {
     return cat(
         ::typeName(this), "(", td_->tableName, ", ", ::toString(field_names_), ")");
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelScan).hash_code();
+      boost::hash_combine(*hash_, td_->tableId);
+      boost::hash_combine(*hash_, td_->tableName);
+      boost::hash_combine(*hash_, ::toString(field_names_));
+    }
+    return *hash_;
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override {
@@ -903,6 +1027,17 @@ class RelProject : public RelAlgNode, public ModifyManipulationTarget {
         ::typeName(this), "(", ::toString(scalar_exprs_), ", ", ::toString(fields_), ")");
   }
 
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelProject).hash_code();
+      for (auto& target_expr : scalar_exprs_) {
+        boost::hash_combine(*hash_, target_expr->toHash());
+      }
+      boost::hash_combine(*hash_, ::toString(fields_));
+    }
+    return *hash_;
+  }
+
   std::shared_ptr<RelAlgNode> deepCopy() const override {
     return std::make_shared<RelProject>(*this);
   }
@@ -1020,6 +1155,21 @@ class RelAggregate : public RelAlgNode {
                ")");
   }
 
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelAggregate).hash_code();
+      boost::hash_combine(*hash_, groupby_count_);
+      for (auto& agg_expr : agg_exprs_) {
+        boost::hash_combine(*hash_, agg_expr->toHash());
+      }
+      for (auto& node : inputs_) {
+        boost::hash_combine(*hash_, node->toHash());
+      }
+      boost::hash_combine(*hash_, ::toString(fields_));
+    }
+    return *hash_;
+  }
+
   std::shared_ptr<RelAlgNode> deepCopy() const override {
     return std::make_shared<RelAggregate>(*this);
   }
@@ -1094,7 +1244,20 @@ class RelJoin : public RelAlgNode {
                ", condition=",
                (condition_ ? condition_->toString() : "null"),
                ", join_type=",
-               std::to_string(static_cast<int>(join_type_)));
+               ::toString(join_type_));
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelJoin).hash_code();
+      boost::hash_combine(*hash_,
+                          condition_ ? condition_->toHash() : boost::hash_value("n"));
+      for (auto& node : inputs_) {
+        boost::hash_combine(*hash_, node->toHash());
+      }
+      boost::hash_combine(*hash_, ::toString(getJoinType()));
+    }
+    return *hash_;
   }
 
   size_t size() const override { return inputs_[0]->size() + inputs_[1]->size(); }
@@ -1135,6 +1298,127 @@ class RelJoin : public RelAlgNode {
   std::unique_ptr<Hints> hints_;
 };
 
+// a helper node that contains detailed information of each level of join qual
+// which is used when extracting query plan DAG
+class RelTranslatedJoin : public RelAlgNode {
+ public:
+  RelTranslatedJoin(const RelAlgNode* lhs,
+                    const RelAlgNode* rhs,
+                    const std::vector<const Analyzer::ColumnVar*> lhs_join_cols,
+                    const std::vector<const Analyzer::ColumnVar*> rhs_join_cols,
+                    const std::vector<std::shared_ptr<const Analyzer::Expr>> filter_ops,
+                    const RexScalar* outer_join_cond,
+                    const bool nested_loop,
+                    const JoinType join_type,
+                    const std::string& op_type,
+                    const std::string& qualifier,
+                    const std::string& op_typeinfo)
+      : lhs_(lhs)
+      , rhs_(rhs)
+      , lhs_join_cols_(lhs_join_cols)
+      , rhs_join_cols_(rhs_join_cols)
+      , filter_ops_(filter_ops)
+      , outer_join_cond_(outer_join_cond)
+      , nested_loop_(nested_loop)
+      , join_type_(join_type)
+      , op_type_(op_type)
+      , qualifier_(qualifier)
+      , op_typeinfo_(op_typeinfo) {
+    CHECK_EQ(lhs_join_cols_.size(), rhs_join_cols_.size());
+  }
+
+  std::string toString() const override {
+    return cat(::typeName(this),
+               "( join_quals { lhs: ",
+               ::toString(lhs_join_cols_),
+               ", rhs: ",
+               ::toString(rhs_join_cols_),
+               " }, filter_quals: { ",
+               ::toString(filter_ops_),
+               " }, outer_join_cond: { ",
+               ::toString(outer_join_cond_),
+               " }, loop_join: ",
+               ::toString(nested_loop_),
+               ", join_type: ",
+               ::toString(join_type_),
+               ", op_type: ",
+               ::toString(op_type_),
+               ", qualifier: ",
+               ::toString(qualifier_),
+               ", op_type_info: ",
+               ::toString(op_typeinfo_),
+               ")");
+  }
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelTranslatedJoin).hash_code();
+      boost::hash_combine(*hash_, lhs_->toHash());
+      boost::hash_combine(*hash_, rhs_->toHash());
+      boost::hash_combine(
+          *hash_, outer_join_cond_ ? outer_join_cond_->toHash() : boost::hash_value("n"));
+      boost::hash_combine(*hash_, nested_loop_);
+      boost::hash_combine(*hash_, ::toString(join_type_));
+      boost::hash_combine(*hash_, op_type_);
+      boost::hash_combine(*hash_, qualifier_);
+      boost::hash_combine(*hash_, op_typeinfo_);
+      for (auto& filter_op : filter_ops_) {
+        boost::hash_combine(*hash_, filter_op->toString());
+      }
+    }
+    return *hash_;
+  }
+  const RelAlgNode* getLHS() const { return lhs_; }
+  const RelAlgNode* getRHS() const { return rhs_; }
+  size_t getFilterCondSize() const { return filter_ops_.size(); }
+  const std::vector<std::shared_ptr<const Analyzer::Expr>> getFilterCond() const {
+    return filter_ops_;
+  }
+  const RexScalar* getOuterJoinCond() const { return outer_join_cond_; }
+  std::string getOpType() const { return op_type_; }
+  std::string getQualifier() const { return qualifier_; }
+  std::string getOpTypeInfo() const { return op_typeinfo_; }
+  size_t size() const override { return 0; }
+  JoinType getJoinType() const { return join_type_; }
+  const RexScalar* getCondition() const {
+    CHECK(false);
+    return nullptr;
+  }
+  const RexScalar* getAndReleaseCondition() const {
+    CHECK(false);
+    return nullptr;
+  }
+  void setCondition(std::unique_ptr<const RexScalar>& condition) { CHECK(false); }
+  void replaceInput(std::shared_ptr<const RelAlgNode> old_input,
+                    std::shared_ptr<const RelAlgNode> input) override {
+    CHECK(false);
+  }
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    CHECK(false);
+    return nullptr;
+  }
+  std::string getFieldName(const size_t i) const;
+  std::vector<const Analyzer::ColumnVar*> getJoinCols(bool lhs) const {
+    if (lhs) {
+      return lhs_join_cols_;
+    }
+    return rhs_join_cols_;
+  }
+  bool isNestedLoopQual() const { return nested_loop_; }
+
+ private:
+  const RelAlgNode* lhs_;
+  const RelAlgNode* rhs_;
+  const std::vector<const Analyzer::ColumnVar*> lhs_join_cols_;
+  const std::vector<const Analyzer::ColumnVar*> rhs_join_cols_;
+  const std::vector<std::shared_ptr<const Analyzer::Expr>> filter_ops_;
+  const RexScalar* outer_join_cond_;
+  const bool nested_loop_;
+  const JoinType join_type_;
+  const std::string op_type_;
+  const std::string qualifier_;
+  const std::string op_typeinfo_;
+};
+
 class RelFilter : public RelAlgNode {
  public:
   RelFilter(std::unique_ptr<const RexScalar>& filter,
@@ -1142,6 +1426,11 @@ class RelFilter : public RelAlgNode {
       : filter_(std::move(filter)) {
     CHECK(filter_);
     inputs_.push_back(input);
+  }
+
+  // for dummy filter node for data recycler
+  RelFilter(std::unique_ptr<const RexScalar>& filter) : filter_(std::move(filter)) {
+    CHECK(filter_);
   }
 
   RelFilter(RelFilter const&);
@@ -1168,6 +1457,17 @@ class RelFilter : public RelAlgNode {
                ::toString(inputs_) + ")");
   }
 
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelFilter).hash_code();
+      boost::hash_combine(*hash_, filter_ ? filter_->toHash() : boost::hash_value("n"));
+      for (auto& node : inputs_) {
+        boost::hash_combine(*hash_, node->toHash());
+      }
+    }
+    return *hash_;
+  }
+
   std::shared_ptr<RelAlgNode> deepCopy() const override {
     return std::make_shared<RelFilter>(*this);
   }
@@ -1189,11 +1489,17 @@ class RelLeftDeepInnerJoin : public RelAlgNode {
 
   std::string toString() const override;
 
+  size_t toHash() const override;
+
   size_t size() const override;
 
   std::shared_ptr<RelAlgNode> deepCopy() const override;
 
   bool coversOriginalNode(const RelAlgNode* node) const;
+
+  const RelFilter* getOriginalFilter() const;
+
+  std::vector<std::shared_ptr<const RelJoin>> getOriginalJoins() const;
 
  private:
   std::unique_ptr<const RexScalar> condition_;
@@ -1276,7 +1582,13 @@ class RelCompound : public RelAlgNode, public ModifyManipulationTarget {
 
   bool isAggregate() const { return is_agg_; }
 
+  size_t getAggExprSize() const { return agg_exprs_.size(); }
+
+  const RexAgg* getAggExpr(size_t i) const { return agg_exprs_[i].get(); }
+
   std::string toString() const override;
+
+  size_t toHash() const override;
 
   std::shared_ptr<RelAlgNode> deepCopy() const override {
     return std::make_shared<RelCompound>(*this);
@@ -1358,7 +1670,9 @@ class RelSort : public RelAlgNode {
   std::string toString() const override {
     return cat(::typeName(this),
                "(",
-               "collation=",
+               "empty_result: ",
+               ::toString(empty_result_),
+               ", collation=",
                ::toString(collation_),
                ", limit=",
                std::to_string(limit_),
@@ -1367,6 +1681,22 @@ class RelSort : public RelAlgNode {
                ", inputs=",
                ::toString(inputs_),
                ")");
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelSort).hash_code();
+      for (auto& collation : collation_) {
+        boost::hash_combine(*hash_, collation.toHash());
+      }
+      boost::hash_combine(*hash_, empty_result_);
+      boost::hash_combine(*hash_, limit_);
+      boost::hash_combine(*hash_, offset_);
+      for (auto& node : inputs_) {
+        boost::hash_combine(*hash_, node->toHash());
+      }
+    }
+    return *hash_;
   }
 
   size_t size() const override { return inputs_[0]->size(); }
@@ -1450,7 +1780,7 @@ class RelModify : public RelAlgNode {
   TableDescriptor const* const getTableDescriptor() const { return table_descriptor_; }
   bool const isFlattened() const { return flattened_; }
   ModifyOperation getOperation() const { return operation_; }
-  TargetColumnList const& getUpdateColumnNames() { return target_column_list_; }
+  TargetColumnList const& getUpdateColumnNames() const { return target_column_list_; }
   int getUpdateColumnCount() const { return target_column_list_.size(); }
 
   size_t size() const override { return 0; }
@@ -1471,6 +1801,20 @@ class RelModify : public RelAlgNode {
                ", inputs=",
                ::toString(inputs_),
                ")");
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelModify).hash_code();
+      boost::hash_combine(*hash_, table_descriptor_->tableName);
+      boost::hash_combine(*hash_, flattened_);
+      boost::hash_combine(*hash_, yieldModifyOperationString(operation_));
+      boost::hash_combine(*hash_, ::toString(target_column_list_));
+      for (auto& node : inputs_) {
+        boost::hash_combine(*hash_, node->toHash());
+      }
+    }
+    return *hash_;
   }
 
   void applyUpdateModificationsToInputNode() {
@@ -1570,6 +1914,11 @@ class RelTableFunction : public RelAlgNode {
 
   size_t size() const override { return target_exprs_.size(); }
 
+  const RexScalar* getTargetExpr(size_t idx) const {
+    CHECK_LT(idx, target_exprs_.size());
+    return target_exprs_[idx].get();
+  }
+
   size_t getTableFuncInputsSize() const { return table_func_inputs_.size(); }
 
   size_t getColInputsSize() const { return col_inputs_.size(); }
@@ -1595,6 +1944,8 @@ class RelTableFunction : public RelAlgNode {
     return fields_[idx];
   }
 
+  const std::vector<std::string>& getFields() const { return fields_; }
+
   std::shared_ptr<RelAlgNode> deepCopy() const override {
     return std::make_shared<RelTableFunction>(*this);
   }
@@ -1613,6 +1964,24 @@ class RelTableFunction : public RelAlgNode {
                ", target_exprs=",
                ::toString(target_exprs_),
                ")");
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelTableFunction).hash_code();
+      for (auto& table_func_input : table_func_inputs_) {
+        boost::hash_combine(*hash_, table_func_input->toHash());
+      }
+      for (auto& target_expr : target_exprs_) {
+        boost::hash_combine(*hash_, target_expr->toHash());
+      }
+      boost::hash_combine(*hash_, function_name_);
+      boost::hash_combine(*hash_, ::toString(fields_));
+      for (auto& node : inputs_) {
+        boost::hash_combine(*hash_, node->toHash());
+      }
+    }
+    return *hash_;
   }
 
  private:
@@ -1649,6 +2018,17 @@ class RelLogicalValues : public RelAlgNode {
     }
     ret += ")";
     return ret;
+  }
+
+  size_t toHash() const override {
+    if (!hash_) {
+      hash_ = typeid(RelLogicalValues).hash_code();
+      for (auto& target_meta_info : tuple_type_) {
+        boost::hash_combine(*hash_, target_meta_info.get_resname());
+        boost::hash_combine(*hash_, target_meta_info.get_type_info().get_type_name());
+      }
+    }
+    return *hash_;
   }
 
   const RexScalar* getValueAt(const size_t row_idx, const size_t col_idx) const {
@@ -1689,6 +2069,7 @@ class RelLogicalUnion : public RelAlgNode {
   }
   size_t size() const override;
   std::string toString() const override;
+  size_t toHash() const override;
 
   std::string getFieldName(const size_t i) const;
 
@@ -1779,6 +2160,8 @@ class RelAlgDagBuilder : public boost::noncopyable {
   }
 
   void registerQueryHints(Hints* hints_delivered) {
+    bool detect_columnar_output_hint = false;
+    bool detect_rowwise_output_hint = false;
     for (auto it = hints_delivered->begin(); it != hints_delivered->end(); it++) {
       auto target = it->second;
       auto hint_type = it->first;
@@ -1787,6 +2170,14 @@ class RelAlgDagBuilder : public boost::noncopyable {
           query_hint_.registerHint(QueryHint::kCpuMode);
           query_hint_.cpu_mode = true;
           VLOG(1) << "A user forces to run the query on the CPU execution mode";
+          break;
+        }
+        case QueryHint::kColumnarOutput: {
+          detect_columnar_output_hint = true;
+          break;
+        }
+        case QueryHint::kRowwiseOutput: {
+          detect_rowwise_output_hint = true;
           break;
         }
         case QueryHint::kOverlapsBucketThreshold: {
@@ -1844,6 +2235,42 @@ class RelAlgDagBuilder : public boost::noncopyable {
         }
         default:
           break;
+      }
+    }
+    // we have four cases depending on 1) g_enable_columnar_output flag
+    // and 2) query hint status: columnar_output and rowwise_output
+    // case 1. g_enable_columnar_output = true
+    // case 1.a) columnar_output = true (so rowwise_output = false);
+    // case 1.b) rowwise_output = true (so columnar_output = false);
+    // case 2. g_enable_columnar_output = false
+    // case 2.a) columnar_output = true (so rowwise_output = false);
+    // case 2.b) rowwise_output = true (so columnar_output = false);
+    // case 1.a --> use columnar output
+    // case 1.b --> use rowwise output
+    // case 2.a --> use columnar output
+    // case 2.b --> use rowwise output
+    if (detect_columnar_output_hint && detect_rowwise_output_hint) {
+      VLOG(1)
+          << "Two hints 1) columnar output and 2) rowwise output are enabled together, "
+          << "so skip them and use the runtime configuration "
+             "\"g_enable_columnar_output\"";
+    } else if (detect_columnar_output_hint && !detect_rowwise_output_hint) {
+      if (g_enable_columnar_output) {
+        VLOG(1) << "We already enable columnar output by default "
+                   "(g_enable_columnar_output = true), so skip this columnar output hint";
+      } else {
+        query_hint_.registerHint(QueryHint::kColumnarOutput);
+        query_hint_.columnar_output = true;
+        VLOG(1) << "A user forces the query to run with columnar output";
+      }
+    } else if (!detect_columnar_output_hint && detect_rowwise_output_hint) {
+      if (!g_enable_columnar_output) {
+        VLOG(1) << "We already use the default rowwise output (g_enable_columnar_output "
+                   "= false), so skip this rowwise output hint";
+      } else {
+        query_hint_.registerHint(QueryHint::kRowwiseOutput);
+        query_hint_.rowwise_output = true;
+        VLOG(1) << "A user forces the query to run with rowwise output";
       }
     }
   }

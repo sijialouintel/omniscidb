@@ -29,6 +29,7 @@ add_executable(ShardedTableEpochConsistencyTest ShardedTableEpochConsistencyTest
 add_executable(DiskCacheQueryTest DiskCacheQueryTest.cpp)
 add_executable(CachingFileMgrTest CachingFileMgrTest.cpp)
 add_executable(JSONTest JSONTest.cpp)
+add_executable(DataRecyclerTest DataRecyclerTest.cpp)
 
 if(ENABLE_CUDA)
   message(DEBUG "Tests CUDA_COMPILATION_ARCH: ${CUDA_COMPILATION_ARCH}")
@@ -73,7 +74,7 @@ add_executable(BumpAllocatorTest BumpAllocatorTest.cpp)
 add_executable(SpecialCharsTest SpecialCharsTest.cpp)
 add_executable(TableFunctionsTest TableFunctionsTest.cpp)
 add_executable(ArrayTest ArrayTest.cpp)
-add_executable(HighCardinalityGroupByTest HighCardinalityGroupByTest.cpp)
+add_executable(GroupByTest GroupByTest.cpp)
 add_executable(ParallelExecutorsTest ParallelExecutorsTest.cpp)
 add_executable(MigrationMgrTest MigrationMgrTest.cpp)
 add_executable(TopKTest TopKTest.cpp)
@@ -113,6 +114,7 @@ endif()
 
 # Tests + Microbenchmarks
 add_executable(TableUpdateDeleteBenchmark TableUpdateDeleteBenchmark.cpp)
+add_executable(GeospatialBenchmark GeospatialBenchmark.cpp)
 
 set(EXECUTE_TEST_LIBS gtest mapd_thrift QueryRunner ${MAPD_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${Boost_LIBRARIES} ${ZLIB_LIBRARIES} ${PROFILER_LIBS})
 set(THRIFT_HANDLER_TEST_LIBRARIES thrift_handler ${EXECUTE_TEST_LIBS})
@@ -146,8 +148,8 @@ target_link_libraries(StorageTest gtest ${EXECUTE_TEST_LIBS})
 target_link_libraries(ComputeMetadataTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(TableFunctionsTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(ArrayTest ${EXECUTE_TEST_LIBS})
-target_link_libraries(ParallelExecutorsTest ${EXECUTE_TEST_LIBS})
-target_link_libraries(HighCardinalityGroupByTest ${EXECUTE_TEST_LIBS})
+target_link_libraries(ParallelExecutorsTest ${THRIFT_HANDLER_TEST_LIBRARIES})
+target_link_libraries(GroupByTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(MigrationMgrTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(BumpAllocatorTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(SpecialCharsTest ${EXECUTE_TEST_LIBS})
@@ -168,7 +170,7 @@ endif()
 
 target_link_libraries(GeoTypesTest gtest Logger Shared Geospatial ${CMAKE_DL_LIBS})
 target_link_libraries(OverlapsJoinTest ${EXECUTE_TEST_LIBS})
-target_link_libraries(CtasUpdateTest ${EXECUTE_TEST_LIBS})
+
 target_link_libraries(CorrelatedSubqueryTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(CtasIntegrationTest gtest Logger Shared mapd_thrift ThriftClient ${LLVM_LINKER_FLAGS})
 target_link_libraries(DateTimeUtilsTest gtest Logger Shared ${LLVM_LINKER_FLAGS})
@@ -180,6 +182,7 @@ target_link_libraries(UtilTest OSDependent)
 target_link_libraries(EncoderTest gtest ${Arrow_LIBRARIES} Catalog ImportExport Geospatial Parser DataMgr Logger)
 target_link_libraries(CommandLineTest gtest Logger Shared ${Boost_LIBRARIES})
 #Requires thrift_handler for DBHandler test fixture
+target_link_libraries(CtasUpdateTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(DBObjectPrivilegesTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(ForeignServerDdlTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(CatalogMigrationTest ${THRIFT_HANDLER_TEST_LIBRARIES})
@@ -187,7 +190,7 @@ target_link_libraries(CreateAndDropTableDdlTest ${THRIFT_HANDLER_TEST_LIBRARIES}
 target_link_libraries(ShowCommandsDdlTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(ForeignTableDmlTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(DashboardAndCustomExpressionTest ${THRIFT_HANDLER_TEST_LIBRARIES})
-target_link_libraries(FileMgrTest ${THRIFT_HANDLER_TEST_LIBRARIES})
+target_link_libraries(FileMgrTest gtest DataMgr ${Boost_LIBRARIES})
 target_link_libraries(FilePathWhitelistTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(SQLHintTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(QuantileCpuTest gtest ${MAPD_LIBRARIES})
@@ -195,25 +198,30 @@ target_link_libraries(ForeignStorageCacheTest gtest ${MAPD_LIBRARIES})
 target_link_libraries(PersistentStorageTest gtest ${MAPD_LIBRARIES})
 target_link_libraries(ShardedTableEpochConsistencyTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(DiskCacheQueryTest ${THRIFT_HANDLER_TEST_LIBRARIES})
-target_link_libraries(CachingFileMgrTest gtest Logger Shared DataMgr OSDependent ${Boost_LIBRARIES} ${Folly_LIBRARIES})
+target_link_libraries(CachingFileMgrTest gtest DataMgr ${Boost_LIBRARIES})
 target_link_libraries(LoadTableTest ${THRIFT_HANDLER_TEST_LIBRARIES})
+target_link_libraries(DataRecyclerTest ${THRIFT_HANDLER_TEST_LIBRARIES})
 target_link_libraries(JSONTest gtest Logger Shared)
 
 if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
-  target_link_libraries(UdfTest gtest ${EXECUTE_TEST_LIBS})
+  target_link_libraries(UdfTest gtest UdfCompiler ${EXECUTE_TEST_LIBS})
 endif()
 
 target_link_libraries(TableUpdateDeleteBenchmark benchmark ${EXECUTE_TEST_LIBS})
+target_link_libraries(GeospatialBenchmark benchmark ${EXECUTE_TEST_LIBS})
+
 if(ENABLE_CUDA)
   target_link_libraries(GpuSharedMemoryTest ${EXECUTE_TEST_LIBS})
 elseif(ENABLE_DBE)
   target_link_libraries(EmbeddedDatabaseTest gtest DBEngine)
 endif()
 
-if(("${MAPD_EDITION_LOWER}" STREQUAL "ee") AND ENABLE_AWS_S3)
+if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   target_link_libraries(UserMappingDdlTest ${THRIFT_HANDLER_TEST_LIBRARIES})
   target_link_libraries(PkiEncryptorTest gtest Logger Shared)
-  target_link_libraries(S3SelectClientTest ${EXECUTE_TEST_LIBS})
+  if(ENABLE_AWS_S3)
+    target_link_libraries(S3SelectClientTest ${EXECUTE_TEST_LIBS})
+  endif()
 endif()
 
 set(TEST_ARGS "--gtest_output=xml:../")
@@ -245,7 +253,7 @@ add_test(SpecialCharsTest SpecialCharsTest ${TEST_ARGS})
 add_test(TableFunctionsTest TableFunctionsTest ${TEST_ARGS})
 add_test(ArrayTest ArrayTest ${TEST_ARGS})
 add_test(ParallelExecutorsTest ParallelExecutorsTest ${TEST_ARGS})
-add_test(HighCardinalityGroupByTest HighCardinalityGroupByTest ${TEST_ARGS})
+add_test(GroupByTest GroupByTest ${TEST_ARGS})
 add_test(MigrationMgrTest MigrationMgrTest ${TEST_ARGS})
 add_test(StoragePerfTest StoragePerfTest ${TEST_ARGS})
 add_test(TopKTest TopKTest ${TEST_ARGS})
@@ -278,6 +286,7 @@ add_test(PersistentStorageTest PersistentStorageTest ${TEST_ARGS})
 add_test(ShardedTableEpochConsistencyTest ShardedTableEpochConsistencyTest ${TEST_ARGS})
 add_test(DiskCacheQueryTest DiskCacheQueryTest ${TEST_ARGS})
 add_test(CachingFileMgrTest CachingFileMgrTest ${TEST_ARGS})
+add_test(DataRecyclerTest DataRecyclerTest ${TEST_ARGS})
 add_test(LoadTableTest LoadTableTest ${TEST_ARGS})
 add_test(JSONTest JSONTest ${TEST_ARGS})
 
@@ -291,14 +300,17 @@ if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
   add_test(UdfTest UdfTest ${TEST_ARGS})
 endif()
 
-if(("${MAPD_EDITION_LOWER}" STREQUAL "ee") AND ENABLE_AWS_S3)
+if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   add_test(UserMappingDdlTest UserMappingDdlTest ${TEST_ARGS})
   add_test(PkiEncryptorTest PkiEncryptorTest ${TEST_ARGS})
-  add_test(S3SelectClientTest S3SelectClientTest ${TEST_ARGS})
+  if(ENABLE_AWS_S3)
+    add_test(S3SelectClientTest S3SelectClientTest ${TEST_ARGS})
+  endif()
 endif()
 
+find_package(fmt REQUIRED)
 add_executable(ArrowIpcIntegrationTest ArrowIpcIntegrationTest.cpp)
-target_link_libraries(ArrowIpcIntegrationTest gtest ThriftClient mapd_thrift Logger Shared ${CUDA_LIBRARIES} ${Arrow_LIBRARIES})
+target_link_libraries(ArrowIpcIntegrationTest gtest fmt::fmt ThriftClient mapd_thrift Logger Shared ${CUDA_LIBRARIES} ${Arrow_LIBRARIES})
 add_test(ArrowIpcIntegrationTest ArrowIpcIntegrationTest ${TEST_ARGS})
 
 #parse s3 credentials
@@ -332,7 +344,7 @@ set(TEST_PROGRAMS
   SpecialCharsTest
   TableFunctionsTest
   ArrayTest
-  HighCardinalityGroupByTest
+  GroupByTest
   ParallelExecutorsTest
   MigrationMgrTest
   TopKTest
@@ -366,6 +378,7 @@ set(TEST_PROGRAMS
   ForeignStorageCacheTest
   PersistentStorageTest
   ShardedTableEpochConsistencyTest
+  DataRecyclerTest
   DiskCacheQueryTest
   CachingFileMgrTest
   LoadTableTest
@@ -382,7 +395,7 @@ if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
   list(APPEND TEST_PROGRAMS UdfTest)
 endif()
 
-if(("${MAPD_EDITION_LOWER}" STREQUAL "ee") AND ENABLE_AWS_S3)
+if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   list(APPEND TEST_PROGRAMS UserMappingDdlTest)
   list(APPEND TEST_PROGRAMS PkiEncryptorTest)
 endif()
@@ -439,3 +452,5 @@ if(ENABLE_DBE)
   add_dependencies(dbe_all_tests dbe4py-test)
   add_dependencies(all_tests dbe4py-test)
 endif()
+
+add_subdirectory(ExtensionFunctions/h3lib/)

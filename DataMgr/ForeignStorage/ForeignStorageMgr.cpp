@@ -75,8 +75,6 @@ void ForeignStorageMgr::fetchBuffer(const ChunkKey& chunk_key,
     }
   }
 
-  createAndPopulateDataWrapperIfNotExists(chunk_key);
-
   // TODO: Populate optional buffers as part of CSV performance improvement
   std::set<ChunkKey> chunk_keys = get_keys_set_from_table(chunk_key);
   chunk_keys.erase(chunk_key);
@@ -151,7 +149,12 @@ void ForeignStorageMgr::getChunkMetadataVecForKeyPrefix(
   CHECK(is_table_key(key_prefix));
   checkIfS3NeedsToBeEnabled(key_prefix);
   createDataWrapperIfNotExists(key_prefix);
-  getDataWrapper(key_prefix)->populateChunkMetadata(chunk_metadata);
+  try {
+    getDataWrapper(key_prefix)->populateChunkMetadata(chunk_metadata);
+  } catch (...) {
+    clearDataWrapper(key_prefix);
+    throw;
+  }
 }
 
 void ForeignStorageMgr::removeTableRelatedDS(const int db_id, const int table_id) {
@@ -183,7 +186,7 @@ std::shared_ptr<ForeignDataWrapper> ForeignStorageMgr::getDataWrapper(
   std::shared_lock data_wrapper_lock(data_wrapper_mutex_);
   ChunkKey table_key{chunk_key[CHUNK_KEY_DB_IDX], chunk_key[CHUNK_KEY_TABLE_IDX]};
   CHECK(data_wrapper_map_.find(table_key) != data_wrapper_map_.end());
-  return data_wrapper_map_[table_key];
+  return data_wrapper_map_.at(table_key);
 }
 
 void ForeignStorageMgr::setDataWrapper(
@@ -192,20 +195,25 @@ void ForeignStorageMgr::setDataWrapper(
   CHECK(is_table_key(table_key));
   std::lock_guard data_wrapper_lock(data_wrapper_mutex_);
   CHECK(data_wrapper_map_.find(table_key) != data_wrapper_map_.end());
-  data_wrapper->setParentWrapper(data_wrapper_map_[table_key]);
+  data_wrapper->setParentWrapper(data_wrapper_map_.at(table_key));
   data_wrapper_map_[table_key] = data_wrapper;
+}
+
+void ForeignStorageMgr::createDataWrapperUnlocked(int32_t db_id, int32_t tb_id) {
+  auto catalog = Catalog_Namespace::SysCatalog::instance().getCatalog(db_id);
+  CHECK(catalog);
+  auto foreign_table = catalog->getForeignTableUnlocked(tb_id);
+  ChunkKey table_key{db_id, tb_id};
+  data_wrapper_map_[table_key] = ForeignDataWrapperFactory::create(
+      foreign_table->foreign_server->data_wrapper_type, db_id, foreign_table);
 }
 
 bool ForeignStorageMgr::createDataWrapperIfNotExists(const ChunkKey& chunk_key) {
   std::lock_guard data_wrapper_lock(data_wrapper_mutex_);
   ChunkKey table_key{chunk_key[CHUNK_KEY_DB_IDX], chunk_key[CHUNK_KEY_TABLE_IDX]};
   if (data_wrapper_map_.find(table_key) == data_wrapper_map_.end()) {
-    auto db_id = chunk_key[CHUNK_KEY_DB_IDX];
-    auto catalog = Catalog_Namespace::SysCatalog::instance().getCatalog(db_id);
-    CHECK(catalog);
-    auto foreign_table = catalog->getForeignTableUnlocked(chunk_key[CHUNK_KEY_TABLE_IDX]);
-    data_wrapper_map_[table_key] = ForeignDataWrapperFactory::create(
-        foreign_table->foreign_server->data_wrapper_type, db_id, foreign_table);
+    auto [db_id, tb_id] = get_table_prefix(chunk_key);
+    createDataWrapperUnlocked(db_id, tb_id);
     return true;
   }
   return false;
@@ -293,10 +301,6 @@ std::string ForeignStorageMgr::printSlabs() {
   return {};  // Added to avoid "no return statement" compiler warning
 }
 
-void ForeignStorageMgr::clearSlabs() {
-  UNREACHABLE();
-}
-
 size_t ForeignStorageMgr::getMaxSize() {
   UNREACHABLE();
   return 0;  // Added to avoid "no return statement" compiler warning
@@ -332,15 +336,6 @@ AbstractBuffer* ForeignStorageMgr::alloc(const size_t num_bytes) {
 
 void ForeignStorageMgr::free(AbstractBuffer* buffer) {
   UNREACHABLE();
-}
-
-void ForeignStorageMgr::createAndPopulateDataWrapperIfNotExists(
-    const ChunkKey& chunk_key) {
-  ChunkKey table_key = get_table_key(chunk_key);
-  if (createDataWrapperIfNotExists(table_key)) {
-    ChunkMetadataVector chunk_metadata;
-    getDataWrapper(table_key)->populateChunkMetadata(chunk_metadata);
-  }
 }
 
 std::set<ChunkKey> get_keys_set_from_table(const ChunkKey& destination_chunk_key) {
@@ -421,7 +416,7 @@ ChunkToBufferMap ForeignStorageMgr::allocateTempBuffersForChunks(
 
 void ForeignStorageMgr::setParallelismHints(
     const std::map<ChunkKey, std::set<ParallelismHint>>& hints_per_table) {
-  std::shared_lock data_wrapper_lock(parallelism_hints_mutex_);
+  std::unique_lock data_wrapper_lock(parallelism_hints_mutex_);
   parallelism_hints_per_table_ = hints_per_table;
 }
 

@@ -33,6 +33,8 @@ constexpr int64_t False = 0;
 constexpr void* Null = nullptr;
 constexpr int64_t Null_i = NULL_INT;
 
+using NullableTargetValue = boost::variant<TargetValue, void*>;
+
 extern size_t g_leaf_count;
 extern bool g_cluster;
 
@@ -147,6 +149,30 @@ class AssertValueEqualsVisitor : public boost::static_visitor<> {
   const size_t column_;
 };
 
+class AssertValueEqualsOrIsNullVisitor : public boost::static_visitor<> {
+ public:
+  AssertValueEqualsOrIsNullVisitor(const TDatum& datum,
+                                   const TColumnType& column_type,
+                                   const size_t row,
+                                   const size_t column)
+      : datum_(datum), column_type_(column_type), row_(row), column_(column) {}
+
+  void operator()(const TargetValue& value) const {
+    boost::apply_visitor(AssertValueEqualsVisitor{datum_, column_type_, row_, column_},
+                         value);
+  }
+
+  void operator()(const void* null) const {
+    EXPECT_TRUE(datum_.is_null)
+        << boost::format("At row: %d, column: %d") % row_ % column_;
+  }
+
+  const TDatum& datum_;
+  const TColumnType& column_type_;
+  const size_t row_;
+  const size_t column_;
+};
+
 /**
  * Helper gtest fixture class for executing SQL queries through DBHandler
  * and asserting result sets.
@@ -160,10 +186,12 @@ class DBHandlerTestFixture : public testing::Test {
     desc.add_options()("cluster",
                        po::value<std::string>(&cluster_config_file_path_),
                        "Path to data leaves list JSON file.");
-
+    desc.add_options()("use-disk-cache", "Enable disk cache for all tables.");
     po::variables_map vm;
     po::store(po::command_line_parser(argc, argv).options(desc).run(), vm);
     po::notify(vm);
+
+    use_disk_cache_ = (vm.count("use-disk-cache"));
   }
 
   static void initTestArgs(const std::vector<LeafHostInfo>& string_servers,
@@ -182,7 +210,7 @@ class DBHandlerTestFixture : public testing::Test {
 
   static void TearDownTestSuite() {}
 
-  static void createDBHandler(DiskCacheLevel cache_level = DiskCacheLevel::fsi) {
+  static void createDBHandler() {
     if (!db_handler_) {
       setupSignalHandler();
 
@@ -212,8 +240,14 @@ class DBHandlerTestFixture : public testing::Test {
       system_parameters_.omnisci_server_port = -1;
       system_parameters_.calcite_port = 3280;
 
-      DiskCacheConfig disk_cache_config{std::string(BASE_PATH) + "/omnisci_disk_cache",
-                                        cache_level};
+      File_Namespace::DiskCacheLevel cache_level{File_Namespace::DiskCacheLevel::fsi};
+      if (use_disk_cache_) {
+        cache_level = File_Namespace::DiskCacheLevel::all;
+      }
+      File_Namespace::DiskCacheConfig disk_cache_config{
+          File_Namespace::DiskCacheConfig::getDefaultPath(std::string(BASE_PATH)),
+          cache_level};
+
       db_handler_ = std::make_unique<DBHandler>(db_leaves_,
                                                 string_leaves_,
                                                 BASE_PATH,
@@ -376,8 +410,13 @@ class DBHandlerTestFixture : public testing::Test {
     executeLambdaAndAssertException([&] { sql(sql_statement); }, error_message);
   }
 
+  void queryAndAssertPartialException(const std::string& sql_statement,
+                                      const std::string& error_message) {
+    executeLambdaAndAssertPartialException([&] { sql(sql_statement); }, error_message);
+  }
+
   void assertResultSetEqual(
-      const std::vector<std::vector<TargetValue>>& expected_result_set,
+      const std::vector<std::vector<NullableTargetValue>>& expected_result_set,
       const TQueryResult actual_result) {
     auto& row_set = actual_result.row_set;
     auto row_count = getRowCount(row_set);
@@ -399,7 +438,7 @@ class DBHandlerTestFixture : public testing::Test {
         auto column_value = row[c];
         auto expected_column_value = expected_result_set[r][c];
         boost::apply_visitor(
-            AssertValueEqualsVisitor{column_value, row_set.row_desc[c], r, c},
+            AssertValueEqualsOrIsNullVisitor{column_value, row_set.row_desc[c], r, c},
             expected_column_value);
       }
     }
@@ -407,7 +446,7 @@ class DBHandlerTestFixture : public testing::Test {
 
   void sqlAndCompareResult(
       const std::string& sql_statement,
-      const std::vector<std::vector<TargetValue>>& expected_result_set) {
+      const std::vector<std::vector<NullableTargetValue>>& expected_result_set) {
     TQueryResult result_set;
     sql(result_set, sql_statement);
     assertResultSetEqual(expected_result_set, result_set);
@@ -434,6 +473,12 @@ class DBHandlerTestFixture : public testing::Test {
     db_handler_->set_execution_mode(session_id_, mode);
     return true;
   }
+
+  void resizeDispatchQueue(size_t queue_size) {
+    db_handler_->resizeDispatchQueue(queue_size);
+  }
+
+  size_t getRowCount(const TQueryResult& result) { return getRowCount(result.row_set); }
 
  private:
   size_t getRowCount(const TRowSet& row_set) {
@@ -476,7 +521,7 @@ class DBHandlerTestFixture : public testing::Test {
         datum_array.emplace_back(datum_item);
       }
     } else {
-      throw std::runtime_error{"Unexpected column data"};
+      // no-op: it is possible for the array to be empty
     }
   }
 
@@ -547,6 +592,7 @@ class DBHandlerTestFixture : public testing::Test {
 
  public:
   static std::string cluster_config_file_path_;
+  static bool use_disk_cache_;
 };
 
 TSessionId DBHandlerTestFixture::session_id_{};
@@ -566,3 +612,4 @@ std::string DBHandlerTestFixture::cluster_config_file_path_{};
 #ifdef ENABLE_GEOS
 std::string DBHandlerTestFixture::libgeos_so_filename_{};
 #endif
+bool DBHandlerTestFixture::use_disk_cache_{false};

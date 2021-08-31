@@ -75,7 +75,7 @@ enum SQLAgg {
   kSUM,
   kCOUNT,
   kAPPROX_COUNT_DISTINCT,
-  kAPPROX_MEDIAN,
+  kAPPROX_QUANTILE,
   kSAMPLE,
   kSINGLE_VALUE
 };
@@ -105,12 +105,25 @@ enum StorageOption { kDISK = 0, kGPU = 1, kCPU = 2 };
 
 enum ViewRefreshOption { kMANUAL = 0, kAUTO = 1, kIMMEDIATE = 2 };
 
-enum class JoinType { INNER, LEFT, INVALID };
+enum class JoinType { INNER, LEFT, SEMI, ANTI, INVALID };
 
 #ifndef __CUDACC__
 
 #include <string>
 #include "Logger/Logger.h"
+
+inline std::string toString(const SQLQualifier& qualifier) {
+  switch (qualifier) {
+    case kONE:
+      return "ONE";
+    case kANY:
+      return "ANY";
+    case kALL:
+      return "ALL";
+  }
+  LOG(FATAL) << "Invalid SQLQualifier: " << qualifier;
+  return "";
+}
 
 inline std::string toString(const SQLAgg& kind) {
   switch (kind) {
@@ -126,8 +139,8 @@ inline std::string toString(const SQLAgg& kind) {
       return "COUNT";
     case kAPPROX_COUNT_DISTINCT:
       return "APPROX_COUNT_DISTINCT";
-    case kAPPROX_MEDIAN:
-      return "APPROX_MEDIAN";
+    case kAPPROX_QUANTILE:
+      return "APPROX_QUANTILE";
     case kSAMPLE:
       return "SAMPLE";
     case kSINGLE_VALUE:

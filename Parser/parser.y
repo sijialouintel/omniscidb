@@ -128,8 +128,7 @@ sql_list:
 
 	/* schema definition language */
 sql:		/* schema {	$<nodeval>$ = $<nodeval>1; } */
-  create_table_as_statement { $<nodeval>$ = $<nodeval>1; }
-	| create_table_statement { $<nodeval>$ = $<nodeval>1; }
+	create_table_statement { $<nodeval>$ = $<nodeval>1; }
 	| create_dataframe_statement { $<nodeval>$ = $<nodeval>1; }
 	| show_table_schema { $<nodeval>$ = $<nodeval>1; }
 	/* | prvililege_def { $<nodeval>$ = $<nodeval>1; } */
@@ -142,20 +141,8 @@ sql:		/* schema {	$<nodeval>$ = $<nodeval>1; } */
 	| drop_column_statement { $<nodeval>$ = $<nodeval>1; }
 	| alter_table_param_statement { $<nodeval>$ = $<nodeval>1; }
 	| copy_table_statement { $<nodeval>$ = $<nodeval>1; }
-	| create_database_statement { $<nodeval>$ = $<nodeval>1; }
-	| drop_database_statement { $<nodeval>$ = $<nodeval>1; }
-	| rename_database_statement { $<nodeval>$ = $<nodeval>1; }
-	| create_user_statement { $<nodeval>$ = $<nodeval>1; }
-	| drop_user_statement { $<nodeval>$ = $<nodeval>1; }
-	| alter_user_statement { $<nodeval>$ = $<nodeval>1; }
-	| create_role_statement { $<nodeval>$ = $<nodeval>1; }
-	| drop_role_statement { $<nodeval>$ = $<nodeval>1; }
-	| grant_privileges_statement { $<nodeval>$ = $<nodeval>1; }
-	| revoke_privileges_statement { $<nodeval>$ = $<nodeval>1; }
-	| grant_role_statement { $<nodeval>$ = $<nodeval>1; }
 	| optimize_table_statement { $<nodeval>$ = $<nodeval>1; }
 	| validate_system_statement { $<nodeval>$ = $<nodeval>1; }
-	| revoke_role_statement { $<nodeval>$ = $<nodeval>1; }
 	| dump_table_statement { $<nodeval>$ = $<nodeval>1; }
 	| restore_table_statement { $<nodeval>$ = $<nodeval>1; }
 	;
@@ -176,59 +163,11 @@ schema_element_list:
 	;
 
 schema_element:
-    create_table_as_statement {  $$ = $1; }
-	| create_table_statement {	$$ = $1; }
+	create_table_statement {	$$ = $1; }
 	|	create_view_statement {	$$ = $1; }
 	|	privilege_def {	$$ = $1; }
 	;
 NOT SUPPORTED */
-
-create_database_statement:
-		CREATE DATABASE opt_if_not_exists NAME
-		{
-			$<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new CreateDBStmt(($<stringval>4)->release(), nullptr, $<boolval>3));
-		}
-		| CREATE DATABASE opt_if_not_exists NAME '(' name_eq_value_list ')'
-		{
-			$<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new CreateDBStmt(($<stringval>4)->release(), reinterpret_cast<std::list<NameValueAssign*>*>(($<listval>6)->release()), $<boolval>3));
-		}
-		;
-drop_database_statement:
-		DROP DATABASE opt_if_exists NAME
-		{
-			$<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new DropDBStmt(($<stringval>4)->release(), $<boolval>3));
-		}
-		;
-rename_database_statement:
-		ALTER DATABASE NAME RENAME TO NAME
-		{
-		   $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new RenameDatabaseStmt(($<stringval>3)->release(), ($<stringval>6)->release()));
-		}
-		;
-
-create_user_statement:
-		CREATE USER username '(' name_eq_value_list ')'
-		{
-			$<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new CreateUserStmt(($<stringval>3)->release(), reinterpret_cast<std::list<NameValueAssign*>*>(($<listval>5)->release())));
-		}
-		;
-drop_user_statement:
-		DROP USER username
-		{
-			$<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new DropUserStmt(($<stringval>3)->release()));
-		}
-		;
-alter_user_statement:
-		ALTER USER username '(' name_eq_value_list ')'
-		{
-			$<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new AlterUserStmt(($<stringval>3)->release(), reinterpret_cast<std::list<NameValueAssign*>*>(($<listval>5)->release())));
-		}
-		|
-		ALTER USER username RENAME TO username
-		{
-		   $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new RenameUserStmt(($<stringval>3)->release(), ($<stringval>6)->release()));
-		}
-		;
 
 name_eq_value_list:
 		name_eq_value
@@ -254,19 +193,12 @@ opt_temporary:
                 | /* empty */ { $<boolval>$ = false; }
                 ;
 
-create_table_as_statement:
-    CREATE opt_temporary TABLE opt_if_not_exists table AS SELECTSTRING opt_with_option_list
-    {
-      $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new CreateTableAsSelectStmt(($<stringval>5)->release(), ($<stringval>7)->release(), $<boolval>2, $<boolval>4, reinterpret_cast<std::list<NameValueAssign*>*>(($<listval>8)->release())));
-    }
-  ;
-
 create_table_statement:
 		CREATE opt_temporary TABLE opt_if_not_exists table '(' base_table_element_commalist ')' opt_with_option_list
 		{
 		  $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new CreateTableStmt(($<stringval>5)->release(), nullptr, reinterpret_cast<std::list<TableElement*>*>(($<listval>7)->release()), $<boolval>2,  $<boolval>4, reinterpret_cast<std::list<NameValueAssign*>*>(($<listval>9)->release())));
 		}
-		| CREATE NAME TABLE opt_if_not_exists table '(' base_table_element_commalist ')' opt_with_option_list
+		| CREATE CREATE NAME TABLE opt_if_not_exists table '(' base_table_element_commalist ')' opt_with_option_list
 		{
 		  $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new CreateTableStmt(($<stringval>5)->release(), ($<stringval>2)->release(), reinterpret_cast<std::list<TableElement*>*>(($<listval>7)->release()), false,  $<boolval>4, reinterpret_cast<std::list<NameValueAssign*>*>(($<listval>9)->release())));
 		}
@@ -389,43 +321,6 @@ restore_table_statement:
 	    $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new RestoreTableStmt(($<stringval>3)->release(), ($<stringval>5)->release(), reinterpret_cast<std::list<NameValueAssign*>*>(($<listval>6)->release())));
     }
     ;
-
-create_role_statement:
-		CREATE ROLE rolename
-		{
-		    $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new CreateRoleStmt(($<stringval>3)->release()));
-		}
-		;
-drop_role_statement:
-		DROP ROLE rolename
-		{
-		    $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new DropRoleStmt(($<stringval>3)->release()));
-		}
-		;
-grant_privileges_statement:
-		GRANT privileges ON privileges_target_type privileges_target TO grantees
-		{
-		    $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new GrantPrivilegesStmt(($<slistval>2)->release(), ($<stringval>4)->release(), ($<stringval>5)->release(), ($<slistval>7)->release()));
-		}
-		;
-revoke_privileges_statement:
-		REVOKE privileges ON privileges_target_type privileges_target FROM grantees
-		{
-		    $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new RevokePrivilegesStmt(($<slistval>2)->release(), ($<stringval>4)->release(), ($<stringval>5)->release(), ($<slistval>7)->release()));
-		}
-		;
-grant_role_statement:
-		GRANT rolenames TO grantees
-		{
-		    $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new GrantRoleStmt(($<slistval>2)->release(), ($<slistval>4)->release()));
-		}
-		;
-revoke_role_statement:
-		REVOKE rolenames FROM grantees
-		{
-		    $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new RevokeRoleStmt(($<slistval>2)->release(), ($<slistval>4)->release()));
-		}
-		;
 
 optimize_table_statement:
 		OPTIMIZE TABLE opt_table opt_with_option_list
@@ -701,10 +596,6 @@ insert_statement:
 		INSERT INTO table opt_column_commalist VALUES '(' atom_commalist ')'
 		{
 			$<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new InsertValuesStmt(($<stringval>3)->release(), ($<slistval>4)->release(), reinterpret_cast<std::list<Expr*>*>(($<listval>7)->release())));
-		}
-		| INSERT INTO table opt_column_commalist SELECTSTRING
-		{
-			$<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new InsertIntoTableAsSelectStmt(($<stringval>3)->release(), ($<stringval>5)->release(), ($<slistval>4)->release()));
 		}
 	;
 

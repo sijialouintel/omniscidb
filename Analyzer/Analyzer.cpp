@@ -24,6 +24,8 @@
 
 #include "Analyzer.h"
 #include "Catalog/Catalog.h"
+#include "Geospatial/Conversion.h"
+#include "Geospatial/Types.h"
 #include "QueryEngine/DateTimeUtils.h"
 #include "RangeTableEntry.h"
 #include "Shared/DateConverters.h"
@@ -156,11 +158,8 @@ std::shared_ptr<Analyzer::Expr> LikelihoodExpr::deep_copy() const {
   return makeExpr<LikelihoodExpr>(arg->deep_copy(), likelihood);
 }
 std::shared_ptr<Analyzer::Expr> AggExpr::deep_copy() const {
-  return makeExpr<AggExpr>(type_info,
-                           aggtype,
-                           arg == nullptr ? nullptr : arg->deep_copy(),
-                           is_distinct,
-                           error_rate);
+  return makeExpr<AggExpr>(
+      type_info, aggtype, arg ? arg->deep_copy() : nullptr, is_distinct, arg1);
 }
 
 std::shared_ptr<Analyzer::Expr> CaseExpr::deep_copy() const {
@@ -1932,7 +1931,7 @@ std::shared_ptr<Analyzer::Expr> AggExpr::rewrite_with_child_targetlist(
                            aggtype,
                            arg ? arg->rewrite_with_child_targetlist(tlist) : nullptr,
                            is_distinct,
-                           error_rate);
+                           arg1);
 }
 
 std::shared_ptr<Analyzer::Expr> AggExpr::rewrite_agg_to_var(
@@ -2590,8 +2589,20 @@ std::string InValues::toString() const {
   std::string str{"(IN "};
   str += arg->toString();
   str += "(";
+  int cnt = 0;
+  bool shorted_value_list_str = false;
   for (auto e : value_list) {
     str += e->toString();
+    cnt++;
+    if (cnt > 4) {
+      shorted_value_list_str = true;
+      break;
+    }
+  }
+  if (shorted_value_list_str) {
+    str += "... | ";
+    str += "Total # values: ";
+    str += std::to_string(value_list.size());
   }
   str += ") ";
   return str;
@@ -2613,8 +2624,20 @@ std::string InIntegerSet::toString() const {
   std::string str{"(IN_INTEGER_SET "};
   str += arg->toString();
   str += "( ";
+  int cnt = 0;
+  bool shorted_value_list_str = false;
   for (const auto e : value_list) {
     str += std::to_string(e) + " ";
+    cnt++;
+    if (cnt > 4) {
+      shorted_value_list_str = true;
+      break;
+    }
+  }
+  if (shorted_value_list_str) {
+    str += "... | ";
+    str += "Total # values: ";
+    str += std::to_string(value_list.size());
   }
   str += ") ";
   return str;
@@ -2706,8 +2729,8 @@ std::string AggExpr::toString() const {
     case kAPPROX_COUNT_DISTINCT:
       agg = "APPROX_COUNT_DISTINCT";
       break;
-    case kAPPROX_MEDIAN:
-      agg = "APPROX_MEDIAN";
+    case kAPPROX_QUANTILE:
+      agg = "APPROX_QUANTILE";
       break;
     case kSINGLE_VALUE:
       agg = "SINGLE_VALUE";
@@ -3082,6 +3105,13 @@ void ArrayExpr::collect_rte_idx(std::set<int>& rte_idx_set) const {
   }
 }
 
+void FunctionOper::collect_rte_idx(std::set<int>& rte_idx_set) const {
+  for (unsigned i = 0; i < getArity(); i++) {
+    const auto expr = getArg(i);
+    expr->collect_rte_idx(rte_idx_set);
+  }
+}
+
 void CaseExpr::collect_column_var(
     std::set<const ColumnVar*, bool (*)(const ColumnVar*, const ColumnVar*)>& colvar_set,
     bool include_agg) const {
@@ -3125,6 +3155,15 @@ void ArrayExpr::collect_column_var(
     bool include_agg) const {
   for (unsigned i = 0; i < getElementCount(); i++) {
     const auto expr = getElement(i);
+    expr->collect_column_var(colvar_set, include_agg);
+  }
+}
+
+void FunctionOper::collect_column_var(
+    std::set<const ColumnVar*, bool (*)(const ColumnVar*, const ColumnVar*)>& colvar_set,
+    bool include_agg) const {
+  for (unsigned i = 0; i < getArity(); i++) {
+    const auto expr = getArg(i);
     expr->collect_column_var(colvar_set, include_agg);
   }
 }
@@ -3288,6 +3327,254 @@ bool FunctionOperWithCustomTypeHandling::operator==(const Expr& rhs) const {
     if (!(*getArg(i) == *(rhs_func_oper->getArg(i)))) {
       return false;
     }
+  }
+  return true;
+}
+
+namespace {
+
+SQLTypes get_ti_from_geo(const Geospatial::GeoBase* geo) {
+  CHECK(geo);
+  switch (geo->getType()) {
+    case Geospatial::GeoBase::GeoType::kPOINT: {
+      return kPOINT;
+    }
+    case Geospatial::GeoBase::GeoType::kLINESTRING: {
+      return kLINESTRING;
+    }
+    case Geospatial::GeoBase::GeoType::kPOLYGON: {
+      return kPOLYGON;
+    }
+    case Geospatial::GeoBase::GeoType::kMULTIPOLYGON: {
+      return kMULTIPOLYGON;
+    }
+    default:
+      UNREACHABLE();
+      return kNULLT;
+  }
+}
+
+}  // namespace
+
+// TODO: fixup null
+GeoConstant::GeoConstant(std::unique_ptr<Geospatial::GeoBase>&& geo,
+                         const SQLTypeInfo& ti)
+    : GeoExpr(ti), geo_(std::move(geo)) {
+  CHECK(geo_);
+  if (get_ti_from_geo(geo_.get()) != ti.get_type()) {
+    throw std::runtime_error("Conflicting types for geo data " + geo_->getWktString() +
+                             " (type provided: " + ti.get_type_name() + ")");
+  }
+}
+
+std::shared_ptr<Analyzer::Expr> GeoConstant::deep_copy() const {
+  CHECK(geo_);
+  return makeExpr<GeoConstant>(geo_->clone(), type_info);
+}
+
+std::string GeoConstant::toString() const {
+  std::string str{"(GeoConstant "};
+  CHECK(geo_);
+  str += geo_->getWktString();
+  str += ") ";
+  return str;
+}
+
+std::string GeoConstant::getWKTString() const {
+  CHECK(geo_);
+  return geo_->getWktString();
+}
+
+bool GeoConstant::operator==(const Expr& rhs) const {
+  if (typeid(rhs) != typeid(GeoConstant)) {
+    return false;
+  }
+  const GeoConstant& rhs_c = dynamic_cast<const GeoConstant&>(rhs);
+  if (type_info != rhs_c.get_type_info() /*|| is_null != rhs_c.get_is_null()*/) {
+    return false;
+  }
+  /* TODO: constant nulls
+  if (is_null && rhs_c.get_is_null()) {
+    return true;
+  }
+
+  */
+  return *geo_ == *rhs_c.geo_;
+}
+
+size_t GeoConstant::physicalCols() const {
+  CHECK(type_info.is_geometry());
+  return type_info.get_physical_coord_cols();
+}
+
+std::shared_ptr<Analyzer::Constant> GeoConstant::makePhysicalConstant(
+    const size_t index) const {
+  // TODO: handle bounds, etc
+  const auto num_phys_coords = type_info.get_physical_coord_cols();
+  CHECK_GE(num_phys_coords, 0);
+  CHECK_LE(index, size_t(num_phys_coords));
+  SQLTypeInfo ti = type_info;
+
+  std::vector<double> coords;
+  std::vector<double> bounds;
+  std::vector<int> ring_sizes;
+  std::vector<int> poly_rings;
+
+  Geospatial::GeoTypesFactory::getGeoColumns(
+      geo_->getWktString(), ti, coords, bounds, ring_sizes, poly_rings);
+
+  switch (index) {
+    case 0:  // coords
+      return Geospatial::convert_coords(coords, ti);
+    case 1:  // ring sizes
+      return Geospatial::convert_rings(ring_sizes);
+    case 2:  // poly rings
+      return Geospatial::convert_rings(poly_rings);
+    default:
+      UNREACHABLE();
+  }
+
+  UNREACHABLE();
+  return nullptr;
+}
+
+std::shared_ptr<Analyzer::Expr> GeoConstant::add_cast(const SQLTypeInfo& new_type_info) {
+  // TODO: we should eliminate the notion of input and output SRIDs on a type. A type can
+  // only have 1 SRID. A cast or transforms changes the SRID of the type.
+  // NOTE: SRID 0 indicates set srid, skip cast
+  if (!(get_type_info().get_input_srid() == 0) &&
+      (get_type_info().get_input_srid() != new_type_info.get_output_srid())) {
+    // run cast
+    CHECK(geo_);
+    if (!geo_->transform(get_type_info().get_input_srid(),
+                         new_type_info.get_output_srid())) {
+      throw std::runtime_error("Failed to transform constant geometry: " + toString());
+    }
+  }
+  return makeExpr<GeoConstant>(std::move(geo_), new_type_info);
+}
+
+GeoOperator::GeoOperator(const SQLTypeInfo& ti,
+                         const std::string& name,
+                         const std::vector<std::shared_ptr<Analyzer::Expr>>& args)
+    : GeoExpr(ti), name_(name), args_(args) {}
+
+std::shared_ptr<Analyzer::Expr> GeoOperator::deep_copy() const {
+  std::vector<std::shared_ptr<Analyzer::Expr>> args;
+  for (size_t i = 0; i < args_.size(); i++) {
+    args.push_back(args_[i]->deep_copy());
+  }
+  return makeExpr<GeoOperator>(type_info, name_, args);
+}
+
+void GeoOperator::collect_rte_idx(std::set<int>& rte_idx_set) const {
+  for (size_t i = 0; i < size(); i++) {
+    const auto expr = getOperand(i);
+    expr->collect_rte_idx(rte_idx_set);
+  }
+}
+
+void GeoOperator::collect_column_var(
+    std::set<const ColumnVar*, bool (*)(const ColumnVar*, const ColumnVar*)>& colvar_set,
+    bool include_agg) const {
+  for (size_t i = 0; i < size(); i++) {
+    const auto expr = getOperand(i);
+    expr->collect_column_var(colvar_set, include_agg);
+  }
+}
+
+std::string GeoOperator::toString() const {
+  std::string str{"(" + name_ + " "};
+  for (const auto& arg : args_) {
+    str += arg->toString();
+  }
+  str += ")";
+  return str;
+}
+
+bool GeoOperator::operator==(const Expr& rhs) const {
+  if (typeid(rhs) != typeid(GeoOperator)) {
+    return false;
+  }
+  const GeoOperator& rhs_go = dynamic_cast<const GeoOperator&>(rhs);
+  if (getName() != rhs_go.getName()) {
+    return false;
+  }
+  if (rhs_go.size() != size()) {
+    return false;
+  }
+  for (size_t i = 0; i < size(); i++) {
+    if (args_[i].get() != rhs_go.getOperand(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t GeoOperator::size() const {
+  return args_.size();
+}
+
+Analyzer::Expr* GeoOperator::getOperand(const size_t index) const {
+  CHECK_LT(index, args_.size());
+  return args_[index].get();
+}
+
+std::shared_ptr<Analyzer::Expr> GeoOperator::add_cast(const SQLTypeInfo& new_type_info) {
+  if (get_type_info().is_geometry()) {
+    std::vector<std::shared_ptr<Analyzer::Expr>> args;
+    for (size_t i = 0; i < args_.size(); i++) {
+      args.push_back(args_[i]->deep_copy());
+    }
+    CHECK(new_type_info.is_geometry());
+    return makeExpr<GeoOperator>(new_type_info, name_, args);
+  } else {
+    auto new_expr = deep_copy();
+    return makeExpr<UOper>(new_type_info, /*contains_agg=*/false, kCAST, new_expr);
+  }
+}
+
+std::shared_ptr<Analyzer::Expr> GeoTransformOperator::deep_copy() const {
+  std::vector<std::shared_ptr<Analyzer::Expr>> args;
+  for (size_t i = 0; i < args_.size(); i++) {
+    args.push_back(args_[i]->deep_copy());
+  }
+  return makeExpr<GeoTransformOperator>(
+      type_info, name_, args, input_srid_, output_srid_);
+}
+
+std::string GeoTransformOperator::toString() const {
+  std::string str{"(" + name_ + " "};
+  for (const auto& arg : args_) {
+    str += arg->toString();
+  }
+  str +=
+      " : " + std::to_string(input_srid_) + " -> " + std::to_string(output_srid_) + " ";
+  str += ")";
+  return str;
+}
+
+bool GeoTransformOperator::operator==(const Expr& rhs) const {
+  if (typeid(rhs) != typeid(GeoTransformOperator)) {
+    return false;
+  }
+  const GeoTransformOperator& rhs_gto = dynamic_cast<const GeoTransformOperator&>(rhs);
+  if (getName() != rhs_gto.getName()) {
+    return false;
+  }
+  if (rhs_gto.size() != size()) {
+    return false;
+  }
+  for (size_t i = 0; i < size(); i++) {
+    if (args_[i].get() != rhs_gto.getOperand(i)) {
+      return false;
+    }
+  }
+  if (input_srid_ != rhs_gto.input_srid_) {
+    return false;
+  }
+  if (output_srid_ != rhs_gto.output_srid_) {
+    return false;
   }
   return true;
 }

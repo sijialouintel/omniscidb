@@ -34,7 +34,6 @@
 #include "QueryEngine/ResultSetBuilder.h"
 
 extern bool g_enable_fsi;
-extern bool g_enable_s3_fsi;
 
 bool DdlCommand::isDefaultServer(const std::string& server_name) {
   return boost::iequals(server_name.substr(0, 7), "omnisci");
@@ -360,6 +359,59 @@ ExecutionResult DdlCommandExecutor::execute() {
   } else if (ddl_command_ == "ALTER_TABLE") {
     Parser::AlterTableStmt::delegateExecute(extractPayload(*ddl_data_), *session_ptr_);
     return result;
+  } else if (ddl_command_ == "CREATE_DB") {
+    auto create_db_stmt = Parser::CreateDBStmt(extractPayload(*ddl_data_));
+    create_db_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "DROP_DB") {
+    auto drop_db_stmt = Parser::DropDBStmt(extractPayload(*ddl_data_));
+    drop_db_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "RENAME_DB") {
+    auto rename_db_stmt = Parser::RenameDBStmt(extractPayload(*ddl_data_));
+    rename_db_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "CREATE_USER") {
+    auto create_user_stmt = Parser::CreateUserStmt(extractPayload(*ddl_data_));
+    create_user_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "DROP_USER") {
+    auto drop_user_stmt = Parser::DropUserStmt(extractPayload(*ddl_data_));
+    drop_user_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "ALTER_USER") {
+    auto alter_user_stmt = Parser::AlterUserStmt(extractPayload(*ddl_data_));
+    alter_user_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "RENAME_USER") {
+    auto rename_user_stmt = Parser::RenameUserStmt(extractPayload(*ddl_data_));
+    rename_user_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "CREATE_ROLE") {
+    auto create_role_stmt = Parser::CreateRoleStmt(extractPayload(*ddl_data_));
+    create_role_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "DROP_ROLE") {
+    auto drop_role_stmt = Parser::DropRoleStmt(extractPayload(*ddl_data_));
+    drop_role_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "GRANT_ROLE") {
+    auto grant_role_stmt = Parser::GrantRoleStmt(extractPayload(*ddl_data_));
+    grant_role_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "REVOKE_ROLE") {
+    auto revoke_role_stmt = Parser::RevokeRoleStmt(extractPayload(*ddl_data_));
+    revoke_role_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "GRANT_PRIVILEGE") {
+    auto grant_privilege_stmt = Parser::GrantPrivilegesStmt(extractPayload(*ddl_data_));
+    grant_privilege_stmt.execute(*session_ptr_);
+    return result;
+  } else if (ddl_command_ == "REVOKE_PRIVILEGE") {
+    auto revoke_privileges_stmt =
+        Parser::RevokePrivilegesStmt(extractPayload(*ddl_data_));
+    revoke_privileges_stmt.execute(*session_ptr_);
+    return result;
   }
 
   // the following commands require a global unique lock until proper table locking has
@@ -391,19 +443,12 @@ ExecutionResult DdlCommandExecutor::execute() {
     result = AlterForeignTableCommand{*ddl_data_, session_ptr_}.execute();
   } else if (ddl_command_ == "REFRESH_FOREIGN_TABLES") {
     result = RefreshForeignTablesCommand{*ddl_data_, session_ptr_}.execute();
-  } else if (ddl_command_ == "SHOW_QUERIES") {
-    LOG(ERROR) << "SHOW QUERIES DDL is not ready yet!\n";
   } else if (ddl_command_ == "SHOW_DISK_CACHE_USAGE") {
     result = ShowDiskCacheUsageCommand{*ddl_data_, session_ptr_}.execute();
-  } else if (ddl_command_ == "KILL_QUERY") {
-    auto& ddl_payload = extractPayload(*ddl_data_);
-    CHECK(ddl_payload.HasMember("querySession"));
-    const std::string& querySessionPayload = ddl_payload["querySession"].GetString();
-    auto querySession = querySessionPayload.substr(1, 8);
-    CHECK_EQ(querySession.length(),
-             (unsigned long)8);  // public_session_id's length + two quotes
-    LOG(ERROR) << "TRY TO KILL QUERY " << querySession
-               << " BUT KILL QUERY DDL is not ready yet!\n";
+  } else if (ddl_command_ == "SHOW_USER_DETAILS") {
+    result = ShowUserDetailsCommand{*ddl_data_, session_ptr_}.execute();
+  } else if (ddl_command_ == "REASSIGN_OWNED") {
+    result = ReassignOwnedCommand{*ddl_data_, session_ptr_}.execute();
   } else {
     throw std::runtime_error("Unsupported DDL command");
   }
@@ -425,11 +470,34 @@ bool DdlCommandExecutor::isKillQuery() {
 
 DistributedExecutionDetails DdlCommandExecutor::getDistributedExecutionDetails() {
   DistributedExecutionDetails execution_details;
-  if (ddl_command_ == "CREATE_TABLE" || ddl_command_ == "DROP_TABLE" ||
-      ddl_command_ == "CREATE_VIEW" || ddl_command_ == "DROP_VIEW" ||
-      ddl_command_ == "RENAME_TABLE" || ddl_command_ == "ALTER_TABLE") {
+  if (ddl_command_ == "CREATE_VIEW" || ddl_command_ == "DROP_VIEW" ||
+      ddl_command_ == "CREATE_TABLE" || ddl_command_ == "DROP_TABLE" ||
+      ddl_command_ == "RENAME_TABLE" || ddl_command_ == "ALTER_TABLE" ||
+      ddl_command_ == "CREATE_DB" || ddl_command_ == "DROP_DB" ||
+      ddl_command_ == "RENAME_DB" || ddl_command_ == "REASSIGN_OWNED") {
+    // commands
     execution_details.execution_location = ExecutionLocation::ALL_NODES;
     execution_details.aggregation_type = AggregationType::NONE;
+  } else if (ddl_command_ == "CREATE_USER" || ddl_command_ == "DROP_USER" ||
+             ddl_command_ == "ALTER_USER" || ddl_command_ == "RENAME_USER" ||
+             ddl_command_ == "CREATE_ROLE" || ddl_command_ == "DROP_ROLE" ||
+             ddl_command_ == "GRANT_ROLE" || ddl_command_ == "REVOKE_ROLE") {
+    // group user/role/db commands
+    execution_details.execution_location = ExecutionLocation::ALL_NODES;
+    execution_details.aggregation_type = AggregationType::NONE;
+  } else if (ddl_command_ == "GRANT_PRIVILEGE" || ddl_command_ == "REVOKE_PRIVILEGE") {
+    auto& ddl_payload = extractPayload(*ddl_data_);
+    CHECK(ddl_payload.HasMember("type"));
+    const std::string& targetType = ddl_payload["type"].GetString();
+    if (targetType == "DASHBOARD") {
+      // dashboard commands should run on Aggregator alone
+      execution_details.execution_location = ExecutionLocation::AGGREGATOR_ONLY;
+      execution_details.aggregation_type = AggregationType::NONE;
+    } else {
+      execution_details.execution_location = ExecutionLocation::ALL_NODES;
+      execution_details.aggregation_type = AggregationType::NONE;
+    }
+
   } else if (ddl_command_ == "SHOW_TABLE_DETAILS") {
     execution_details.execution_location = ExecutionLocation::LEAVES_ONLY;
     execution_details.aggregation_type = AggregationType::UNION;
@@ -979,8 +1047,12 @@ void CreateForeignTableCommand::setColumnDetails(std::list<ColumnDescriptor>& co
     ColumnDescriptor cd;
     ddl_utils::validate_non_duplicate_column(column_name, column_names);
     ddl_utils::validate_non_reserved_keyword(column_name);
-    ddl_utils::set_column_descriptor(
-        column_name, cd, &sql_type, data_type["notNull"].GetBool(), encoding.get());
+    ddl_utils::set_column_descriptor(column_name,
+                                     cd,
+                                     &sql_type,
+                                     data_type["notNull"].GetBool(),
+                                     encoding.get(),
+                                     nullptr);
     columns.emplace_back(cd);
   }
 }
@@ -1518,4 +1590,110 @@ ExecutionResult ShowDiskCacheUsageCommand::execute() {
       ResultSetLogicalValuesBuilder::create(label_infos, logical_values));
 
   return ExecutionResult(rSet, label_infos);
+}
+
+ShowUserDetailsCommand::ShowUserDetailsCommand(
+    const DdlCommandData& ddl_data,
+    std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr)
+    : DdlCommand(ddl_data, session_ptr) {
+  auto& ddl_payload = extractPayload(ddl_data);
+  if (ddl_payload.HasMember("userNames")) {
+    CHECK(ddl_payload["userNames"].IsArray());
+    for (const auto& user_name : ddl_payload["userNames"].GetArray()) {
+      CHECK(user_name.IsString());
+    }
+  }
+}
+
+ExecutionResult ShowUserDetailsCommand::execute() {
+  auto& ddl_payload = extractPayload(ddl_data_);
+  auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
+
+  // label_infos -> column labels
+  std::vector<std::string> labels{"NAME", "ID", "IS_SUPER", "DEFAULT_DB", "CAN_LOGIN"};
+  std::vector<TargetMetaInfo> label_infos;
+  label_infos.emplace_back(labels[0], SQLTypeInfo(kTEXT, true));
+  label_infos.emplace_back(labels[1], SQLTypeInfo(kBIGINT, true));
+  label_infos.emplace_back(labels[2], SQLTypeInfo(kBOOLEAN, true));
+  label_infos.emplace_back(labels[3], SQLTypeInfo(kTEXT, true));
+  label_infos.emplace_back(labels[4], SQLTypeInfo(kBOOLEAN, true));
+  std::vector<RelLogicalValues::RowValues> logical_values;
+
+  Catalog_Namespace::UserMetadata self = session_ptr_->get_currentUser();
+  Catalog_Namespace::DBSummaryList dbsums = sys_cat.getDatabaseListForUser(self);
+  std::unordered_set<std::string> visible_databases;
+  if (!self.isSuper) {
+    for (const auto& dbsum : dbsums) {
+      visible_databases.insert(dbsum.dbName);
+    }
+  }
+
+  std::list<Catalog_Namespace::UserMetadata> user_list;
+  if (ddl_payload.HasMember("userNames")) {
+    for (const auto& user_name_json : ddl_payload["userNames"].GetArray()) {
+      std::string user_name = user_name_json.GetString();
+      Catalog_Namespace::UserMetadata user;
+      if (!sys_cat.getMetadataForUser(user_name, user)) {
+        throw std::runtime_error("User with username \"" + user_name +
+                                 "\" does not exist. ");
+      }
+      user_list.emplace_back(std::move(user));
+    }
+  } else {
+    user_list = sys_cat.getAllUserMetadata();
+  }
+
+  for (const auto& user : user_list) {
+    // database
+    std::string dbname;
+    Catalog_Namespace::DBMetadata db;
+    if (sys_cat.getMetadataForDBById(user.defaultDbId, db)) {
+      if (self.isSuper.load() || visible_databases.count(db.dbName)) {
+        dbname = db.dbName;
+      }
+    }
+    if (self.isSuper.load()) {
+      dbname += "(" + std::to_string(user.defaultDbId) + ")";
+    }
+
+    // logical_values -> table data
+    logical_values.emplace_back(RelLogicalValues::RowValues{});
+    logical_values.back().emplace_back(genLiteralStr(user.userName));
+    logical_values.back().emplace_back(genLiteralBigInt(user.userId));
+    logical_values.back().emplace_back(genLiteralBoolean(user.isSuper.load()));
+    logical_values.back().emplace_back(genLiteralStr(dbname));
+    logical_values.back().emplace_back(genLiteralBoolean(user.can_login));
+  }
+
+  // Create ResultSet
+  std::shared_ptr<ResultSet> rSet = std::shared_ptr<ResultSet>(
+      ResultSetLogicalValuesBuilder::create(label_infos, logical_values));
+
+  return ExecutionResult(rSet, label_infos);
+}
+
+ReassignOwnedCommand::ReassignOwnedCommand(
+    const DdlCommandData& ddl_data,
+    std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr)
+    : DdlCommand(ddl_data, session_ptr) {
+  auto& ddl_payload = extractPayload(ddl_data_);
+  CHECK(ddl_payload.HasMember("oldOwners"));
+  CHECK(ddl_payload["oldOwners"].IsArray());
+  for (const auto& old_owner : ddl_payload["oldOwners"].GetArray()) {
+    CHECK(old_owner.IsString());
+    old_owners_.emplace(old_owner.GetString());
+  }
+  CHECK(ddl_payload.HasMember("newOwner"));
+  CHECK(ddl_payload["newOwner"].IsString());
+  new_owner_ = ddl_payload["newOwner"].GetString();
+}
+
+ExecutionResult ReassignOwnedCommand::execute() {
+  if (!session_ptr_->get_currentUser().isSuper) {
+    throw std::runtime_error{
+        "Only super users can reassign ownership of database objects."};
+  }
+  const auto catalog = session_ptr_->get_catalog_ptr();
+  catalog->reassignOwners(old_owners_, new_owner_);
+  return ExecutionResult();
 }

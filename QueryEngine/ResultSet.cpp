@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2021 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,8 +18,6 @@
  * @file    ResultSet.cpp
  * @author  Alex Suhan <alex@mapd.com>
  * @brief   Basic constructors and methods of the row set interface.
- *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
  */
 
 #include "ResultSet.h"
@@ -38,6 +36,7 @@
 #include "Shared/threadpool.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <future>
 #include <numeric>
@@ -208,11 +207,16 @@ const ResultSetStorage* ResultSet::allocateStorage() const {
 
 const ResultSetStorage* ResultSet::allocateStorage(
     int8_t* buff,
-    const std::vector<int64_t>& target_init_vals) const {
+    const std::vector<int64_t>& target_init_vals,
+    std::shared_ptr<VarlenOutputInfo> varlen_output_info) const {
   CHECK(buff);
   CHECK(!storage_);
   storage_.reset(new ResultSetStorage(targets_, query_mem_desc_, buff, true));
+  // TODO: add both to the constructor
   storage_->target_init_vals_ = target_init_vals;
+  if (varlen_output_info) {
+    storage_->varlen_output_info_ = varlen_output_info;
+  }
   return storage_.get();
 }
 
@@ -369,7 +373,8 @@ size_t ResultSet::parallelRowCount() const {
          ++i, start_entry += stride) {
       const auto end_entry = std::min(start_entry + stride, entryCount());
       counter_threads.spawn(
-          [this](const size_t start, const size_t end) {
+          [this, query_id = logger::query_id()](const size_t start, const size_t end) {
+            auto qid_scope_guard = logger::set_thread_local_query_id(query_id);
             size_t row_count{0};
             for (size_t i = start; i < end; ++i) {
               if (!isRowAtEmpty(i)) {
@@ -392,6 +397,26 @@ size_t ResultSet::parallelRowCount() const {
           : execute_parallel_row_count(threadpool::FuturesThreadPool<size_t>());
 
   return get_truncated_row_count(row_count, getLimit(), drop_first_);
+}
+
+bool ResultSet::isEmpty() const {
+  if (entryCount() == 0) {
+    return true;
+  }
+  if (!storage_) {
+    return true;
+  }
+
+  std::lock_guard<std::mutex> lock(row_iteration_mutex_);
+  moveToBegin();
+  while (true) {
+    auto crt_row = getNextRowUnlocked(false, false);
+    if (!crt_row.empty()) {
+      return false;
+    }
+  }
+  moveToBegin();
+  return true;
 }
 
 bool ResultSet::definitelyHasNoRows() const {
@@ -602,12 +627,14 @@ void ResultSet::parallelTop(const std::list<Analyzer::OrderEntry>& order_entries
   // Split permutation_ into nthreads subranges and top-sort in-place.
   permutation_.resize(query_mem_desc_.getEntryCount());
   std::vector<PermutationView> permutation_views(nthreads);
-  const auto top_sort_interval = [&, top_n, executor](const auto interval) {
-    PermutationView pv(permutation_.data() + interval.begin, 0, interval.size());
-    pv = initPermutationBuffer(pv, interval.begin, interval.end);
-    const auto compare = createComparator(order_entries, pv, executor, true);
-    permutation_views[interval.index] = topPermutation(pv, top_n, compare);
-  };
+  const auto top_sort_interval =
+      [&, top_n, executor, query_id = logger::query_id()](const auto interval) {
+        auto qid_scope_guard = logger::set_thread_local_query_id(query_id);
+        PermutationView pv(permutation_.data() + interval.begin, 0, interval.size());
+        pv = initPermutationBuffer(pv, interval.begin, interval.end);
+        const auto compare = createComparator(order_entries, pv, executor, true);
+        permutation_views[interval.index] = topPermutation(pv, top_n, compare);
+      };
   threadpool::FuturesThreadPool<void> top_sort_threads;
   for (auto interval : makeIntervals<PermutationIdx>(0, permutation_.size(), nthreads)) {
     top_sort_threads.spawn(top_sort_interval, interval);
@@ -679,16 +706,16 @@ void ResultSet::ResultSetComparator<
 }
 
 template <typename BUFFER_ITERATOR_TYPE>
-ResultSet::ApproxMedianBuffers ResultSet::ResultSetComparator<
-    BUFFER_ITERATOR_TYPE>::materializeApproxMedianColumns() const {
-  ResultSet::ApproxMedianBuffers approx_median_materialized_buffers;
+ResultSet::ApproxQuantileBuffers ResultSet::ResultSetComparator<
+    BUFFER_ITERATOR_TYPE>::materializeApproxQuantileColumns() const {
+  ResultSet::ApproxQuantileBuffers approx_quantile_materialized_buffers;
   for (const auto& order_entry : order_entries_) {
-    if (result_set_->targets_[order_entry.tle_no - 1].agg_kind == kAPPROX_MEDIAN) {
-      approx_median_materialized_buffers.emplace_back(
-          materializeApproxMedianColumn(order_entry));
+    if (result_set_->targets_[order_entry.tle_no - 1].agg_kind == kAPPROX_QUANTILE) {
+      approx_quantile_materialized_buffers.emplace_back(
+          materializeApproxQuantileColumn(order_entry));
     }
   }
-  return approx_median_materialized_buffers;
+  return approx_quantile_materialized_buffers;
 }
 
 template <typename BUFFER_ITERATOR_TYPE>
@@ -700,7 +727,9 @@ ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::materializeCountDistinctCo
   const CountDistinctDescriptor count_distinct_descriptor =
       result_set_->query_mem_desc_.getCountDistinctDescriptor(order_entry.tle_no - 1);
   const size_t num_non_empty_entries = permutation_.size();
-  const auto work = [&](const size_t start, const size_t end) {
+  const auto work = [&, query_id = logger::query_id()](const size_t start,
+                                                       const size_t end) {
+    auto qid_scope_guard = logger::set_thread_local_query_id(query_id);
     for (size_t i = start; i < end; ++i) {
       const PermutationIdx permuted_idx = permutation_[i];
       const auto storage_lookup_result = result_set_->findStorage(permuted_idx);
@@ -726,22 +755,24 @@ ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::materializeCountDistinctCo
   return count_distinct_materialized_buffer;
 }
 
-double ResultSet::calculateQuantile(quantile::TDigest* const t_digest, double const q) {
+double ResultSet::calculateQuantile(quantile::TDigest* const t_digest) {
   static_assert(sizeof(int64_t) == sizeof(quantile::TDigest*));
-  CHECK(t_digest) << "t_digest=" << (void*)t_digest << ", q=" << q;
+  CHECK(t_digest);
   t_digest->mergeBuffer();
-  double const median = t_digest->quantile(q);
-  return boost::math::isnan(median) ? NULL_DOUBLE : median;
+  double const quantile = t_digest->quantile();
+  return boost::math::isnan(quantile) ? NULL_DOUBLE : quantile;
 }
 
 template <typename BUFFER_ITERATOR_TYPE>
-ResultSet::ApproxMedianBuffers::value_type
-ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::materializeApproxMedianColumn(
+ResultSet::ApproxQuantileBuffers::value_type
+ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::materializeApproxQuantileColumn(
     const Analyzer::OrderEntry& order_entry) const {
-  ResultSet::ApproxMedianBuffers::value_type materialized_buffer(
+  ResultSet::ApproxQuantileBuffers::value_type materialized_buffer(
       result_set_->query_mem_desc_.getEntryCount());
   const size_t size = permutation_.size();
-  const auto work = [&](const size_t start, const size_t end) {
+  const auto work = [&, query_id = logger::query_id()](const size_t start,
+                                                       const size_t end) {
+    auto qid_scope_guard = logger::set_thread_local_query_id(query_id);
     for (size_t i = start; i < end; ++i) {
       const PermutationIdx permuted_idx = permutation_[i];
       const auto storage_lookup_result = result_set_->findStorage(permuted_idx);
@@ -750,9 +781,8 @@ ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::materializeApproxMedianCol
       const auto value = buffer_itr_.getColumnInternal(
           storage->buff_, off, order_entry.tle_no - 1, storage_lookup_result);
       materialized_buffer[permuted_idx] =
-          value.i1
-              ? calculateQuantile(reinterpret_cast<quantile::TDigest*>(value.i1), 0.5)
-              : NULL_DOUBLE;
+          value.i1 ? calculateQuantile(reinterpret_cast<quantile::TDigest*>(value.i1))
+                   : NULL_DOUBLE;
     }
   };
   if (single_threaded_) {
@@ -780,7 +810,7 @@ bool ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::operator()(
   const auto fixedup_lhs = lhs_storage_lookup_result.fixedup_entry_idx;
   const auto fixedup_rhs = rhs_storage_lookup_result.fixedup_entry_idx;
   size_t materialized_count_distinct_buffer_idx{0};
-  size_t materialized_approx_median_buffer_idx{0};
+  size_t materialized_approx_quantile_buffer_idx{0};
 
   for (const auto& order_entry : order_entries_) {
     CHECK_GE(order_entry.tle_no, 1);
@@ -816,14 +846,14 @@ bool ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::operator()(
         continue;
       }
       return (lhs_sz < rhs_sz) != order_entry.is_desc;
-    } else if (UNLIKELY(agg_info.agg_kind == kAPPROX_MEDIAN)) {
-      CHECK_LT(materialized_approx_median_buffer_idx,
-               approx_median_materialized_buffers_.size());
-      const auto& approx_median_materialized_buffer =
-          approx_median_materialized_buffers_[materialized_approx_median_buffer_idx];
-      const auto lhs_value = approx_median_materialized_buffer[lhs];
-      const auto rhs_value = approx_median_materialized_buffer[rhs];
-      ++materialized_approx_median_buffer_idx;
+    } else if (UNLIKELY(agg_info.agg_kind == kAPPROX_QUANTILE)) {
+      CHECK_LT(materialized_approx_quantile_buffer_idx,
+               approx_quantile_materialized_buffers_.size());
+      const auto& approx_quantile_materialized_buffer =
+          approx_quantile_materialized_buffers_[materialized_approx_quantile_buffer_idx];
+      const auto lhs_value = approx_quantile_materialized_buffer[lhs];
+      const auto rhs_value = approx_quantile_materialized_buffer[rhs];
+      ++materialized_approx_quantile_buffer_idx;
       if (lhs_value == rhs_value) {
         continue;
       } else if (!entry_ti.get_notnull()) {
@@ -951,23 +981,25 @@ void ResultSet::radixSortOnGpu(
                                   grid_size_,
                                   device_id,
                                   ExecutorDispatchMode::KernelPerFragment,
-                                  -1,
-                                  true,
-                                  true,
-                                  false,
-                                  nullptr);
+                                  /*num_input_rows=*/-1,
+                                  /*prepend_index_buffer=*/true,
+                                  /*always_init_group_by_on_host=*/true,
+                                  /*use_bump_allocator=*/false,
+                                  /*has_varlen_output=*/false,
+                                  /*insitu_allocator*=*/nullptr);
   inplace_sort_gpu(
       order_entries, query_mem_desc_, dev_group_by_buffers, data_mgr, device_id);
   copy_group_by_buffers_from_gpu(
       data_mgr,
       group_by_buffers,
       query_mem_desc_.getBufferSizeBytes(ExecutorDeviceType::GPU),
-      dev_group_by_buffers.second,
+      dev_group_by_buffers.data,
       query_mem_desc_,
       block_size_,
       grid_size_,
       device_id,
-      false);
+      /*use_bump_allocator=*/false,
+      /*has_varlen_output=*/false);
 }
 
 void ResultSet::radixSortOnCpu(
@@ -1092,7 +1124,7 @@ std::tuple<std::vector<bool>, size_t> ResultSet::getSupportedSingleSlotTargetBit
   for (size_t target_idx = 0; target_idx < single_slot_targets.size(); target_idx++) {
     const auto& target = targets_[target_idx];
     if (single_slot_targets[target_idx] &&
-        (is_distinct_target(target) || target.agg_kind == kAPPROX_MEDIAN ||
+        (is_distinct_target(target) || target.agg_kind == kAPPROX_QUANTILE ||
          (target.is_agg && target.agg_kind == kSAMPLE && target.sql_type == kFLOAT))) {
       single_slot_targets[target_idx] = false;
       num_single_slot_targets--;

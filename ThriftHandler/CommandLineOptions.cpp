@@ -37,7 +37,7 @@ bool g_enable_thrift_logs{false};
 extern bool g_use_table_device_offset;
 extern float g_fraction_code_cache_to_evict;
 extern bool g_cache_string_hash;
-
+extern bool g_enable_idp_temporary_users;
 extern bool g_enable_left_join_filter_hoisting;
 extern int64_t g_large_ndv_threshold;
 extern size_t g_large_ndv_multiplier;
@@ -48,6 +48,7 @@ extern size_t g_approx_quantile_buffer;
 extern size_t g_approx_quantile_centroids;
 extern size_t g_parallel_top_min;
 extern size_t g_parallel_top_max;
+extern size_t g_estimator_failure_max_groupby_size;
 
 namespace Catalog_Namespace {
 extern bool g_log_user_id;
@@ -361,6 +362,22 @@ void CommandLineOptions::fillOptions() {
       "Specify level of disk cache. Valid options are 'foreign_tables', "
       "'local_tables', 'none', and 'all'.");
 
+  help_desc.add_options()("disk-cache-size",
+                          po::value<size_t>(&(disk_cache_config.size_limit)),
+                          "Specify a maximum size for the disk cache in bytes.");
+
+#ifdef HAVE_AWS_S3
+  help_desc.add_options()(
+      "allow-s3-server-privileges",
+      po::value<bool>(&g_allow_s3_server_privileges)
+          ->default_value(g_allow_s3_server_privileges)
+          ->implicit_value(true),
+      "Allow S3 server privileges, if IAM user credentials are not provided. Credentials "
+      "may be specified with "
+      "environment variables (such as AWS_ACCESS_KEY_ID,  AWS_SECRET_ACCESS_KEY, etc), "
+      "an AWS credentials file, or when running on an EC2 instance, with an IAM role "
+      "that is attached to the instance.");
+#endif  // defined(HAVE_AWS_S3)
   help_desc.add_options()(
       "enable-interoperability",
       po::value<bool>(&g_enable_interop)
@@ -523,6 +540,17 @@ void CommandLineOptions::fillAdvancedOptions() {
           ->default_value(g_use_tbb_pool)
           ->implicit_value(true),
       "Enable a new thread pool implementation for queuing kernels for execution.");
+  developer_desc.add_options()(
+      "enable-cpu-sub-tasks",
+      po::value<bool>(&g_enable_cpu_sub_tasks)
+          ->default_value(g_enable_cpu_sub_tasks)
+          ->implicit_value(true),
+      "Enable parallel processing of a single data fragment on CPU. This can improve CPU "
+      "load balance and decrease reduction overhead.");
+  developer_desc.add_options()(
+      "cpu-sub-task-size",
+      po::value<size_t>(&g_cpu_sub_task_size)->default_value(g_cpu_sub_task_size),
+      "Set CPU sub-task size in rows.");
   developer_desc.add_options()(
       "skip-intermediate-count",
       po::value<bool>(&g_skip_intermediate_count)
@@ -695,6 +723,13 @@ void CommandLineOptions::fillAdvancedOptions() {
       "Enable the filter function protection feature for the SQL JIT compiler. "
       "Normally should be on but techs might want to disable for troubleshooting.");
   developer_desc.add_options()(
+      "enable-idp-temporary-users",
+      po::value<bool>(&g_enable_idp_temporary_users)
+          ->default_value(g_enable_idp_temporary_users)
+          ->implicit_value(true),
+      "Enable temporary users for SAML and LDAP logins on read-only servers. "
+      "Normally should be on but techs might want to disable for troubleshooting.");
+  developer_desc.add_options()(
       "enable-calcite-ddl",
       po::value<bool>(&g_enable_calcite_ddl_parser)
           ->default_value(g_enable_calcite_ddl_parser)
@@ -735,6 +770,18 @@ void CommandLineOptions::fillAdvancedOptions() {
                                    ->default_value(g_enable_automatic_ir_metadata)
                                    ->implicit_value(true),
                                "Enable automatic IR metadata (debug builds only).");
+  developer_desc.add_options()(
+      "estimator-failure-max-groupby-size",
+      po::value<size_t>(&g_estimator_failure_max_groupby_size)
+          ->default_value(g_estimator_failure_max_groupby_size),
+      "Maximum size of the groupby buffer if the estimator fails. By default we use the "
+      "number of tuples in the table up to this value.");
+  help_desc.add_options()(
+      "allow-query-step-cpu-retry",
+      po::value<bool>(&g_allow_query_step_cpu_retry)
+          ->default_value(g_allow_query_step_cpu_retry)
+          ->implicit_value(true),
+      R"(Allow certain query steps to retry on CPU, even when allow-cpu-retry is disabled)");
 }
 
 namespace {
@@ -883,26 +930,31 @@ void CommandLineOptions::validate() {
 
   if (disk_cache_level == "foreign_tables") {
     if (g_enable_fsi) {
-      disk_cache_config.enabled_level = DiskCacheLevel::fsi;
+      disk_cache_config.enabled_level = File_Namespace::DiskCacheLevel::fsi;
       LOG(INFO) << "Disk cache enabled for foreign tables only";
     } else {
       LOG(INFO) << "Cannot enable disk cache for fsi when fsi is disabled.  Defaulted to "
                    "disk cache disabled";
     }
   } else if (disk_cache_level == "all") {
-    disk_cache_config.enabled_level = DiskCacheLevel::all;
+    disk_cache_config.enabled_level = File_Namespace::DiskCacheLevel::all;
     LOG(INFO) << "Disk cache enabled for all tables";
   } else if (disk_cache_level == "local_tables") {
-    disk_cache_config.enabled_level = DiskCacheLevel::non_fsi;
+    disk_cache_config.enabled_level = File_Namespace::DiskCacheLevel::non_fsi;
     LOG(INFO) << "Disk cache enabled for non-FSI tables";
   } else if (disk_cache_level == "none") {
-    disk_cache_config.enabled_level = DiskCacheLevel::none;
+    disk_cache_config.enabled_level = File_Namespace::DiskCacheLevel::none;
     LOG(INFO) << "Disk cache disabled";
   } else {
     throw std::runtime_error{
         "Unexpected \"disk-cache-level\" value: " + disk_cache_level +
         ". Valid options are 'foreign_tables', "
         "'local_tables', 'none', and 'all'."};
+  }
+
+  if (disk_cache_config.size_limit < File_Namespace::CachingFileMgr::getMinimumSize()) {
+    throw std::runtime_error{"disk-cache-size must be at least " +
+                             to_string(File_Namespace::CachingFileMgr::getMinimumSize())};
   }
 
   if (disk_cache_config.path.empty()) {
@@ -1083,7 +1135,7 @@ boost::optional<int> CommandLineOptions::parse_command_line(
   boost::algorithm::trim_if(system_parameters.master_address, boost::is_any_of("\"'"));
   if (!system_parameters.master_address.empty()) {
     if (!read_only) {
-      LOG(ERROR) << "The master-address setting is only allowed in readonly mode";
+      LOG(ERROR) << "The master-address setting is only allowed in read-only mode";
       return 9;
     }
     LOG(INFO) << " Master Address is " << system_parameters.master_address;

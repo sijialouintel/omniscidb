@@ -46,7 +46,7 @@ class CommandLineOptions {
   int http_port = 6278;
   size_t reserved_gpu_mem = 384 * 1024 * 1024;
   std::string base_path;
-  DiskCacheConfig disk_cache_config;
+  File_Namespace::DiskCacheConfig disk_cache_config;
   std::string cluster_file = {"cluster.conf"};
   std::string cluster_topology_file = {"cluster_topology.conf"};
   std::string license_path = {""};
@@ -74,10 +74,10 @@ class CommandLineOptions {
 
   bool enable_watchdog = true;
   bool enable_dynamic_watchdog = false;
-  bool enable_runtime_query_interrupt = false;
+  bool enable_runtime_query_interrupt = true;
   bool enable_non_kernel_time_query_interrupt = true;
   bool use_estimator_result_cache = true;
-  double running_query_interrupt_freq = 0.5;     // 0.0 ~ 1.0
+  double running_query_interrupt_freq = 0.1;     // 0.0 ~ 1.0
   unsigned pending_query_interrupt_freq = 1000;  // in milliseconds
   unsigned dynamic_watchdog_time_limit = 10000;
   std::string disk_cache_level = "";
@@ -150,6 +150,7 @@ extern unsigned g_trivial_loop_join_threshold;
 extern bool g_from_table_reordering;
 extern bool g_enable_filter_push_down;
 extern bool g_allow_cpu_retry;
+extern bool g_allow_query_step_cpu_retry;
 extern bool g_null_div_by_zero;
 extern bool g_bigint_count;
 extern bool g_inner_join_fragment_skipping;
@@ -194,9 +195,13 @@ extern bool g_enable_s3_fsi;
 extern bool g_enable_interop;
 extern bool g_enable_union;
 extern bool g_use_tbb_pool;
+extern bool g_enable_cpu_sub_tasks;
+extern size_t g_cpu_sub_task_size;
 extern bool g_enable_filter_function;
 extern size_t g_max_import_threads;
 extern bool g_enable_auto_metadata_update;
+extern bool g_allow_s3_server_privileges;
 extern float g_vacuum_min_selectivity;
 extern bool g_read_only;
 extern bool g_enable_automatic_ir_metadata;
+extern size_t g_enable_parallel_linearization;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2021 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include "QueryState.h"
 #include "Catalog/Catalog.h"
 #include "Catalog/SessionInfo.h"
+#include "Shared/nvtx_helpers.h"
 #include "Shared/toString.h"
 
 #include <algorithm>
@@ -51,7 +52,8 @@ SessionData::SessionData(
     , user_name(session_info->get_currentUser().userLoggable())
     , public_session_id(session_info->get_public_session_id()) {}
 
-std::atomic<query_state::Id> QueryState::s_next_id{0};
+// The id to be given to the next QueryState.
+std::atomic<logger::QueryId> QueryState::s_next_id{1};
 
 QueryState::QueryState(
     std::shared_ptr<Catalog_Namespace::SessionInfo const> const& session_info,
@@ -98,6 +100,11 @@ const std::string QueryState::getQuerySubmittedTime() const {
   return submitted_;
 }
 
+// Changes g_query_id to id_ only if it was previously 0. Otherwise no effect.
+logger::QidScopeGuard QueryState::setThreadLocalQueryId() const {
+  return logger::set_thread_local_query_id(id_);
+}
+
 // Assumes query_state_ is not null, and events_mutex_ is locked for this.
 void QueryState::logCallStack(std::stringstream& ss,
                               unsigned const depth,
@@ -126,7 +133,10 @@ Timer QueryStateProxy::createTimer(char const* event_name) {
 }
 
 Timer::Timer(std::shared_ptr<QueryState>&& query_state, Events::iterator event)
-    : query_state_(std::move(query_state)), event_(event) {}
+    : query_state_(std::move(query_state)), event_(event) {
+  nvtx_helpers::omnisci_range_push(
+      nvtx_helpers::Category::kQueryStateTimer, event_->name, nullptr);
+}
 
 QueryStateProxy Timer::createQueryStateProxy() {
   return query_state_->createQueryStateProxy(event_);
@@ -134,6 +144,7 @@ QueryStateProxy Timer::createQueryStateProxy() {
 
 Timer::~Timer() {
   event_->stop();
+  nvtx_helpers::omnisci_range_pop();
 }
 
 std::atomic<int64_t> StdLogData::s_match{0};
@@ -206,8 +217,9 @@ logger::Severity StdLog::stdlogBeginSeverity(char const* func) {
 void StdLog::log(logger::Severity severity, char const* label) {
   if (logger::fast_logging_check(severity)) {
     std::stringstream ss;
-    ss << logger::thread_id() << ' ' << file_ << ':' << line_ << ' ' << label << ' '
-       << func_ << ' ' << match_ << ' ' << duration<std::chrono::milliseconds>() << ' ';
+    ss << logger::query_id() << ' ' << logger::thread_id() << ' ' << file_ << ':' << line_
+       << ' ' << label << ' ' << func_ << ' ' << match_ << ' '
+       << duration<std::chrono::milliseconds>() << ' ';
     if (session_info_) {
       ss << SessionInfoFormatter{*session_info_} << ' ';
     } else if (query_state_ && query_state_->getSessionData()) {

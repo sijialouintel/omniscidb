@@ -182,7 +182,7 @@ const char* create_table_trips =
 
 void init_table_data(const std::string& table = "trips",
                      const std::string& create_table_cmd = create_table_trips,
-                     const std::string& file = "trip_data_b.txt") {
+                     const std::string& file = "trip_data_dir/trip_data_b.txt") {
   run_ddl_statement("drop table if exists " + table + ";");
   run_ddl_statement(create_table_cmd);
   if (file.size()) {
@@ -292,10 +292,11 @@ void drop_columns(const bool rollback, const std::vector<std::string>&& dropped_
       std::back_inserter(drop_column_phrases),
       [](const auto& dropped_column) -> auto {
         using namespace std::string_literals;
-        return "drop "s + (dropped_column[0] % 2 ? "column " : "") + dropped_column;
+        return dropped_column;
       });
-  std::string drop_column_statement =
-      "alter table t " + boost::algorithm::join(drop_column_phrases, ",") + ";";
+  std::string drop_column_statement = "alter table t drop column " +
+                                      boost::algorithm::join(drop_column_phrases, ",") +
+                                      ";";
   if (g_test_drop_column_rollback) {
     EXPECT_THROW(run_ddl_statement(drop_column_statement), std::runtime_error);
     for (const auto& dropped_column : dropped_columns) {
@@ -502,7 +503,7 @@ TEST_F(AlterTableSetMaxRowsTest, NegativeMaxRows) {
   sqlAndCompareResult("select * from test_table;",
                       {{i(1)}, {i(2)}, {i(3)}, {i(4)}, {i(5)}});
   queryAndAssertException("alter table test_table set max_rows = -1;",
-                          "Exception: Max rows cannot be a negative number.");
+                          "Max rows cannot be a negative number.");
   assertMaxRows(DEFAULT_MAX_ROWS);
   sqlAndCompareResult("select * from test_table;",
                       {{i(1)}, {i(2)}, {i(3)}, {i(4)}, {i(5)}});

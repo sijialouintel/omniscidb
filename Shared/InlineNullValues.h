@@ -20,8 +20,10 @@
 #include "../Logger/Logger.h"
 #include "funcannotations.h"
 
+#include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 #define NULL_BOOLEAN INT8_MIN
@@ -89,22 +91,22 @@ constexpr inline double inline_fp_null_value<double>() {
 }
 
 template <typename T>
-T inline_fp_null_array_value() {
+DEVICE T inline_fp_null_array_value() {
 #if !(defined(__CUDACC__) || defined(NO_BOOST))
   LOG(FATAL) << "Only float or double overloads should be called.";
 #else
-  LOG(FATAL);
+  assert(false);
 #endif
   return T{};
 }
 
 template <>
-constexpr inline float inline_fp_null_array_value<float>() {
+DEVICE inline float inline_fp_null_array_value<float>() {
   return NULL_ARRAY_FLOAT;
 }
 
 template <>
-constexpr inline double inline_fp_null_array_value<double>() {
+DEVICE inline double inline_fp_null_array_value<double>() {
   return NULL_ARRAY_DOUBLE;
 }
 

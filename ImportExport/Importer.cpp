@@ -59,12 +59,13 @@
 #include "Geospatial/Types.h"
 #include "ImportExport/DelimitedParserUtils.h"
 #include "Logger/Logger.h"
-#include "OSDependent/omnisci_glob.h"
 #include "QueryEngine/ErrorHandling.h"
 #include "QueryEngine/Execute.h"
 #include "QueryEngine/TypePunning.h"
+#include "RenderGroupAnalyzer.h"
 #include "Shared/DateTimeParser.h"
 #include "Shared/SqlTypesLayout.h"
+#include "Shared/glob_local_recursive_files.h"
 #include "Shared/import_helpers.h"
 #include "Shared/likely.h"
 #include "Shared/measure.h"
@@ -416,6 +417,22 @@ ArrayDatum NullArray(const SQLTypeInfo& ti) {
 
 ArrayDatum ImporterUtils::composeNullArray(const SQLTypeInfo& ti) {
   return NullArray(ti);
+}
+
+ArrayDatum ImporterUtils::composeNullPointCoords(const SQLTypeInfo& coords_ti,
+                                                 const SQLTypeInfo& geo_ti) {
+  if (geo_ti.get_compression() == kENCODING_GEOINT) {
+    CHECK(geo_ti.get_comp_param() == 32);
+    std::vector<double> null_point_coords = {NULL_ARRAY_DOUBLE, NULL_DOUBLE};
+    auto compressed_null_coords = Geospatial::compress_coords(null_point_coords, geo_ti);
+    const size_t len = compressed_null_coords.size();
+    int8_t* buf = (int8_t*)checked_malloc(len);
+    memcpy(buf, compressed_null_coords.data(), len);
+    return ArrayDatum(len, buf, false);
+  }
+  auto modified_ti = coords_ti;
+  modified_ti.set_subtype(kDOUBLE);
+  return import_export::ImporterUtils::composeNullArray(modified_ti);
 }
 
 void addBinaryStringArray(const TDatum& datum, std::vector<std::string>& string_vec) {
@@ -1144,7 +1161,15 @@ size_t TypedImportBuffer::add_values(const ColumnDescriptor* cd, const TColumn& 
                 int8_t* buf = (int8_t*)checked_malloc(len * byteSize);
                 int8_t* p = buf;
                 for (size_t j = 0; j < len; ++j) {
-                  *(bool*)p = static_cast<bool>(col.data.arr_col[i].data.int_col[j]);
+                  // Explicitly checking the item for null because
+                  // casting null value (-128) to bool results
+                  // incorrect value 1.
+                  if (col.data.arr_col[i].nulls[j]) {
+                    *p = static_cast<int8_t>(
+                        inline_fixed_encoding_null_val(cd->columnType.get_elem_type()));
+                  } else {
+                    *(bool*)p = static_cast<bool>(col.data.arr_col[i].data.int_col[j]);
+                  }
                   p += sizeof(bool);
                 }
                 addArray(ArrayDatum(byteSize, buf, false));
@@ -1433,6 +1458,165 @@ void TypedImportBuffer::add_value(const ColumnDescriptor* cd,
       break;
     default:
       CHECK(false) << "TypedImportBuffer::add_value() does not support type " << type;
+  }
+}
+
+void TypedImportBuffer::addDefaultValues(const ColumnDescriptor* cd, size_t num_rows) {
+  bool is_null = !cd->default_value.has_value();
+  CHECK(!(is_null && cd->columnType.get_notnull()));
+  const auto type = cd->columnType.get_type();
+  auto ti = cd->columnType;
+  auto val = cd->default_value.value_or("NULL");
+  CopyParams cp;
+  switch (type) {
+    case kBOOLEAN: {
+      if (!is_null) {
+        bool_buffer_->resize(num_rows, StringToDatum(val, ti).boolval);
+      } else {
+        bool_buffer_->resize(num_rows, inline_fixed_encoding_null_val(cd->columnType));
+      }
+      break;
+    }
+    case kTINYINT: {
+      if (!is_null) {
+        tinyint_buffer_->resize(num_rows, StringToDatum(val, ti).tinyintval);
+      } else {
+        tinyint_buffer_->resize(num_rows, inline_fixed_encoding_null_val(cd->columnType));
+      }
+      break;
+    }
+    case kSMALLINT: {
+      if (!is_null) {
+        smallint_buffer_->resize(num_rows, StringToDatum(val, ti).smallintval);
+      } else {
+        smallint_buffer_->resize(num_rows,
+                                 inline_fixed_encoding_null_val(cd->columnType));
+      }
+      break;
+    }
+    case kINT: {
+      if (!is_null) {
+        int_buffer_->resize(num_rows, StringToDatum(val, ti).intval);
+      } else {
+        int_buffer_->resize(num_rows, inline_fixed_encoding_null_val(cd->columnType));
+      }
+      break;
+    }
+    case kBIGINT: {
+      if (!is_null) {
+        bigint_buffer_->resize(num_rows, StringToDatum(val, ti).bigintval);
+      } else {
+        bigint_buffer_->resize(num_rows, inline_fixed_encoding_null_val(cd->columnType));
+      }
+      break;
+    }
+    case kDECIMAL:
+    case kNUMERIC: {
+      if (!is_null) {
+        const auto converted_decimal_value = convert_decimal_value_to_scale(
+            StringToDatum(val, ti).bigintval, ti, cd->columnType);
+        bigint_buffer_->resize(num_rows, converted_decimal_value);
+      } else {
+        bigint_buffer_->resize(num_rows, inline_fixed_encoding_null_val(cd->columnType));
+      }
+      break;
+    }
+    case kFLOAT:
+      if (!is_null) {
+        float_buffer_->resize(num_rows,
+                              static_cast<float>(std::atof(std::string(val).c_str())));
+      } else {
+        float_buffer_->resize(num_rows, NULL_FLOAT);
+      }
+      break;
+    case kDOUBLE:
+      if (!is_null) {
+        double_buffer_->resize(num_rows, std::atof(std::string(val).c_str()));
+      } else {
+        double_buffer_->resize(num_rows, NULL_DOUBLE);
+      }
+      break;
+    case kTEXT:
+    case kVARCHAR:
+    case kCHAR: {
+      if (is_null) {
+        string_buffer_->resize(num_rows, "");
+      } else {
+        if (val.length() > StringDictionary::MAX_STRLEN) {
+          throw std::runtime_error("String too long for column " + cd->columnName +
+                                   " was " + std::to_string(val.length()) + " max is " +
+                                   std::to_string(StringDictionary::MAX_STRLEN));
+        }
+        string_buffer_->resize(num_rows, val);
+      }
+      break;
+    }
+    case kTIME:
+    case kTIMESTAMP:
+    case kDATE:
+      if (!is_null) {
+        bigint_buffer_->resize(num_rows, StringToDatum(val, ti).bigintval);
+      } else {
+        bigint_buffer_->resize(num_rows, inline_fixed_encoding_null_val(cd->columnType));
+      }
+      break;
+    case kARRAY: {
+      if (IS_STRING(ti.get_subtype())) {
+        std::vector<std::string> string_vec;
+        // Just parse string array, don't push it to buffer yet as we might throw
+        import_export::delimited_parser::parse_string_array(
+            std::string(val), cp, string_vec);
+        if (!is_null) {
+          // TODO: add support for NULL string arrays
+          if (ti.get_size() > 0) {
+            auto sti = ti.get_elem_type();
+            size_t expected_size = ti.get_size() / sti.get_size();
+            size_t actual_size = string_vec.size();
+            if (actual_size != expected_size) {
+              throw std::runtime_error("Fixed length array column " + cd->columnName +
+                                       " expects " + std::to_string(expected_size) +
+                                       " values, received " +
+                                       std::to_string(actual_size));
+            }
+          }
+          string_array_buffer_->resize(num_rows, string_vec);
+        } else {
+          if (ti.get_size() > 0) {
+            // TODO: remove once NULL fixlen arrays are allowed
+            throw std::runtime_error("Fixed length array column " + cd->columnName +
+                                     " currently cannot accept NULL arrays");
+          }
+          // TODO: add support for NULL string arrays, replace with addStringArray(),
+          //       for now add whatever parseStringArray() outputs for NULLs ("NULL")
+          string_array_buffer_->resize(num_rows, string_vec);
+        }
+      } else {
+        if (!is_null) {
+          ArrayDatum d = StringToArray(std::string(val), ti, cp);
+          if (d.is_null) {  // val could be "NULL"
+            array_buffer_->resize(num_rows, NullArray(ti));
+          } else {
+            if (ti.get_size() > 0 && static_cast<size_t>(ti.get_size()) != d.length) {
+              throw std::runtime_error("Fixed length array for column " + cd->columnName +
+                                       " has incorrect length: " + std::string(val));
+            }
+            array_buffer_->resize(num_rows, d);
+          }
+        } else {
+          array_buffer_->resize(num_rows, NullArray(ti));
+        }
+      }
+      break;
+    }
+    case kPOINT:
+    case kLINESTRING:
+    case kPOLYGON:
+    case kMULTIPOLYGON:
+      geo_string_buffer_->resize(num_rows, val);
+      break;
+    default:
+      CHECK(false) << "TypedImportBuffer::addDefaultValues() does not support type "
+                   << type;
   }
 }
 
@@ -2189,6 +2373,12 @@ static ImportStatus import_thread_delimited(
   return thread_import_status;
 }
 
+class ColumnNotGeoError : public std::runtime_error {
+ public:
+  ColumnNotGeoError(const std::string& column_name)
+      : std::runtime_error("Column '" + column_name + "' is not a geo column") {}
+};
+
 static ImportStatus import_thread_shapefile(
     int thread_id,
     Importer* importer,
@@ -2215,33 +2405,54 @@ static ImportStatus import_thread_shapefile(
 
   // we create this on the fly based on the first feature's SR
   std::unique_ptr<OGRCoordinateTransformation> coordinate_transformation;
+  bool checked_transformation{false};
+
+  // for all the features in this chunk...
   for (size_t iFeature = 0; iFeature < numFeatures; iFeature++) {
+    // ignore null features
     if (!features[iFeature]) {
       continue;
     }
 
     // get this feature's geometry
+    // for geodatabase, we need to consider features with no geometry
+    // as we still want to create a table, even if it has no geo column
     OGRGeometry* pGeometry = features[iFeature]->GetGeometryRef();
     if (pGeometry) {
-      // for geodatabase, we need to consider features with no geometry
-      // as we still want to create a table, even if it has no geo column
-
-      // transform it
-      // avoid GDAL error if not transformable
-      auto geometry_sr = pGeometry->getSpatialReference();
-      if (geometry_sr) {
-        // create an OGRCoordinateTransformation (CT) on the fly
-        // we must assume that all geo in this file will have
-        // the same source SR, so the CT will be valid for all
-        // transforming to a reusable CT is faster than to an SR
-        if (coordinate_transformation == nullptr) {
-          coordinate_transformation.reset(
-              OGRCreateCoordinateTransformation(geometry_sr, poGeographicSR));
+      // check if we need to make a CoordinateTransformation
+      // we assume that all features in this chunk will have
+      // the same source SR, so the CT will be valid for all
+      // transforming to a reusable CT is faster than to an SR
+      if (!checked_transformation) {
+        // get the SR of the incoming geo
+        auto geometry_sr = pGeometry->getSpatialReference();
+        // if the SR is non-null and non-empty and different from what we want
+        // we need to make a reusable CoordinateTransformation
+        if (geometry_sr &&
+#if GDAL_VERSION_MAJOR >= 3
+            !geometry_sr->IsEmpty() &&
+#endif
+            !geometry_sr->IsSame(poGeographicSR)) {
+          // validate the SR before trying to use it
+          if (geometry_sr->Validate() != OGRERR_NONE) {
+            throw std::runtime_error("Incoming geo has invalid Spatial Reference");
+          }
+          // create the OGRCoordinateTransformation that will be used for
+          // all the features in this chunk
           if (coordinate_transformation == nullptr) {
-            throw std::runtime_error(
-                "Failed to create a GDAL CoordinateTransformation for incoming geo");
+            coordinate_transformation.reset(
+                OGRCreateCoordinateTransformation(geometry_sr, poGeographicSR));
+            if (coordinate_transformation == nullptr) {
+              throw std::runtime_error(
+                  "Failed to create a GDAL CoordinateTransformation for incoming geo");
+            }
           }
         }
+        checked_transformation = true;
+      }
+
+      // if we have a transformation, use it
+      if (coordinate_transformation) {
         pGeometry->transform(coordinate_transformation.get());
       }
     }
@@ -2431,7 +2642,10 @@ static ImportStatus import_thread_shapefile(
             auto const& field_name = cit->second;
 
             auto const fit = fieldNameToIndexMap.find(field_name);
-            CHECK(fit != fieldNameToIndexMap.end());
+            if (fit == fieldNameToIndexMap.end()) {
+              throw ColumnNotGeoError(cd->columnName);
+            }
+
             auto const& field_index = fit->second;
             CHECK(field_index < fieldNameToIndexMap.size());
 
@@ -2510,6 +2724,9 @@ static ImportStatus import_thread_shapefile(
         if (e.getErrorCode() == Executor::ERR_INTERRUPTED) {
           throw e;
         }
+      } catch (ColumnNotGeoError& e) {
+        LOG(ERROR) << "Input exception thrown: " << e.what() << ". Aborting import.";
+        throw std::runtime_error(e.what());
       } catch (const std::exception& e) {
         for (size_t col_idx_to_pop = 0; col_idx_to_pop < col_idx; ++col_idx_to_pop) {
           import_buffers[col_idx_to_pop]->pop_value();
@@ -3417,8 +3634,13 @@ ImportStatus DataStreamSink::archivePlumber(
   // in generalized importing scheme, reaching here file_path may
   // contain a file path, a url or a wildcard of file paths.
   // see CopyTableStmt::execute.
-  auto file_paths = omnisci::glob(file_path);
-  if (file_paths.size() == 0) {
+
+  std::vector<std::string> file_paths;
+  try {
+    auto file_paths_set = shared::glob_local_recursive_files(file_path);
+    file_paths = std::vector<std::string>(file_paths_set.begin(), file_paths_set.end());
+  } catch (const shared::FileNotFoundException& e) {
+    // After finding no matching files locally, file_path may still be an s3 url
     file_paths.push_back(file_path);
   }
 
@@ -4963,18 +5185,24 @@ ImportStatus Importer::importGDAL(ColumnNameToSourceNameMapType columnNameToSour
   auto query_session = session_info ? session_info->get_session_id() : "";
   auto query_submitted_time = ::toString(std::chrono::system_clock::now());
   auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
-  if (g_enable_non_kernel_time_query_interrupt && !query_session.empty()) {
+  auto is_session_already_registered = false;
+  {
+    mapd_shared_lock<mapd_shared_mutex> session_read_lock(executor->getSessionLock());
+    is_session_already_registered =
+        executor->checkIsQuerySessionEnrolled(query_session, session_read_lock);
+  }
+  if (g_enable_non_kernel_time_query_interrupt && !query_session.empty() &&
+      !is_session_already_registered) {
     executor->enrollQuerySession(query_session,
-                                 "Import Geo Table",
+                                 "IMPORT_GEO_TABLE",
                                  query_submitted_time,
                                  Executor::UNITARY_EXECUTOR_ID,
-                                 QuerySessionStatus::QueryStatus::RUNNING);
+                                 QuerySessionStatus::QueryStatus::RUNNING_IMPORTER);
   }
-
   ScopeGuard clearInterruptStatus = [executor, &query_session, &query_submitted_time] {
     // reset the runtime query interrupt status
     if (g_enable_non_kernel_time_query_interrupt && !query_session.empty()) {
-      executor->clearQuerySessionStatus(query_session, query_submitted_time, false);
+      executor->clearQuerySessionStatus(query_session, query_submitted_time);
     }
   };
 
@@ -5164,193 +5392,6 @@ ImportStatus Importer::importGDAL(ColumnNameToSourceNameMapType columnNameToSour
   return import_status_;
 }
 
-//
-// class RenderGroupAnalyzer
-//
-
-void RenderGroupAnalyzer::seedFromExistingTableContents(
-    Catalog_Namespace::Catalog& cat,
-    const std::string& tableName,
-    const std::string& geoColumnBaseName) {
-  // start timer
-  auto seedTimer = timer_start();
-
-  // start with a fresh tree
-  _rtree = nullptr;
-  _numRenderGroups = 0;
-
-  // get the table descriptor
-  auto const* td = cat.getMetadataForTable(tableName);
-  CHECK(td);
-
-  // foreign tables not supported
-  if (td->storageType == StorageType::FOREIGN_TABLE) {
-    if (DEBUG_RENDER_GROUP_ANALYZER) {
-      LOG(INFO) << "DEBUG: Table is a foreign table";
-    }
-    _rtree = std::make_unique<RTree>();
-    CHECK(_rtree);
-    return;
-  }
-
-  // if the table is empty, just make an empty tree
-  CHECK(td->fragmenter);
-  if (td->fragmenter->getFragmentsForQuery().getPhysicalNumTuples() == 0) {
-    if (DEBUG_RENDER_GROUP_ANALYZER) {
-      LOG(INFO) << "DEBUG: Table is empty!";
-    }
-    _rtree = std::make_unique<RTree>();
-    CHECK(_rtree);
-    return;
-  }
-
-  // no seeding possible without these two columns
-  const auto cd_bounds =
-      cat.getMetadataForColumn(td->tableId, geoColumnBaseName + "_bounds");
-  const auto cd_render_group =
-      cat.getMetadataForColumn(td->tableId, geoColumnBaseName + "_render_group");
-  if (!cd_bounds || !cd_render_group) {
-    throw std::runtime_error("RenderGroupAnalyzer: Table " + tableName +
-                             " doesn't have bounds or render_group columns!");
-  }
-
-  // and validate their types
-  if (cd_bounds->columnType.get_type() != kARRAY ||
-      cd_bounds->columnType.get_subtype() != kDOUBLE) {
-    throw std::runtime_error("RenderGroupAnalyzer: Table " + tableName +
-                             " bounds column is wrong type!");
-  }
-  if (cd_render_group->columnType.get_type() != kINT) {
-    throw std::runtime_error("RenderGroupAnalyzer: Table " + tableName +
-                             " render_group column is wrong type!");
-  }
-
-  // get chunk accessor table
-  auto chunkAccessorTable = getChunkAccessorTable(
-      cat, td, {geoColumnBaseName + "_bounds", geoColumnBaseName + "_render_group"});
-  const auto table_count = std::get<0>(chunkAccessorTable.back());
-
-  if (DEBUG_RENDER_GROUP_ANALYZER) {
-    LOG(INFO) << "DEBUG: Scanning existing table geo column set '" << geoColumnBaseName
-              << "'";
-  }
-
-  std::vector<Node> nodes;
-  try {
-    nodes.resize(table_count);
-  } catch (const std::exception& e) {
-    throw std::runtime_error("RenderGroupAnalyzer failed to reserve memory for " +
-                             std::to_string(table_count) + " rows");
-  }
-
-  for (size_t row = 0; row < table_count; row++) {
-    ArrayDatum ad;
-    VarlenDatum vd;
-    bool is_end;
-
-    // get ChunkIters and fragment row offset
-    size_t rowOffset = 0;
-    auto& chunkIters = getChunkItersAndRowOffset(chunkAccessorTable, row, rowOffset);
-    auto& boundsChunkIter = chunkIters[0];
-    auto& renderGroupChunkIter = chunkIters[1];
-
-    // get bounds values
-    ChunkIter_get_nth(&boundsChunkIter, row - rowOffset, &ad, &is_end);
-    CHECK(!is_end);
-    CHECK(ad.pointer);
-    int numBounds = (int)(ad.length / sizeof(double));
-    CHECK(numBounds == 4);
-
-    // convert to bounding box
-    double* bounds = reinterpret_cast<double*>(ad.pointer);
-    BoundingBox bounding_box;
-    boost::geometry::assign_inverse(bounding_box);
-    boost::geometry::expand(bounding_box, Point(bounds[0], bounds[1]));
-    boost::geometry::expand(bounding_box, Point(bounds[2], bounds[3]));
-
-    // get render group
-    ChunkIter_get_nth(&renderGroupChunkIter, row - rowOffset, false, &vd, &is_end);
-    CHECK(!is_end);
-    CHECK(vd.pointer);
-    int renderGroup = *reinterpret_cast<int32_t*>(vd.pointer);
-
-    // skip rows with invalid render groups (e.g. EMPTY geometry)
-    if (renderGroup < 0) {
-      continue;
-    }
-
-    // store
-    nodes[row] = std::make_pair(bounding_box, renderGroup);
-
-    // how many render groups do we have now?
-    if (renderGroup >= _numRenderGroups) {
-      _numRenderGroups = renderGroup + 1;
-    }
-
-    if (DEBUG_RENDER_GROUP_ANALYZER) {
-      LOG(INFO) << "DEBUG:   Existing row " << row << " has Render Group " << renderGroup;
-    }
-  }
-
-  // bulk-load the tree
-  auto bulk_load_timer = timer_start();
-  _rtree = std::make_unique<RTree>(nodes);
-  CHECK(_rtree);
-  LOG(INFO) << "Scanning render groups of poly column '" << geoColumnBaseName
-            << "' of table '" << tableName << "' took " << timer_stop(seedTimer) << "ms ("
-            << timer_stop(bulk_load_timer) << " ms for tree)";
-
-  if (DEBUG_RENDER_GROUP_ANALYZER) {
-    LOG(INFO) << "DEBUG: Done! Now have " << _numRenderGroups << " Render Groups";
-  }
-}
-
-int RenderGroupAnalyzer::insertBoundsAndReturnRenderGroup(
-    const std::vector<double>& bounds) {
-  // validate
-  CHECK(bounds.size() == 4);
-
-  // get bounds
-  BoundingBox bounding_box;
-  boost::geometry::assign_inverse(bounding_box);
-  boost::geometry::expand(bounding_box, Point(bounds[0], bounds[1]));
-  boost::geometry::expand(bounding_box, Point(bounds[2], bounds[3]));
-
-  // remainder under mutex to allow this to be multi-threaded
-  std::lock_guard<std::mutex> guard(_rtreeMutex);
-
-  // get the intersecting nodes
-  std::vector<Node> intersects;
-  _rtree->query(boost::geometry::index::intersects(bounding_box),
-                std::back_inserter(intersects));
-
-  // build bitset of render groups of the intersecting rectangles
-  // clear bit means available, allows use of find_first()
-  boost::dynamic_bitset<> bits(_numRenderGroups);
-  bits.set();
-  for (const auto& intersection : intersects) {
-    CHECK(intersection.second < _numRenderGroups);
-    bits.reset(intersection.second);
-  }
-
-  // find first available group
-  int firstAvailableRenderGroup = 0;
-  size_t firstSetBit = bits.find_first();
-  if (firstSetBit == boost::dynamic_bitset<>::npos) {
-    // all known groups represented, add a new one
-    firstAvailableRenderGroup = _numRenderGroups;
-    _numRenderGroups++;
-  } else {
-    firstAvailableRenderGroup = (int)firstSetBit;
-  }
-
-  // insert new node
-  _rtree->insert(std::make_pair(bounding_box, firstAvailableRenderGroup));
-
-  // return it
-  return firstAvailableRenderGroup;
-}
-
 std::vector<std::unique_ptr<TypedImportBuffer>> setup_column_loaders(
     const TableDescriptor* td,
     Loader* loader) {
@@ -5385,12 +5426,11 @@ std::vector<std::unique_ptr<TypedImportBuffer>> setup_column_loaders(
                   cd->columnId) == insert_data.columnIds.end()) {
       StringDictionary* dict = nullptr;
       if (cd->columnType.get_type() == kARRAY &&
-          IS_STRING(cd->columnType.get_subtype())) {
+          IS_STRING(cd->columnType.get_subtype()) && !cd->default_value.has_value()) {
         throw std::runtime_error("Cannot omit column \"" + cd->columnName +
                                  "\": omitting TEXT arrays is not supported yet");
       }
-      if (cd->columnType.is_string() &&
-          cd->columnType.get_compression() == kENCODING_DICT) {
+      if (cd->columnType.get_compression() == kENCODING_DICT) {
         dict = cat->getMetadataForDict(cd->columnType.get_comp_param())->stringDict.get();
       }
       defaults_buffers.emplace_back(std::make_unique<TypedImportBuffer>(cd, dict));
@@ -5404,14 +5444,16 @@ std::vector<std::unique_ptr<TypedImportBuffer>> setup_column_loaders(
             });
   for (size_t i = 0; i < defaults_buffers.size(); ++i) {
     auto cd = defaults_buffers[i]->getColumnDesc();
-    defaults_buffers[i]->add_value(cd, "NULL", true, import_export::CopyParams());
+    std::string default_value = cd->default_value.value_or("NULL");
+    defaults_buffers[i]->add_value(
+        cd, default_value, !cd->default_value.has_value(), import_export::CopyParams());
     if (cd->columnType.is_geometry()) {
       std::vector<double> coords, bounds;
       std::vector<int> ring_sizes, poly_rings;
       int render_group = 0;
       SQLTypeInfo tinfo{cd->columnType};
       CHECK(Geospatial::GeoTypesFactory::getGeoColumns(
-          "NULL", tinfo, coords, bounds, ring_sizes, poly_rings, false));
+          default_value, tinfo, coords, bounds, ring_sizes, poly_rings, false));
       // set physical columns starting with the following ID
       auto next_col = i + 1;
       import_export::Importer::set_geo_physical_import_buffer(*cat,

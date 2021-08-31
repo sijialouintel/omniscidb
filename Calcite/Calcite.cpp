@@ -28,7 +28,6 @@
 #include "Shared/SystemParameters.h"
 #include "Shared/ThriftClient.h"
 #include "Shared/fixautotools.h"
-#include "Shared/mapd_shared_ptr.h"
 #include "Shared/measure.h"
 #include "ThriftHandler/QueryState.h"
 
@@ -247,14 +246,14 @@ static void start_calcite_server_as_daemon(const int db_port,
 #endif
 }
 
-std::pair<mapd::shared_ptr<CalciteServerClient>, mapd::shared_ptr<TTransport>>
+std::pair<std::shared_ptr<CalciteServerClient>, std::shared_ptr<TTransport>>
 Calcite::getClient(int port) {
   const auto transport = connMgr_->open_buffered_client_transport("localhost",
                                                                   port,
                                                                   ssl_ca_file_,
                                                                   true,
                                                                   service_keepalive_,
-                                                                  2000,
+                                                                  service_timeout_,
                                                                   service_timeout_,
                                                                   service_timeout_);
   try {
@@ -265,10 +264,10 @@ Calcite::getClient(int port) {
   } catch (std::exception& ex) {
     throw ex;
   }
-  mapd::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
-  mapd::shared_ptr<CalciteServerClient> client;
+  std::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
+  std::shared_ptr<CalciteServerClient> client;
   client.reset(new CalciteServerClient(protocol));
-  std::pair<mapd::shared_ptr<CalciteServerClient>, mapd::shared_ptr<TTransport>> ret;
+  std::pair<std::shared_ptr<CalciteServerClient>, std::shared_ptr<TTransport>> ret;
   return std::make_pair(client, transport);
 }
 
@@ -419,17 +418,18 @@ void Calcite::updateMetadata(std::string catalog, std::string table) {
 }
 
 void checkPermissionForTables(const Catalog_Namespace::SessionInfo& session_info,
-                              std::vector<std::string> tableOrViewNames,
+                              std::vector<std::vector<std::string>> tableOrViewNames,
                               AccessPrivileges tablePrivs,
                               AccessPrivileges viewPrivs) {
+  // TODO MAT this needs to be able to check privileges from other catalogs
   Catalog_Namespace::Catalog& catalog = session_info.getCatalog();
 
   for (auto tableOrViewName : tableOrViewNames) {
     const TableDescriptor* tableMeta =
-        catalog.getMetadataForTable(tableOrViewName, false);
+        catalog.getMetadataForTable(tableOrViewName[0], false);
 
     if (!tableMeta) {
-      throw std::runtime_error("unknown table of view: " + tableOrViewName);
+      throw std::runtime_error("unknown table of view: " + tableOrViewName[0]);
     }
 
     DBObjectKey key;
@@ -442,14 +442,16 @@ void checkPermissionForTables(const Catalog_Namespace::SessionInfo& session_info
     std::vector<DBObject> privObjects{dbobject};
 
     if (!privs.hasAny()) {
-      throw std::runtime_error("Operation not supported for object " + tableOrViewName);
+      throw std::runtime_error("Operation not supported for object " +
+                               tableOrViewName[0]);
     }
 
     if (!Catalog_Namespace::SysCatalog::instance().checkPrivileges(
             session_info.get_currentUser(), privObjects)) {
       throw std::runtime_error("Violation of access privileges: user " +
                                session_info.get_currentUser().userLoggable() +
-                               " has no proper privileges for object " + tableOrViewName);
+                               " has no proper privileges for object " +
+                               tableOrViewName[0]);
     }
   }
 }
@@ -554,7 +556,8 @@ TPlanResult Calcite::processImpl(
 
   TRestriction restriction;
   auto rest = user_session_info->get_restriction_ptr();
-  if (rest != nullptr) {
+  if (rest != nullptr && !rest->column.empty()) {
+    VLOG(1) << "This users session has a restriction : " << *rest;
     restriction.column = rest->column;
     restriction.values = rest->values;
   }

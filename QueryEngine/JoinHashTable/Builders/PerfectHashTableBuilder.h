@@ -22,15 +22,15 @@
 
 class PerfectJoinHashTableBuilder {
  public:
-  PerfectJoinHashTableBuilder(const Catalog_Namespace::Catalog* catalog)
-      : catalog_(catalog) {}
+  PerfectJoinHashTableBuilder() {}
 
   void allocateDeviceMemory(const JoinColumn& join_column,
                             const HashType layout,
                             HashEntryInfo& hash_entry_info,
                             const size_t shard_count,
                             const int device_id,
-                            const int device_count) {
+                            const int device_count,
+                            const Executor* executor) {
 #ifdef HAVE_CUDA
     if (shard_count) {
       const auto shards_per_device = (shard_count + device_count - 1) / device_count;
@@ -45,7 +45,7 @@ class PerfectJoinHashTableBuilder {
             : 2 * hash_entry_info.getNormalizedHashEntryCount() + join_column.num_elems;
     CHECK(!hash_table_);
     hash_table_ =
-        std::make_unique<PerfectHashTable>(catalog_,
+        std::make_unique<PerfectHashTable>(executor->getDataMgr(),
                                            layout,
                                            ExecutorDeviceType::GPU,
                                            hash_entry_info.getNormalizedHashEntryCount(),
@@ -62,6 +62,7 @@ class PerfectJoinHashTableBuilder {
                           const ExpressionRange& col_range,
                           const bool is_bitwise_eq,
                           const InnerOuter& cols,
+                          const JoinType join_type,
                           const HashType layout,
                           const HashEntryInfo hash_entry_info,
                           const size_t shard_count,
@@ -69,18 +70,17 @@ class PerfectJoinHashTableBuilder {
                           const int device_id,
                           const int device_count,
                           const Executor* executor) {
-    auto catalog = executor->getCatalog();
-    auto& data_mgr = catalog->getDataMgr();
+    auto data_mgr = executor->getDataMgr();
     Data_Namespace::AbstractBuffer* gpu_hash_table_err_buff =
-        CudaAllocator::allocGpuAbstractBuffer(&data_mgr, sizeof(int), device_id);
+        CudaAllocator::allocGpuAbstractBuffer(data_mgr, sizeof(int), device_id);
     ScopeGuard cleanup_error_buff = [&data_mgr, gpu_hash_table_err_buff]() {
-      data_mgr.free(gpu_hash_table_err_buff);
+      data_mgr->free(gpu_hash_table_err_buff);
     };
     CHECK(gpu_hash_table_err_buff);
     auto dev_err_buff =
         reinterpret_cast<CUdeviceptr>(gpu_hash_table_err_buff->getMemoryPtr());
     int err{0};
-    copy_to_gpu(&data_mgr, dev_err_buff, &err, sizeof(err), device_id);
+    copy_to_gpu(data_mgr, dev_err_buff, &err, sizeof(err), device_id);
 
     CHECK(hash_table_);
     auto gpu_hash_table_buff = hash_table_->getGpuBuffer();
@@ -115,6 +115,7 @@ class PerfectJoinHashTableBuilder {
           fill_hash_join_buff_on_device_sharded_bucketized(
               reinterpret_cast<int32_t*>(gpu_hash_table_buff),
               hash_join_invalid_val,
+              for_semi_anti_join(join_type),
               reinterpret_cast<int*>(dev_err_buff),
               join_column,
               type_info,
@@ -135,6 +136,7 @@ class PerfectJoinHashTableBuilder {
         fill_hash_join_buff_on_device_bucketized(
             reinterpret_cast<int32_t*>(gpu_hash_table_buff),
             hash_join_invalid_val,
+            for_semi_anti_join(join_type),
             reinterpret_cast<int*>(dev_err_buff),
             join_column,
             type_info,
@@ -157,7 +159,7 @@ class PerfectJoinHashTableBuilder {
         }
       }
     }
-    copy_from_gpu(&data_mgr, &err, dev_err_buff, sizeof(err), device_id);
+    copy_from_gpu(data_mgr, &err, dev_err_buff, sizeof(err), device_id);
     if (err) {
       if (layout == HashType::OneToOne) {
         throw NeedsOneToManyHash();
@@ -173,6 +175,8 @@ class PerfectJoinHashTableBuilder {
                                   const ExpressionRange& col_range,
                                   const bool is_bitwise_eq,
                                   const InnerOuter& cols,
+                                  const JoinType join_type,
+                                  const HashType hash_type,
                                   const HashEntryInfo hash_entry_info,
                                   const int32_t hash_join_invalid_val,
                                   const Executor* executor) {
@@ -183,8 +187,8 @@ class PerfectJoinHashTableBuilder {
 
     CHECK(!hash_table_);
     hash_table_ =
-        std::make_unique<PerfectHashTable>(catalog_,
-                                           HashType::OneToOne,
+        std::make_unique<PerfectHashTable>(executor->getDataMgr(),
+                                           hash_type,
                                            ExecutorDeviceType::CPU,
                                            hash_entry_info.getNormalizedHashEntryCount(),
                                            0);
@@ -193,6 +197,7 @@ class PerfectJoinHashTableBuilder {
     const StringDictionaryProxy* sd_inner_proxy{nullptr};
     const StringDictionaryProxy* sd_outer_proxy{nullptr};
     const auto outer_col = dynamic_cast<const Analyzer::ColumnVar*>(cols.second);
+    const bool for_semi_join = for_semi_anti_join(join_type);
     if (ti.is_string() &&
         (outer_col && !(inner_col->get_comp_param() == outer_col->get_comp_param()))) {
       CHECK_EQ(kENCODING_DICT, ti.get_compression());
@@ -235,11 +240,13 @@ class PerfectJoinHashTableBuilder {
                                           &err,
                                           &col_range,
                                           &is_bitwise_eq,
+                                          &for_semi_join,
                                           cpu_hash_table_buff,
                                           hash_entry_info] {
         int partial_err =
             fill_hash_join_buff_bucketized(cpu_hash_table_buff,
                                            hash_join_invalid_val,
+                                           for_semi_join,
                                            join_column,
                                            {static_cast<size_t>(ti.get_size()),
                                             col_range.getIntMin(),
@@ -282,7 +289,7 @@ class PerfectJoinHashTableBuilder {
 
     CHECK(!hash_table_);
     hash_table_ =
-        std::make_unique<PerfectHashTable>(catalog_,
+        std::make_unique<PerfectHashTable>(executor->getDataMgr(),
                                            HashType::OneToMany,
                                            ExecutorDeviceType::CPU,
                                            hash_entry_info.getNormalizedHashEntryCount(),
@@ -361,8 +368,10 @@ class PerfectJoinHashTableBuilder {
     return (total_entry_count + shard_count - 1) / shard_count;
   }
 
- private:
-  const Catalog_Namespace::Catalog* catalog_;
+  const bool for_semi_anti_join(const JoinType join_type) {
+    return join_type == JoinType::SEMI || join_type == JoinType::ANTI;
+  }
 
+ private:
   std::unique_ptr<PerfectHashTable> hash_table_;
 };

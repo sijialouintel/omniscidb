@@ -53,6 +53,7 @@
 #include "QueryEngine/LoopControlFlow/JoinLoop.h"
 #include "QueryEngine/NvidiaKernel.h"
 #include "QueryEngine/PlanState.h"
+#include "QueryEngine/QueryPlanDagCache.h"
 #include "QueryEngine/RelAlgExecutionUnit.h"
 #include "QueryEngine/RelAlgTranslator.h"
 #include "QueryEngine/StringDictionaryGenerations.h"
@@ -88,8 +89,9 @@ class QuerySessionStatus {
     UNDEFINED = 0,
     PENDING_QUEUE,
     PENDING_EXECUTOR,
-    RUNNING,
-    RUNNING_REDUCTION
+    RUNNING_QUERY_KERNEL,
+    RUNNING_REDUCTION,
+    RUNNING_IMPORTER
   };
 
   QuerySessionStatus(const QuerySessionId& query_session,
@@ -129,9 +131,6 @@ class QuerySessionStatus {
     query_status_ = status;
   }
   void setExecutorId(const size_t executor_id) { executor_id_ = executor_id; }
-  void setQueryStatusAsRunning() {
-    query_status_ = QuerySessionStatus::QueryStatus::RUNNING;
-  }
 
  private:
   const QuerySessionId query_session_;
@@ -148,9 +147,7 @@ class QuerySessionStatus {
 };
 using QuerySessionMap =
     std::map<const QuerySessionId, std::map<std::string, QuerySessionStatus>>;
-extern void read_udf_gpu_module(const std::string& udf_ir_filename);
-extern void read_udf_cpu_module(const std::string& udf_ir_filename);
-extern bool is_udf_module_present(bool cpu_only = false);
+
 extern void read_rt_udf_gpu_module(const std::string& udf_ir);
 extern void read_rt_udf_cpu_module(const std::string& udf_ir);
 extern bool is_rt_udf_module_present(bool cpu_only = false);
@@ -284,9 +281,30 @@ class CompilationRetryNoCompaction : public std::runtime_error {
       : std::runtime_error("Retry query compilation with no compaction.") {}
 };
 
+// Throwing QueryMustRunOnCpu allows us retry a query step on CPU if
+// g_allow_query_step_cpu_retry is true (on by default) by catching
+// the exception at the query step execution level in RelAlgExecutor,
+// or if g_allow_query_step_cpu_retry is false but g_allow_cpu_retry is true,
+// by retrying the entire query on CPU (if both flags are false, we return an
+// error). This flag is thrown for the following broad categories of conditions:
+// 1) we have not implemented an operator on GPU and so cannot codegen for GPU
+// 2) we catch an unexpected GPU compilation/linking error (perhaps due
+//    to an outdated driver/CUDA installation not allowing a modern operator)
+// 3) when we detect up front that we will not have enough GPU memory to execute
+//    a query.
+// There is a fourth scenerio where our pre-flight GPU memory check passed but for
+// whatever reason we still run out of memory. In those cases we go down the
+// handleOutOfMemoryRetry path, which will first try per-fragment execution on GPU,
+// and if that fails, CPU execution.
+// Note that for distributed execution failures on leaves, we do not retry queries
+// TODO(todd): See if CPU retry of individual steps can be turned on safely for
+// distributed
+
 class QueryMustRunOnCpu : public std::runtime_error {
  public:
   QueryMustRunOnCpu() : std::runtime_error("Query must run in cpu mode.") {}
+
+  QueryMustRunOnCpu(const std::string& err) : std::runtime_error(err) {}
 };
 
 class ParseIRError : public std::runtime_error {
@@ -366,6 +384,7 @@ class Executor {
   static const ExecutorId UNITARY_EXECUTOR_ID = 0;
 
   Executor(const ExecutorId id,
+           Data_Namespace::DataMgr* data_mgr,
            const size_t block_size_x,
            const size_t grid_size_x,
            const size_t max_gpu_slab_size,
@@ -388,6 +407,8 @@ class Executor {
   static void clearMemory(const Data_Namespace::MemoryLevel memory_level);
 
   static size_t getArenaBlockSize();
+
+  static void addUdfIrToModule(const std::string& udf_ir_filename, const bool is_cuda_ir);
 
   /**
    * Returns pointer to the intermediate tables vector currently stored by this executor.
@@ -424,6 +445,11 @@ class Executor {
   const Catalog_Namespace::Catalog* getCatalog() const;
   void setCatalog(const Catalog_Namespace::Catalog* catalog);
 
+  Data_Namespace::DataMgr* getDataMgr() const {
+    CHECK(data_mgr_);
+    return data_mgr_;
+  }
+
   const std::shared_ptr<RowSetMemoryOwner> getRowSetMemoryOwner() const;
 
   const TemporaryTables* getTemporaryTables() const;
@@ -436,6 +462,7 @@ class Executor {
 
   size_t getNumBytesForFetchedRow(const std::set<int>& table_ids_to_fetch) const;
 
+  bool hasLazyFetchColumns(const std::vector<Analyzer::Expr*>& target_exprs) const;
   std::vector<ColumnLazyFetchInfo> getColLazyFetchInfo(
       const std::vector<Analyzer::Expr*>& target_exprs) const;
 
@@ -470,12 +497,17 @@ class Executor {
 
   TableUpdateMetadata executeUpdate(const RelAlgExecutionUnit& ra_exe_unit,
                                     const std::vector<InputTableInfo>& table_infos,
+                                    const TableDescriptor* updated_table_desc,
                                     const CompilationOptions& co,
                                     const ExecutionOptions& eo,
                                     const Catalog_Namespace::Catalog& cat,
                                     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
                                     const UpdateLogForFragment::Callback& cb,
                                     const bool is_agg);
+
+  void addTransientStringLiterals(
+      const RelAlgExecutionUnit& ra_exe_unit,
+      const std::shared_ptr<RowSetMemoryOwner>& row_set_mem_owner);
 
  private:
   void clearMetaInfoCache();
@@ -513,12 +545,16 @@ class Executor {
 
   llvm::Value* aggregateWindowStatePtr();
 
+  CudaMgr_Namespace::CudaMgr* cudaMgr() const {
+    CHECK(data_mgr_);
+    auto cuda_mgr = data_mgr_->getCudaMgr();
+    CHECK(cuda_mgr);
+    return cuda_mgr;
+  }
+
   bool isArchPascalOrLater(const ExecutorDeviceType dt) const {
     if (dt == ExecutorDeviceType::GPU) {
-      const auto cuda_mgr = catalog_->getDataMgr().getCudaMgr();
-      LOG_IF(FATAL, cuda_mgr == nullptr)
-          << "No CudaMgr instantiated, unable to check device architecture";
-      return cuda_mgr->isArchPascalOrLater();
+      return cudaMgr()->isArchPascalOrLater();
     }
     return false;
   }
@@ -604,7 +640,8 @@ class Executor {
    */
   template <typename THREAD_POOL>
   void launchKernels(SharedKernelContext& shared_context,
-                     std::vector<std::unique_ptr<ExecutionKernel>>&& kernels);
+                     std::vector<std::unique_ptr<ExecutionKernel>>&& kernels,
+                     const ExecutorDeviceType device_type);
 
   std::vector<size_t> getTableFragmentIndices(
       const RelAlgExecutionUnit& ra_exe_unit,
@@ -674,10 +711,11 @@ class Executor {
                                        const size_t scan_idx,
                                        const RelAlgExecutionUnit& ra_exe_unit);
 
+  // pass nullptr to results if it shouldn't be extracted from the execution context
   int32_t executePlanWithGroupBy(const RelAlgExecutionUnit& ra_exe_unit,
                                  const CompilationResult&,
                                  const bool hoist_literals,
-                                 ResultSetPtr& results,
+                                 ResultSetPtr* results,
                                  const ExecutorDeviceType device_type,
                                  std::vector<std::vector<const int8_t*>>& col_buffers,
                                  const std::vector<size_t> outer_tab_frag_ids,
@@ -691,12 +729,14 @@ class Executor {
                                  const uint32_t start_rowid,
                                  const uint32_t num_tables,
                                  const bool allow_runtime_interrupt,
-                                 RenderInfo* render_info);
+                                 RenderInfo* render_info,
+                                 const int64_t rows_to_process = -1);
+  // pass nullptr to results if it shouldn't be extracted from the execution context
   int32_t executePlanWithoutGroupBy(
       const RelAlgExecutionUnit& ra_exe_unit,
       const CompilationResult&,
       const bool hoist_literals,
-      ResultSetPtr& results,
+      ResultSetPtr* results,
       const std::vector<Analyzer::Expr*>& target_exprs,
       const ExecutorDeviceType device_type,
       std::vector<std::vector<const int8_t*>>& col_buffers,
@@ -708,7 +748,8 @@ class Executor {
       const uint32_t start_rowid,
       const uint32_t num_tables,
       const bool allow_runtime_interrupt,
-      RenderInfo* render_info);
+      RenderInfo* render_info,
+      const int64_t rows_to_process = -1);
 
  public:  // Temporary, ask saman about this
   static std::pair<int64_t, int32_t> reduceResults(const SQLAgg agg,
@@ -845,6 +886,7 @@ class Executor {
       const std::shared_ptr<Analyzer::BinOper>& qual_bin_oper,
       const std::vector<InputTableInfo>& query_infos,
       const MemoryLevel memory_level,
+      const JoinType join_type,
       const HashType preferred_hash_type,
       ColumnCacheMap& column_cache,
       const RegisteredQueryHint& query_hint);
@@ -924,11 +966,9 @@ class Executor {
   }
 
   QuerySessionId& getCurrentQuerySession(mapd_shared_lock<mapd_shared_mutex>& read_lock);
-  size_t getRunningExecutorId(mapd_shared_lock<mapd_shared_mutex>& read_lock);
-  void setCurrentQuerySession(const QuerySessionId& query_session,
-                              mapd_unique_lock<mapd_shared_mutex>& write_lock);
-  void setRunningExecutorId(const size_t id,
-                            mapd_unique_lock<mapd_shared_mutex>& write_lock);
+  QuerySessionStatus::QueryStatus getQuerySessionStatus(
+      const QuerySessionId& candidate_query_session,
+      mapd_shared_lock<mapd_shared_mutex>& read_lock);
   bool checkCurrentQuerySession(const std::string& candidate_query_session,
                                 mapd_shared_lock<mapd_shared_mutex>& read_lock);
   void invalidateRunningQuerySession(mapd_unique_lock<mapd_shared_mutex>& write_lock);
@@ -943,11 +983,8 @@ class Executor {
                                   mapd_unique_lock<mapd_shared_mutex>& write_lock);
   void setQuerySessionAsInterrupted(const QuerySessionId& query_session,
                                     mapd_unique_lock<mapd_shared_mutex>& write_lock);
-  void resetQuerySessionInterruptFlag(const std::string& query_session,
-                                      mapd_unique_lock<mapd_shared_mutex>& write_lock);
   bool checkIsQuerySessionInterrupted(const std::string& query_session,
                                       mapd_shared_lock<mapd_shared_mutex>& read_lock);
-  bool checkIsRunningQuerySessionInterrupted();
   bool checkIsQuerySessionEnrolled(const QuerySessionId& query_session,
                                    mapd_shared_lock<mapd_shared_mutex>& read_lock);
   bool updateQuerySessionStatusWithLock(
@@ -971,11 +1008,7 @@ class Executor {
       const std::string& query_submitted_time);
   void checkPendingQueryStatus(const QuerySessionId& query_session);
   void clearQuerySessionStatus(const QuerySessionId& query_session,
-                               const std::string& submitted_time_str,
-                               const bool acquire_spin_lock);
-  void updateQuerySessionStatus(
-      std::shared_ptr<const query_state::QueryState>& query_state,
-      const QuerySessionStatus::QueryStatus new_query_status);
+                               const std::string& submitted_time_str);
   void updateQuerySessionStatus(const QuerySessionId& query_session,
                                 const std::string& submitted_time_str,
                                 const QuerySessionStatus::QueryStatus new_query_status);
@@ -989,6 +1022,12 @@ class Executor {
   using CachedCardinality = std::pair<bool, size_t>;
   void addToCardinalityCache(const std::string& cache_key, const size_t cache_value);
   CachedCardinality getCachedCardinality(const std::string& cache_key);
+
+  mapd_shared_mutex& getDataRecyclerLock();
+  QueryPlanDagCache& getQueryPlanDagCache();
+  JoinColumnsInfo getJoinColumnsInfo(const Analyzer::Expr* join_expr,
+                                     JoinColumnSide target_side,
+                                     bool extract_only_col_id);
 
  private:
   std::shared_ptr<CompilationContext> getCodeFromCache(const CodeCacheKey&,
@@ -1051,6 +1090,7 @@ class Executor {
 
   const ExecutorId executor_id_;
   const Catalog_Namespace::Catalog* catalog_;
+  Data_Namespace::DataMgr* data_mgr_;
   const TemporaryTables* temporary_tables_;
 
   int64_t kernel_queue_time_ms_ = 0;
@@ -1069,7 +1109,7 @@ class Executor {
   // a query session that currently is running
   static QuerySessionId current_query_session_;
   // an executor's id that executes the running query
-  static size_t running_query_executor_id_;
+  static std::optional<size_t> running_query_executor_id_;
   // a pair of <QuerySessionId, interrupted_flag>
   static InterruptFlagMap queries_interrupt_flag_;
   // a pair of <QuerySessionId, query_session_status>
@@ -1099,8 +1139,8 @@ class Executor {
 
   static mapd_shared_mutex executors_cache_mutex_;
 
-  // for now we use recycler_mutex only for cardinality_cache_
-  // and will expand its coverage for more interesting caches for query execution
+  static QueryPlanDagCache query_plan_dag_cache_;
+  const QueryPlanHash INVALID_QUERY_PLAN_HASH{std::hash<std::string>{}(EMPTY_QUERY_PLAN)};
   static mapd_shared_mutex recycler_mutex_;
   static std::unordered_map<std::string, size_t> cardinality_cache_;
 
@@ -1129,6 +1169,7 @@ class Executor {
   friend class ColumnFetcher;
   friend struct DiamondCodegen;  // cgen_state_
   friend class ExecutionKernel;
+  friend class KernelSubtask;
   friend class HashJoin;  // cgen_state_
   friend class OverlapsJoinHashTable;
   friend class GroupByAndAggregate;

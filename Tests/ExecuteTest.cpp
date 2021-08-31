@@ -19,8 +19,10 @@
 #include "../ImportExport/Importer.h"
 #include "../Parser/parser.h"
 #include "../QueryEngine/ArrowResultSet.h"
+#include "../QueryEngine/CgenState.h"
 #include "../QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
 #include "../QueryEngine/Execute.h"
+#include "../QueryEngine/ExpressionRange.h"
 #include "../QueryEngine/ResultSetReductionJIT.h"
 #include "../QueryRunner/QueryRunner.h"
 #include "../Shared/DateConverters.h"
@@ -50,6 +52,7 @@ bool g_aggregator{false};
 extern int g_test_against_columnId_gap;
 extern bool g_enable_smem_group_by;
 extern bool g_allow_cpu_retry;
+extern bool g_allow_query_step_cpu_retry;
 extern bool g_enable_watchdog;
 extern bool g_skip_intermediate_count;
 extern bool g_use_tbb_pool;
@@ -89,61 +92,6 @@ size_t choose_shard_count() {
   return g_num_leafs * (device_count > 1 ? device_count : 1);
 }
 
-struct ShardInfo {
-  const std::string shard_col;
-  const size_t shard_count;
-};
-
-struct SharedDictionaryInfo {
-  const std::string col;
-  const std::string ref_table;
-  const std::string ref_col;
-};
-
-std::string build_create_table_statement(
-    const std::string& columns_definition,
-    const std::string& table_name,
-    const ShardInfo& shard_info,
-    const std::vector<SharedDictionaryInfo>& shared_dict_info,
-    const size_t fragment_size,
-    const bool use_temporary_tables,
-    const bool delete_support = true,
-    const bool replicated = false) {
-  const std::string shard_key_def{
-      shard_info.shard_col.empty() ? "" : ", SHARD KEY (" + shard_info.shard_col + ")"};
-
-  std::vector<std::string> shared_dict_def;
-  if (shared_dict_info.size() > 0) {
-    for (size_t idx = 0; idx < shared_dict_info.size(); ++idx) {
-      shared_dict_def.push_back(", SHARED DICTIONARY (" + shared_dict_info[idx].col +
-                                ") REFERENCES " + shared_dict_info[idx].ref_table + "(" +
-                                shared_dict_info[idx].ref_col + ")");
-    }
-  }
-
-  std::ostringstream with_statement_assembly;
-  if (!shard_info.shard_col.empty()) {
-    with_statement_assembly << "shard_count=" << shard_info.shard_count << ", ";
-  }
-  with_statement_assembly << "fragment_size=" << fragment_size;
-
-  if (delete_support) {
-    with_statement_assembly << ", vacuum='delayed'";
-  } else {
-    with_statement_assembly << ", vacuum='immediate'";
-  }
-
-  const std::string replicated_def{
-      (!replicated || !shard_info.shard_col.empty()) ? "" : ", PARTITIONS='REPLICATED' "};
-
-  const std::string create_def{use_temporary_tables ? "CREATE TEMPORARY TABLE "
-                                                    : "CREATE TABLE "};
-
-  return create_def + table_name + "(" + columns_definition + shard_key_def +
-         boost::algorithm::join(shared_dict_def, "") + ") WITH (" +
-         with_statement_assembly.str() + replicated_def + ");";
-}
-
 std::shared_ptr<ResultSet> run_multiple_agg(const string& query_str,
                                             const ExecutorDeviceType device_type,
                                             const bool allow_loop_joins) {
@@ -172,6 +120,10 @@ inline void run_ddl_statement(const std::string& create_table_stmt) {
   QR::get()->runDDLStatement(create_table_stmt);
 }
 
+inline void validate_ddl_statement(const std::string& create_table_stmt) {
+  QR::get()->validateDDLStatement(create_table_stmt);
+}
+
 bool skip_tests(const ExecutorDeviceType device_type) {
 #ifdef HAVE_CUDA
   return device_type == ExecutorDeviceType::GPU && !(QR::get()->gpusPresent());
@@ -180,11 +132,7 @@ bool skip_tests(const ExecutorDeviceType device_type) {
 #endif
 }
 
-bool approx_eq(const double v, const double target, const double eps = 0.01) {
-  const auto v_u64 = *reinterpret_cast<const uint64_t*>(may_alias_ptr(&v));
-  const auto target_u64 = *reinterpret_cast<const uint64_t*>(may_alias_ptr(&target));
-  return v_u64 == target_u64 || (target - eps < v && v < target + eps);
-}
+constexpr double EPS = 1.25e-5;
 
 // Moved from TimeGM::parse_fractional_seconds().
 int parse_fractional_seconds(unsigned sfrac, const int ntotal, const SQLTypeInfo& ti) {
@@ -320,7 +268,7 @@ class SQLiteComparator {
                   << errmsg;
             } else {
               const auto ref_val = connector_.getData<double>(row_idx, col_idx);
-              ASSERT_TRUE(approx_eq(ref_val, omnisci_val)) << errmsg;
+              ASSERT_NEAR(ref_val, omnisci_val, EPS * std::fabs(ref_val)) << errmsg;
             }
             break;
           }
@@ -333,7 +281,7 @@ class SQLiteComparator {
                   << errmsg;
             } else {
               const auto ref_val = connector_.getData<float>(row_idx, col_idx);
-              ASSERT_TRUE(approx_eq(ref_val, omnisci_val)) << errmsg;
+              ASSERT_NEAR(ref_val, omnisci_val, EPS * std::fabs(ref_val)) << errmsg;
             }
             break;
           }
@@ -546,7 +494,7 @@ void validate_storage_options(
         "CREATE TABLE chelsea_storage(id TEXT ENCODING DICT(32), val INT " + add_column;
     query +=
         type_meta.first.empty() ? ");" : ") WITH (" + type_meta.first + "=" + val + ");";
-    ASSERT_EQ(true, validate_statement_syntax(query));
+    ASSERT_NO_THROW(validate_ddl_statement(query));
     if (type_meta.second) {
       ASSERT_THROW(run_ddl_statement(query), std::runtime_error);
     } else {
@@ -1755,6 +1703,118 @@ TEST(Select, FilterAndMultipleAggregation) {
 }
 
 TEST(Select, GroupBy) {
+  {  // generate dataset to test count distinct rewrite
+    run_ddl_statement("DROP TABLE IF EXISTS count_distinct_rewrite;");
+    run_ddl_statement("CREATE TABLE count_distinct_rewrite (v1 int);");
+    const auto data_path = boost::filesystem::path(
+        "../../Tests/Import/datafiles/count_distinct_rewrite.csv");
+    if (boost::filesystem::exists(data_path)) {
+      boost::filesystem::remove(data_path);
+    }
+    std::ofstream out1(data_path.string());
+    for (int i = 0; i < 1000000; i++) {
+      if (out1.is_open()) {
+        out1 << i << "\n";
+      }
+    }
+    out1.close();
+    auto copy_data_str = "COPY count_distinct_rewrite FROM \'" + data_path.string() +
+                         "\' WITH (HEADER=\'f\');";
+    run_ddl_statement(copy_data_str);
+    boost::filesystem::remove(data_path);
+  }
+
+  std::vector<std::string> runnable_column_names = {
+      "x", "w", "y", "z", "fx", "f", "d", "dd", "dd_notnull", "u", "smallint_nulls"};
+  std::set<std::string> str_col_names = {
+      "str", "fixed_str", "shared_dict", "null_str", "fixed_null_str"};
+  // some column type can execute a subset of agg ops without an exception
+  using TypeAndAvaliableAggOps = std::pair<std::string, std::vector<SQLAgg>>;
+  std::vector<TypeAndAvaliableAggOps> column_names_with_available_agg_ops = {
+      {"str", std::vector<SQLAgg>{SQLAgg::kSAMPLE}},
+      {"fixed_str", std::vector<SQLAgg>{SQLAgg::kSAMPLE}},
+      {"shared_dict", std::vector<SQLAgg>{SQLAgg::kSAMPLE}},
+      {"null_str", std::vector<SQLAgg>{SQLAgg::kSAMPLE}},
+      {"fixed_null_str", std::vector<SQLAgg>{SQLAgg::kSAMPLE}},
+      {"b", std::vector<SQLAgg>{SQLAgg::kMIN, SQLAgg::kMAX, SQLAgg::kSAMPLE}},
+      {"m", std::vector<SQLAgg>{SQLAgg::kMIN, SQLAgg::kMAX, SQLAgg::kSAMPLE}},
+      {"m_3", std::vector<SQLAgg>{SQLAgg::kMIN, SQLAgg::kMAX, SQLAgg::kSAMPLE}},
+      {"m_6", std::vector<SQLAgg>{SQLAgg::kMIN, SQLAgg::kMAX, SQLAgg::kSAMPLE}},
+      {"m_9", std::vector<SQLAgg>{SQLAgg::kMIN, SQLAgg::kMAX, SQLAgg::kSAMPLE}},
+      {"n", std::vector<SQLAgg>{SQLAgg::kMIN, SQLAgg::kMAX, SQLAgg::kSAMPLE}},
+      {"o", std::vector<SQLAgg>{SQLAgg::kMIN, SQLAgg::kMAX, SQLAgg::kSAMPLE}},
+      {"o1", std::vector<SQLAgg>{SQLAgg::kMIN, SQLAgg::kMAX, SQLAgg::kSAMPLE}}};
+  auto get_query_str = [](SQLAgg agg_op, const std::string& col_name) {
+    std::ostringstream oss;
+    oss << "SELECT " << col_name << " v1, ";
+    switch (agg_op) {
+      case SQLAgg::kMIN:
+        oss << "MIN(" << col_name << ")";
+        break;
+      case SQLAgg::kMAX:
+        oss << "MAX(" << col_name << ")";
+        break;
+      case SQLAgg::kAVG:
+        oss << "AVG(" << col_name << ")";
+        break;
+      case SQLAgg::kSAMPLE:
+        oss << "SAMPLE(" << col_name << ")";
+        break;
+      case SQLAgg::kAPPROX_QUANTILE:
+        oss << "APPROX_QUANTILE(" << col_name << ", 0.5) ";
+        break;
+      default:
+        CHECK(false);
+        break;
+    }
+    oss << " v2 FROM test GROUP BY " << col_name;
+    return oss.str();
+  };
+  auto perform_test = [&get_query_str, &str_col_names](SQLAgg agg_op,
+                                                       const std::string& col_name,
+                                                       ExecutorDeviceType dt) {
+    std::string omnisci_cnt_query, sqlite_cnt_query, omnisci_min_query, sqlite_min_query;
+    if (agg_op == SQLAgg::kAPPROX_QUANTILE || agg_op == SQLAgg::kSAMPLE) {
+      if (agg_op == SQLAgg::kAPPROX_QUANTILE && g_aggregator) {
+        LOG(WARNING) << "Skipping ApproxQuantile tests in distributed mode.";
+        return;
+      } else {
+        omnisci_cnt_query =
+            "SELECT COUNT(*) FROM (" + get_query_str(agg_op, col_name) + ")";
+        omnisci_min_query =
+            "SELECT MIN(v2) FROM (" + get_query_str(agg_op, col_name) + ")";
+        // since sqlite does not support sample and approx_quantile
+        // we instead use max agg op; min and avg are also possible
+        sqlite_cnt_query =
+            "SELECT COUNT(*) FROM (" + get_query_str(SQLAgg::kMAX, col_name) + ")";
+        sqlite_min_query =
+            "SELECT MIN(v2) FROM (" + get_query_str(SQLAgg::kMAX, col_name) + ")";
+        if (col_name.compare("d") != 0 && col_name.compare("f") != 0 &&
+            col_name.compare("fx") != 0) {
+          omnisci_cnt_query += " WHERE v1 = v2";
+          sqlite_cnt_query += " WHERE v1 = v2";
+        }
+      }
+    } else {
+      omnisci_cnt_query =
+          "SELECT COUNT(*) FROM (" + get_query_str(agg_op, col_name) + ")";
+      omnisci_min_query = "SELECT MIN(v2) FROM (" + get_query_str(agg_op, col_name) + ")";
+      if (col_name.compare("d") != 0 && col_name.compare("f") != 0 &&
+          col_name.compare("fx") != 0) {
+        omnisci_cnt_query += " WHERE v1 = v2";
+      }
+      sqlite_cnt_query = omnisci_cnt_query;
+      sqlite_min_query = omnisci_min_query;
+    }
+    c(omnisci_cnt_query, sqlite_cnt_query, dt);
+    if (!str_col_names.count(col_name)) {
+      c(omnisci_min_query, sqlite_min_query, dt);
+    } else {
+      LOG(WARNING) << "Skipping aggregation query on string column: "
+                   << omnisci_min_query;
+    }
+  };
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
@@ -1782,6 +1842,68 @@ TEST(Select, GroupBy) {
     c("SELECT f, ff, APPROX_COUNT_DISTINCT(str) from test group by f, ff ORDER BY f, ff;",
       "SELECT f, ff, COUNT(distinct str) FROM test GROUP BY f, ff ORDER BY f, ff;",
       dt);
+
+    // check rewriting agg on gby col to its equivalent case-when
+    // 1. check count-distinct op runs successfully
+    ASSERT_NO_THROW(run_multiple_agg(
+        "SELECT v1, COUNT(DISTINCT v1) FROM count_distinct_rewrite GROUP BY v1 limit "
+        "1;",
+        dt));
+    ASSERT_NO_THROW(run_multiple_agg(
+        "SELECT v1, COUNT(DISTINCT v1), CASE WHEN v1 IS NOT NULL THEN 1 ELSE 0 END "
+        "FROM count_distinct_rewrite GROUP BY v1 limit 1;",
+        dt));
+    ASSERT_NO_THROW(
+        run_multiple_agg("SELECT v1, COUNT(DISTINCT v1), APPROX_COUNT_DISTINCT(DISTINCT "
+                         "v1) FROM count_distinct_rewrite GROUP BY v1 limit "
+                         "1;",
+                         dt));
+    ASSERT_NO_THROW(run_multiple_agg(
+        "SELECT v1, APPROX_COUNT_DISTINCT(v1) FROM count_distinct_rewrite GROUP BY v1 "
+        "limit 1;",
+        dt));
+    ASSERT_NO_THROW(run_multiple_agg(
+        "SELECT v1, APPROX_COUNT_DISTINCT(v1), CASE WHEN v1 IS NOT NULL THEN 1 ELSE 0 "
+        "END, COUNT(DISTINCT v1) FROM count_distinct_rewrite GROUP BY v1 limit 1;",
+        dt));
+
+    // 2. remaining agg ops: avg / min / max / sample / approx_quantile
+    // there are two exceptions when perform gby-agg: 1) gby fails and 2) agg fails
+    // otherwise this rewriting should return the same result as the original query
+    std::vector<SQLAgg> test_agg_ops = {SQLAgg::kMIN,
+                                        SQLAgg::kMAX,
+                                        SQLAgg::kSAMPLE,
+                                        SQLAgg::kAVG,
+                                        SQLAgg::kAPPROX_QUANTILE};
+    for (auto& col_name : runnable_column_names) {
+      for (auto& agg_op : test_agg_ops) {
+        perform_test(agg_op, col_name, dt);
+      }
+    }
+    for (TypeAndAvaliableAggOps& info : column_names_with_available_agg_ops) {
+      const auto& col_name = info.first;
+      const auto& agg_ops = info.second;
+      for (auto& agg_op : agg_ops) {
+        perform_test(agg_op, col_name, dt);
+      }
+    }
+  }
+  run_ddl_statement("DROP TABLE IF EXISTS count_distinct_rewrite;");
+}
+
+TEST(Select, ExecutePlanWithoutGroupBy) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    // SQLite doesn't support NOW(), and timestamps may not be exactly equal,
+    // so just test for no throw.
+    EXPECT_NO_THROW(
+        run_multiple_agg("SELECT COUNT(*), NOW(), CURRENT_TIME, CURRENT_DATE, "
+                         "CURRENT_TIMESTAMP FROM test;",
+                         dt));
+    EXPECT_NO_THROW(
+        run_multiple_agg("SELECT x, COUNT(*), NOW(), CURRENT_TIME, CURRENT_DATE, "
+                         "CURRENT_TIMESTAMP FROM test GROUP BY x;",
+                         dt));
   }
 }
 
@@ -2202,10 +2324,30 @@ TEST(Select, CountWithLimitAndOffset) {
                                         dt)));
   }
 
-  // now increase the data
-  for (int i = 0; i < 16; i++) {
-    run_ddl_statement("INSERT INTO count_test SELECT * from count_test;");
+  // now increase the data, by using temporary file
+  {
+    const auto data_path = boost::filesystem::path(
+        "../../Tests/Import/datafiles/ctas_itas_CountWithLimitAndOffset.csv");
+    if (boost::filesystem::exists(data_path)) {
+      boost::filesystem::remove(data_path);
+    }
+    std::ofstream out1(data_path.string());
+    // num_sets (-1) because data started out with 1 set of (10) items
+    int64_t num_sets = static_cast<int64_t>(pow(2, 16)) - 1;
+    for (int i = 0; i < num_sets; i++) {
+      for (int j = 0; j < 10; j++) {
+        if (out1.is_open()) {
+          out1 << j << "\n";
+        }
+      }
+    }
+    out1.close();
+    auto copy_data_str =
+        "COPY count_test FROM \'" + data_path.string() + "\' WITH (HEADER=\'f\');";
+    run_ddl_statement(copy_data_str);
+    boost::filesystem::remove(data_path);
   }
+
   int64_t size = static_cast<int64_t>(pow(2, 16) * 10);
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -2307,9 +2449,9 @@ TEST(Select, CountDistinct) {
     c("SELECT COUNT(distinct x) FROM test;", dt);
     c("SELECT COUNT(distinct b) FROM test;", dt);
     THROW_ON_AGGREGATOR(c("SELECT COUNT(distinct f) FROM test;",
-                          dt));  // Exception: Cannot use a fast path for COUNT distinct
+                          dt));  // Cannot use a fast path for COUNT distinct
     THROW_ON_AGGREGATOR(c("SELECT COUNT(distinct d) FROM test;",
-                          dt));  // Exception: Cannot use a fast path for COUNT distinct
+                          dt));  // Cannot use a fast path for COUNT distinct
     c("SELECT COUNT(distinct str) FROM test;", dt);
     c("SELECT COUNT(distinct ss) FROM test;", dt);
     c("SELECT COUNT(distinct x + 1) FROM test;", dt);
@@ -2326,10 +2468,10 @@ TEST(Select, CountDistinct) {
     c("SELECT AVG(z), COUNT(distinct x) AS dx FROM test GROUP BY y HAVING dx > 1;", dt);
     THROW_ON_AGGREGATOR(
         c("SELECT z, str, COUNT(distinct f) FROM test GROUP BY z, str ORDER BY str DESC;",
-          dt));  // Exception: Cannot use a fast path for COUNT distinct
+          dt));  // Cannot use a fast path for COUNT distinct
     c("SELECT COUNT(distinct x * (50000 - 1)) FROM test;", dt);
     EXPECT_THROW(run_multiple_agg("SELECT COUNT(distinct real_str) FROM test;", dt),
-                 std::runtime_error);  // Exception: Strings must be dictionary-encoded
+                 std::runtime_error);  // Strings must be dictionary-encoded
                                        // for COUNT(DISTINCT).
   }
 }
@@ -2459,10 +2601,10 @@ TEST(Select, ApproxMedianSanity) {
       approx_median("w");
       EXPECT_TRUE(false) << "Exception expected for approx_median query.";
     } catch (std::runtime_error const& e) {
-      EXPECT_EQ(std::string(e.what()),
-                "TException - service has thrown: TOmniSciException(error_msg=Exception: "
-                "APPROX_MEDIAN is not supported in distributed mode at this time."
-                ")");
+      EXPECT_EQ(
+          std::string(e.what()),
+          "TException - service has thrown: TOmniSciException(error_msg="
+          "APPROX_QUANTILE/MEDIAN is not supported in distributed mode at this time.)");
     } catch (...) {
       EXPECT_TRUE(false) << "std::runtime_error expected for approx_median query.";
     }
@@ -2582,7 +2724,47 @@ TEST(Select, ApproxMedianSort) {
   }
 }
 
-TEST(Select, ApproxMedianSubqueries) {
+// APPROX_QUANTILE is exact when the number of rows is low.
+TEST(Select, ApproxQuantileExactValues) {
+  if (g_aggregator) {
+    LOG(WARNING) << "Skipping ApproxQuantileExactValues tests in distributed mode.";
+  } else {
+    auto const dt = ExecutorDeviceType::CPU;
+    // clang-format off
+    double tests[][2]{{0.0, 2.2}, {0.25, 2.2}, {0.45, 2.2}, {0.5, 2.3}, {0.55, 2.4},
+                      {0.7, 2.4}, {0.75, 2.5}, {0.8, 2.6}, {1.0, 2.6}};
+    // clang-format on
+    for (auto test : tests) {
+      std::stringstream query;
+      query << "SELECT APPROX_QUANTILE(d," << test[0] << ") FROM test;";
+      EXPECT_EQ(test[1], v<double>(run_simple_agg(query.str(), dt)));
+    }
+  }
+}
+
+TEST(Select, ApproxQuantileMinMax) {
+  if (g_aggregator) {
+    LOG(WARNING) << "Skipping ApproxQuantileMinMax tests in distributed mode.";
+  } else {
+    auto const dt = ExecutorDeviceType::CPU;
+    // clang-format off
+    char const* cols[]{"w", "x", "y", "z", "t", "f", "ff", "fn", "d", "dn", "dd",
+                       "dd_notnull", "u", "ofd", "ufd", "ofq", "ufq", "smallint_nulls"};
+    // clang-format on
+    for (std::string col : cols) {
+      c("SELECT APPROX_QUANTILE(" + col + ",0) FROM test;",
+        // MIN(ofq) = -1 but MIN(CAST(ofq AS DOUBLE)) = -2^63 due to null sentinel logic
+        //"SELECT CAST(MIN(" + col + ") AS DOUBLE) FROM test;",
+        "SELECT MIN(CAST(" + col + " AS DOUBLE)) FROM test;",
+        dt);
+      c("SELECT APPROX_QUANTILE(" + col + ",1) FROM test;",
+        "SELECT CAST(MAX(" + col + ") AS DOUBLE) FROM test;",
+        dt);
+    }
+  }
+}
+
+TEST(Select, ApproxQuantileSubqueries) {
   if (g_aggregator) {
     LOG(WARNING) << "Skipping ApproxMedianSubqueries tests in distributed mode.";
   } else {
@@ -2591,23 +2773,38 @@ TEST(Select, ApproxMedianSubqueries) {
         "SELECT MIN(am) FROM (SELECT x, APPROX_MEDIAN(w) AS am FROM test GROUP BY x);";
     EXPECT_EQ(-8.0, v<double>(run_simple_agg(query, dt)));
     query =
+        "SELECT MIN(am) FROM (SELECT x, APPROX_QUANTILE(w,0.5) AS am FROM test GROUP BY "
+        "x);";
+    EXPECT_EQ(-8.0, v<double>(run_simple_agg(query, dt)));
+    query =
         "SELECT MAX(am) FROM (SELECT x, APPROX_MEDIAN(w) AS am FROM test GROUP BY x);";
+    EXPECT_EQ(-7.0, v<double>(run_simple_agg(query, dt)));
+    query =
+        "SELECT MAX(am) FROM (SELECT x, APPROX_QUANTILE(w,0.5) AS am FROM test GROUP BY "
+        "x);";
     EXPECT_EQ(-7.0, v<double>(run_simple_agg(query, dt)));
   }
 }
 
 // Immerse invokes sql_validate which requires testing.
-TEST(Select, ApproxMedianValidate) {
+TEST(Select, ApproxQuantileValidate) {
   if (g_aggregator) {
     LOG(WARNING) << "Skipping ApproxMedianValidate tests in distributed mode.";
   } else {
     auto const dt = ExecutorDeviceType::CPU;
     auto eo = QR::defaultExecutionOptionsForRunSQL();
     eo.just_validate = true;
-    char const* const query = "SELECT APPROX_MEDIAN(x) FROM test;";
+    // APPROX_MEDIAN
+    char const* query = "SELECT APPROX_MEDIAN(x) FROM test;";
     std::shared_ptr<ResultSet> rows =
         QR::get()->runSQL(query, CompilationOptions::defaults(dt), std::move(eo));
     auto crt_row = rows->getNextRow(true, true);
+    CHECK_EQ(1u, crt_row.size()) << query;
+    EXPECT_EQ(NULL_DOUBLE, v<double>(crt_row[0]));
+    // APPROX_QUANTILE
+    query = "SELECT APPROX_QUANTILE(x,0.1) FROM test;";
+    rows = QR::get()->runSQL(query, CompilationOptions::defaults(dt), std::move(eo));
+    crt_row = rows->getNextRow(true, true);
     CHECK_EQ(1u, crt_row.size()) << query;
     EXPECT_EQ(NULL_DOUBLE, v<double>(crt_row[0]));
   }
@@ -2977,6 +3174,12 @@ TEST(Select, Case) {
       dt);
     c(R"(SELECT COUNT(*) FROM test WHERE (CASE WHEN x = 7 THEN str ELSE 'b' END) = shared_dict;)",
       dt);
+    c(R"(SELECT COUNT(*) FROM test WHERE (CASE WHEN str = 'foo' THEN 'a' WHEN str = 'bar' THEN 'b' ELSE str END) = 'b';)",
+      dt);
+    c(R"(SELECT str, count(*) FROM test WHERE (CASE WHEN str = 'foo' THEN 'a' WHEN str = 'bar' THEN 'b' ELSE str END) = 'b' GROUP BY str;)",
+      dt);
+    c(R"(SELECT COUNT(*) FROM test WHERE (CASE WHEN fixed_str = 'foo' THEN 'a' WHEN fixed_str is NULL THEN 'b' ELSE str END) = 'z';)",
+      dt);
     {
       const auto watchdog_state = g_enable_watchdog;
       g_enable_watchdog = true;
@@ -2985,8 +3188,19 @@ TEST(Select, Case) {
       };
       EXPECT_ANY_THROW(run_multiple_agg(
           R"(SELECT CASE WHEN x = 7 THEN 'a' WHEN x = 8 then str ELSE fixed_str END FROM test;)",
-          dt));  // Exception: Cast from dictionary-encoded string to none-encoded would
+          dt));  // Cast from dictionary-encoded string to none-encoded would
                  // be slow
+      g_enable_watchdog = false;
+      // casts not yet supported in distributed mode
+      SKIP_ON_AGGREGATOR(c(
+          R"(SELECT CASE WHEN x = 7 THEN 'a' WHEN x = 8 then str ELSE fixed_str END FROM test ORDER BY 1;)",
+          dt));
+      SKIP_ON_AGGREGATOR(c(
+          R"(SELECT CASE WHEN str = 'foo' THEN real_str WHEN str = 'bar' THEN 'b' ELSE null_str END FROM test ORDER BY 1)",
+          dt));
+      EXPECT_ANY_THROW(run_multiple_agg(
+          R"(SELECT CASE WHEN str = 'foo' THEN real_str WHEN str = 'bar' THEN 'b' ELSE null_str END case_col, sum(x) FROM test GROUP BY case_col;)",
+          dt));  // cannot group by none encoded string columns
     }
     c("SELECT y AS key0, SUM(CASE WHEN x > 7 THEN x / (x - 7) ELSE 99 END) FROM test "
       "GROUP BY key0 ORDER BY key0;",
@@ -5951,6 +6165,36 @@ TEST(Select, OverflowAndUnderFlow) {
   }
 }
 
+TEST(Select, DetectOverflowedLiteralBuf) {
+  // constructing literal buf to trigger overflow takes too much time
+  // so we mimic the literal buffer collection during codegen
+  std::vector<CgenState::LiteralValue> literals;
+  size_t literal_bytes{0};
+  auto getOrAddLiteral = [&literals, &literal_bytes](const std::string& val) {
+    const CgenState::LiteralValue var_val(val);
+    literals.emplace_back(val);
+    const auto lit_bytes = CgenState::literalBytes(var_val);
+    literal_bytes = CgenState::addAligned(literal_bytes, lit_bytes);
+    return literal_bytes - lit_bytes;
+  };
+
+  // add unique string literals until we detect the overflow
+  // note that we only consider unique literals so we don't need to
+  // lookup the existing literal buffer offset when adding the literal
+  auto perform_test = [getOrAddLiteral]() {
+    checked_int16_t checked_lit_off{-1};
+    int added_literals = 0;
+    try {
+      for (; added_literals < 100000; ++added_literals) {
+        checked_lit_off = getOrAddLiteral(std::to_string(added_literals));
+      }
+    } catch (const std::range_error& e) {
+      throw TooManyLiterals();
+    }
+  };
+  EXPECT_THROW(perform_test(), TooManyLiterals);
+}
+
 TEST(Select, BooleanColumn) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -6024,6 +6268,23 @@ TEST(Select, CastFromNull) {
     c("SELECT CAST(NULL AS DOUBLE) FROM test;", dt);
     c("SELECT CAST(NULL AS DECIMAL) FROM test;", dt);
     c("SELECT CAST(NULL AS NUMERIC) FROM test;", dt);
+  }
+}
+
+TEST(Select, CastFromNull2) {
+  auto* const drop = "DROP TABLE IF EXISTS cast_from_null2;";
+  auto* const create = "CREATE TABLE cast_from_null2 (d DOUBLE, dd DECIMAL(8,2));";
+  auto* const insert = "INSERT INTO cast_from_null2 VALUES (1.0, NULL);";
+  auto* const select = "SELECT d * dd FROM cast_from_null2;";
+  run_ddl_statement(drop);
+  g_sqlite_comparator.query(drop);
+  run_ddl_statement(create);
+  g_sqlite_comparator.query(create);
+  run_multiple_agg(insert, ExecutorDeviceType::CPU);
+  g_sqlite_comparator.query(insert);
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    c(select, dt);
   }
 }
 
@@ -6146,126 +6407,126 @@ TEST(Select, CastDecimalToDecimal) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
-    ASSERT_TRUE(
-        approx_eq(456.78956,
-                  v<double>(run_simple_agg(
-                      "SELECT val FROM decimal_to_decimal_test WHERE id = 1;", dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.78956,
-                  v<double>(run_simple_agg(
-                      "SELECT val FROM decimal_to_decimal_test WHERE id = -1;", dt))));
-    ASSERT_TRUE(
-        approx_eq(456.12345,
-                  v<double>(run_simple_agg(
-                      "SELECT val FROM decimal_to_decimal_test WHERE id = 2;", dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.12345,
-                  v<double>(run_simple_agg(
-                      "SELECT val FROM decimal_to_decimal_test WHERE id = -2;", dt))));
+    ASSERT_NEAR(456.78956,
+                v<double>(run_simple_agg(
+                    "SELECT val FROM decimal_to_decimal_test WHERE id = 1;", dt)),
+                456.78956 * EPS);
+    ASSERT_NEAR(-456.78956,
+                v<double>(run_simple_agg(
+                    "SELECT val FROM decimal_to_decimal_test WHERE id = -1;", dt)),
+                456.78956 * EPS);
+    ASSERT_NEAR(456.12345,
+                v<double>(run_simple_agg(
+                    "SELECT val FROM decimal_to_decimal_test WHERE id = 2;", dt)),
+                EPS);
+    ASSERT_NEAR(-456.12345,
+                v<double>(run_simple_agg(
+                    "SELECT val FROM decimal_to_decimal_test WHERE id = -2;", dt)),
+                456.12345 * EPS);
 
-    ASSERT_TRUE(
-        approx_eq(456.7896,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,4)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.7896,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,4)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(456.123,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,4)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 2;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.123,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,4)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -2;",
-                                           dt))));
+    ASSERT_NEAR(456.7896,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,4)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 1;",
+                                         dt)),
+                456.7896 * EPS);
+    ASSERT_NEAR(-456.7896,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,4)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -1;",
+                                         dt)),
+                456.7896 * EPS);
+    ASSERT_NEAR(456.123,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,4)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 2;",
+                                         dt)),
+                456.123 * EPS);
+    ASSERT_NEAR(-456.123,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,4)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -2;",
+                                         dt)),
+                456.123 * EPS);
 
-    ASSERT_TRUE(
-        approx_eq(456.790,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,3)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.790,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,3)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(456.1234,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,3)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 2;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.1234,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,3)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -2;",
-                                           dt))));
+    ASSERT_NEAR(456.790,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,3)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 1;",
+                                         dt)),
+                456.790 * EPS);
+    ASSERT_NEAR(-456.790,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,3)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -1;",
+                                         dt)),
+                456.790 * EPS);
+    ASSERT_NEAR(456.1234,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,3)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 2;",
+                                         dt)),
+                456.1234 * EPS);
+    ASSERT_NEAR(-456.1234,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,3)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -2;",
+                                         dt)),
+                456.1234 * EPS);
 
-    ASSERT_TRUE(
-        approx_eq(456.79,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,2)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.79,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,2)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(456.12,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,2)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 2;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.12,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,2)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -2;",
-                                           dt))));
+    ASSERT_NEAR(456.79,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,2)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 1;",
+                                         dt)),
+                456.79 * EPS);
+    ASSERT_NEAR(-456.79,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,2)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -1;",
+                                         dt)),
+                456.79 * EPS);
+    ASSERT_NEAR(456.12,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,2)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 2;",
+                                         dt)),
+                456.12 * EPS);
+    ASSERT_NEAR(-456.12,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,2)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -2;",
+                                         dt)),
+                456.12 * EPS);
 
-    ASSERT_TRUE(
-        approx_eq(456.8,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,1)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.8,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,1)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(456.1,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,1)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 2;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456.1,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,1)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -2;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(457,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,0)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-457,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,0)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -1;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(456,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,0)) FROM "
-                                           "decimal_to_decimal_test WHERE id = 2;",
-                                           dt))));
-    ASSERT_TRUE(
-        approx_eq(-456,
-                  v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,0)) FROM "
-                                           "decimal_to_decimal_test WHERE id = -2;",
-                                           dt))));
+    ASSERT_NEAR(456.8,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,1)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 1;",
+                                         dt)),
+                456.8 * EPS);
+    ASSERT_NEAR(-456.8,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,1)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -1;",
+                                         dt)),
+                456.8 * EPS);
+    ASSERT_NEAR(456.1,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,1)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 2;",
+                                         dt)),
+                456.1 * EPS);
+    ASSERT_NEAR(-456.1,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,1)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -2;",
+                                         dt)),
+                456.1 * EPS);
+    ASSERT_NEAR(457,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,0)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 1;",
+                                         dt)),
+                457 * EPS);
+    ASSERT_NEAR(-457,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,0)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -1;",
+                                         dt)),
+                457 * EPS);
+    ASSERT_NEAR(456,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,0)) FROM "
+                                         "decimal_to_decimal_test WHERE id = 2;",
+                                         dt)),
+                456 * EPS);
+    ASSERT_NEAR(-456,
+                v<double>(run_simple_agg("SELECT CAST(val AS DECIMAL(10,0)) FROM "
+                                         "decimal_to_decimal_test WHERE id = -2;",
+                                         dt)),
+                456 * EPS);
 
     ASSERT_EQ(457,
               v<int64_t>(run_simple_agg(
@@ -7528,6 +7789,21 @@ TEST(Select, ArrayUnnest) {
       ASSERT_EQ(1, v<int64_t>(fixed_result_rows->getRowAt(0, 1, true)));
       ASSERT_EQ(0, v<int64_t>(fixed_result_rows->getRowAt(1, 1, true)));
     }
+
+    // unnest groupby, force estimator run
+    const auto big_group_threshold = g_big_group_threshold;
+    ScopeGuard reset_big_group_threshold = [&big_group_threshold] {
+      // this sets the "has estimation" parameter to false for baseline hash groupby of
+      // small tables, forcing the estimator to run
+      g_big_group_threshold = big_group_threshold;
+    };
+    g_big_group_threshold = 1;
+
+    EXPECT_EQ(
+        v<int64_t>(run_simple_agg(
+            R"(SELECT count(*) FROM (SELECT  unnest(arr_str), unnest(arr_float) FROM array_test GROUP BY 1, 2);)",
+            dt)),
+        int64_t(104));
   }
 }
 
@@ -8443,7 +8719,7 @@ TEST(Select, Export_Via_Query_Having_Scalar_Subquery) {
   // EXPORT stmt needs "validation_query" to gather some info from the query
   // before doing the actual data export
   // Here, if we do export via custom query having scalar subquery,
-  // we throw "Exception: Scalar sub-query returned no results"
+  // we throw "Scalar sub-query returned no results"
   // since RexSubquery Analyzer does not know about the validation query
   // so we have to let subquery analyzer know about that we do process validation query
   // and keep doing processing instead of throwing the exception
@@ -8644,18 +8920,9 @@ TEST(Select, Joins_Fixed_Size_Array_Multi_Frag) {
     ASSERT_EQ(int64_t(5), v<int64_t>(run_simple_agg(q6, dt)));
   };
 
-  // If GPU exists, check whether we get an exception related to varlen columnarization
-  // when query is executed on GPU
-  if (!skip_tests(ExecutorDeviceType::GPU)) {
-    EXPECT_THROW(
-        run_simple_agg(
-            R"(SELECT COUNT(1) FROM mf_t_arr r1, mf_t_arr r2 WHERE r1.t2[1] = r2.t2[1];)",
-            ExecutorDeviceType::GPU),
-        std::runtime_error);
-  }
-
   // skip to test GPU device until we fix the #5425 issue
-  for (auto dt : {ExecutorDeviceType::CPU}) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
     test_query("mf_f_arr", dt);
     test_query("mf_d_arr", dt);
     test_query("mf_i_arr", dt);
@@ -8855,6 +9122,11 @@ TEST(Select, Joins_FilterPushDown) {
         "coalesce_cols_test_2 AS S, coalesce_cols_test_0 AS T WHERE T.x = S.x AND S.y = "
         "R.y AND R.x < 20 AND S.y > 2 AND S.str <> 'foo' AND T.y < 18 AND T.x > 1 GROUP "
         "BY R.y ORDER BY R.y;",
+        dt);
+      // BE-6050, filter pushdown for a query having subquery
+      c("SELECT COUNT(1) FROM coalesce_cols_test_1 WHERE y IN (SELECT MAX(R.y) FROM "
+        "coalesce_cols_test_1 R, (SELECT x, y FROM coalesce_cols_test_1) S WHERE R.y = "
+        "S.y AND s.x < -999);",
         dt);
     }
   }
@@ -9348,6 +9620,22 @@ TEST(Select, Joins_LeftJoinFiltered) {
             R"(SELECT COUNT(*) FROM test LEFT JOIN test_inner ON test.x = test_inner.x LEFT JOIN test_inner_x ON test.x = test_inner_x.x WHERE test.y > 42;)";
         c(query, dt);
         check_explain_result(query, dt, enable_filter_hoisting);
+      }
+
+      {
+        const std::string query =
+            R"(SELECT a.x FROM test a INNER JOIN test_inner b ON (a.x = b.x AND a.y = b.y) LEFT JOIN test_inner_x c ON (a.x = c.x) WHERE a.x > 5 GROUP BY 1;)";
+        c(query, dt);
+        // filter hoisting disabled if LEFT JOIN is the not the first join condition
+        check_explain_result(query, dt, /*enable_filter_hoisting=*/false);
+      }
+
+      {
+        const std::string query =
+            R"(SELECT a.x FROM test a LEFT JOIN test_inner_x c ON (a.x = c.x) INNER JOIN test_inner b ON (a.x = b.x AND a.y = b.y) WHERE a.y + 1 > 5 GROUP BY 1;)";
+        c(query, dt);
+        // filter hoisting disabled if LEFT JOIN is the not the first join condition
+        check_explain_result(query, dt, /*enable_filter_hoisting=*/false);
       }
     }
   }
@@ -10042,6 +10330,75 @@ TEST(Select, Joins_OuterJoin_OptBy_NullRejection) {
           dt);
       CHECK_EQ(q1_res->rowCount(), (size_t)1);
       CHECK_EQ(q1_res->rowCount(), q2_res->rowCount());
+    }
+
+    {
+      // [BE-6037] null rejection rule issue v4: IS NOT NULL filter epxr connected via
+      // OR-logic
+      run_ddl_statement("DROP TABLE IF EXISTS BE_6037_a;");
+      run_ddl_statement("DROP TABLE IF EXISTS BE_6037_b;");
+      run_ddl_statement("DROP TABLE IF EXISTS BE_6037_c;");
+      g_sqlite_comparator.query("DROP TABLE IF EXISTS BE_6037_a;");
+      g_sqlite_comparator.query("DROP TABLE IF EXISTS BE_6037_b;");
+      g_sqlite_comparator.query("DROP TABLE IF EXISTS BE_6037_c;");
+      run_ddl_statement("CREATE TABLE BE_6037_a (id INT);");
+      run_ddl_statement(
+          "CREATE TABLE BE_6037_b (id INT) WITH (PARTITIONS='REPLICATED');");
+      run_ddl_statement(
+          "CREATE TABLE BE_6037_c (id INT) WITH (PARTITIONS='REPLICATED');");
+      g_sqlite_comparator.query("CREATE TABLE BE_6037_a (id INT);");
+      g_sqlite_comparator.query("CREATE TABLE BE_6037_b (id INT);");
+      g_sqlite_comparator.query("CREATE TABLE BE_6037_c (id INT);");
+      auto insert_stmt = [](const std::string& tbl_name, const int val) {
+        std::ostringstream oss;
+        oss << "INSERT INTO " << tbl_name << " VALUES (" << val << ");";
+        return oss.str();
+      };
+      for (int i = 1; i <= 12; i++) {
+        auto insert_stmt_a = insert_stmt("BE_6037_a", i);
+        run_multiple_agg(insert_stmt_a, ExecutorDeviceType::CPU);
+        g_sqlite_comparator.query(insert_stmt_a);
+        if (i % 2 == 0) {
+          auto insert_stmt_b = insert_stmt("BE_6037_b", i);
+          g_sqlite_comparator.query(insert_stmt_b);
+          run_multiple_agg(insert_stmt_b, ExecutorDeviceType::CPU);
+        }
+        if (i % 3 == 0) {
+          auto insert_stmt_c = insert_stmt("BE_6037_c", i);
+          g_sqlite_comparator.query(insert_stmt_c);
+          run_multiple_agg(insert_stmt_c, ExecutorDeviceType::CPU);
+        }
+      }
+      auto q1 =
+          "SELECT COUNT(1) FROM BE_6037_a r1 LEFT JOIN BE_6037_b r2 ON r1.id = r2.id "
+          "LEFT JOIN BE_6037_c r3 ON r1.id = r3.id WHERE r2.id IS NOT NULL OR r3.id IS "
+          "NOT NULL;";
+      auto q2 =
+          "SELECT COUNT(1) FROM (SELECT r1.id a, r2.id b, r3.id c FROM BE_6037_a r1 LEFT "
+          "JOIN BE_6037_b r2 ON r1.id = r2.id LEFT JOIN BE_6037_c r3 ON r1.id = r3.id) "
+          "WHERE b IS NOT NULL OR c IS NOT NULL;";
+      auto q3 =
+          "SELECT COUNT(1) FROM BE_6037_a r1 LEFT JOIN BE_6037_b r2 ON r1.id = r2.id "
+          "LEFT JOIN BE_6037_c r3 ON r1.id = r3.id WHERE r1.id IS NOT NULL AND r2.id IS "
+          "NOT NULL OR r3.id IS NOT NULL;";
+      auto q4 =
+          "SELECT COUNT(1) FROM BE_6037_a r1 LEFT JOIN BE_6037_b r2 ON r1.id = r2.id "
+          "LEFT JOIN BE_6037_c r3 ON r1.id = r3.id WHERE (r1.id IS NOT NULL AND r2.id IS "
+          "NOT NULL) OR r3.id IS NOT NULL;";
+      auto q5 =
+          "SELECT COUNT(1) FROM BE_6037_a r1 LEFT JOIN BE_6037_b r2 ON r1.id = r2.id "
+          "LEFT JOIN BE_6037_c r3 ON r1.id = r3.id WHERE r1.id IS NOT NULL AND (r2.id IS "
+          "NOT NULL OR r3.id IS NOT NULL);";
+      auto q6 =
+          "SELECT COUNT(1) FROM BE_6037_a r1 LEFT JOIN BE_6037_b r2 ON r1.id = r2.id "
+          "LEFT JOIN BE_6037_c r3 ON r1.id = r3.id WHERE r1.id IS NOT NULL OR (r2.id IS "
+          "NOT NULL AND r3.id IS NOT NULL);";
+      c(q1, dt);
+      c(q2, dt);
+      c(q3, dt);
+      c(q4, dt);
+      c(q5, dt);
+      c(q6, dt);
     }
   }
 }
@@ -10752,28 +11109,6 @@ TEST(Select, ViewHavingSelfJoin) {
   run_test(false);
 }
 
-TEST(Select, CreateTableAsSelect) {
-  SKIP_ALL_ON_AGGREGATOR();
-  SKIP_WITH_TEMP_TABLES();
-
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
-    SKIP_NO_GPU();
-    c("SELECT fixed_str, COUNT(*) FROM ctas_test GROUP BY fixed_str;", dt);
-    c("SELECT x, COUNT(*) FROM ctas_test GROUP BY x;", dt);
-    c("SELECT f, COUNT(*) FROM ctas_test GROUP BY f;", dt);
-    c("SELECT d, COUNT(*) FROM ctas_test GROUP BY d;", dt);
-    c("SELECT COUNT(*) FROM empty_ctas_test;", dt);
-    c("SELECT x, w, y, z, b, f, ff, d, fx FROM ctas_test_full ORDER BY x, w, y, z, "
-      "b, f, ff, d, fx;",
-      dt);
-    c("SELECT count(dn), count(fn), count(null_str) FROM ctas_test_full;", dt);
-    c("SELECT str, count(*) FROM ctas_test_full GROUP BY str ORDER BY 2;", dt);
-    c("SELECT m, m_3, m_6, m_9, n, o, o1, o2 FROM ctas_test_full ORDER BY m, m_3, m_6, "
-      "m_9, n, o, o1, o2;",
-      dt);
-  }
-}
-
 TEST(Select, PgShim) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -10842,14 +11177,18 @@ TEST(Select, PuntToCPU) {
   SKIP_ALL_ON_AGGREGATOR();
 
   const auto cpu_retry_state = g_allow_cpu_retry;
+  const auto cpu_step_retry_state = g_allow_query_step_cpu_retry;
   const auto watchdog_state = g_enable_watchdog;
   g_allow_cpu_retry = false;
+  g_allow_query_step_cpu_retry = false;
   g_enable_watchdog = true;
-  ScopeGuard reset_global_flag_state = [&cpu_retry_state, &watchdog_state] {
-    g_allow_cpu_retry = cpu_retry_state;
-    g_enable_watchdog = watchdog_state;
-    g_gpu_mem_limit_percent = 0.9;  // Reset to 90%
-  };
+  ScopeGuard reset_global_flag_state =
+      [&cpu_retry_state, &cpu_step_retry_state, &watchdog_state] {
+        g_allow_cpu_retry = cpu_retry_state;
+        g_allow_query_step_cpu_retry = cpu_step_retry_state;
+        g_enable_watchdog = watchdog_state;
+        g_gpu_mem_limit_percent = 0.9;  // Reset to 90%
+      };
 
   const auto dt = ExecutorDeviceType::GPU;
   if (skip_tests(dt)) {
@@ -10866,6 +11205,74 @@ TEST(Select, PuntToCPU) {
   EXPECT_NO_THROW(run_multiple_agg("SELECT x, COUNT(*) FROM test GROUP BY x;", dt));
   EXPECT_NO_THROW(run_multiple_agg(
       "SELECT COUNT(*) FROM test WHERE x IN (SELECT y FROM test WHERE y > 3);", dt));
+}
+
+TEST(Select, PuntQueryStepToCPU) {
+  SKIP_ALL_ON_AGGREGATOR();
+
+  const auto cpu_retry_state = g_allow_cpu_retry;
+  const auto cpu_step_retry_state = g_allow_query_step_cpu_retry;
+  const auto watchdog_state = g_enable_watchdog;
+  g_allow_cpu_retry = false;
+  g_allow_query_step_cpu_retry = false;
+  g_enable_watchdog = true;
+  ScopeGuard reset_global_flag_state =
+      [&cpu_retry_state, &cpu_step_retry_state, &watchdog_state] {
+        g_allow_cpu_retry = cpu_retry_state;
+        g_allow_query_step_cpu_retry = cpu_step_retry_state;
+        g_enable_watchdog = watchdog_state;
+        g_gpu_mem_limit_percent = 0.9;  // Reset to 90%
+      };
+
+  const auto dt = ExecutorDeviceType::GPU;
+  if (skip_tests(dt)) {
+    return;
+  }
+
+  // Query is single step and can run on GPU
+  EXPECT_NO_THROW(run_multiple_agg("SELECT x, COUNT(*) FROM test GROUP BY x;", dt));
+
+  // Query is multi-step and second step can only run on CPU, will fail without
+  // g_allow_cpu_retry Note: If and when we implement APPROX_MEDIAN for GPU, this will
+  // fail and need adjustment
+  EXPECT_THROW(run_multiple_agg("SELECT x, APPROX_MEDIAN(n) AS n_median FROM (SELECT x, "
+                                "y, COUNT(*) AS n FROM test GROUP BY x, y) GROUP BY x;",
+                                dt),
+               std::runtime_error);
+
+  g_allow_cpu_retry = false;
+  g_allow_query_step_cpu_retry = true;
+
+  EXPECT_NO_THROW(run_multiple_agg("SELECT x, COUNT(*) FROM test GROUP BY x;", dt));
+  // Even without g_allow_cpu_retry = true, this should run with
+  // g_allow_query_step_cpu_retry = true, as second step can drop to CPU without
+  // triggering global punt to CPU
+  EXPECT_NO_THROW(
+      run_multiple_agg("SELECT x, APPROX_MEDIAN(n) AS n_median FROM (SELECT x, y, "
+                       "COUNT(*) AS n FROM test GROUP BY x, y) GROUP BY x;",
+                       dt));
+
+  g_allow_cpu_retry = false;
+  g_allow_query_step_cpu_retry = false;
+  g_gpu_mem_limit_percent = 1e-10;
+
+  // Out of memory errors caught pre-allocation should (currently) trigger a
+  // QueryMustRunOnCPU exception and will be caught with either g_allow_cpu_retry or
+  // g_allow_query_step_cpu_retry
+
+  EXPECT_THROW(run_multiple_agg("SELECT x, AVG(n) AS n_avg FROM (SELECT x, "
+                                "y, COUNT(*) AS n FROM test GROUP BY x, y) GROUP BY x;",
+                                dt),
+               std::runtime_error);
+
+  g_allow_cpu_retry = false;
+  g_allow_query_step_cpu_retry = true;
+  g_gpu_mem_limit_percent = 1e-10;
+
+  EXPECT_NO_THROW(
+      run_multiple_agg("SELECT x, AVG(n) AS n_avg FROM (SELECT x, y, "
+                       "COUNT(*) AS n FROM test GROUP BY x, y) GROUP BY x;",
+                       dt));
 }
 
 TEST(Select, TimestampMeridiesEncoding) {
@@ -15333,6 +15740,16 @@ TEST(Update, SimpleFilter) {
     c("UPDATE simple_filter SET z = 2*z WHERE x < 6;", dt);
     c("SELECT * FROM simple_filter ORDER BY x, y, z;", dt);
     c("SELECT sum(x) FROM simple_filter WHERE x < 6;", dt);  // check metadata
+
+    // BE-6050
+    {
+      auto default_flag = g_enable_filter_push_down;
+      g_enable_filter_push_down = true;
+      c("UPDATE simple_filter SET x = 50 WHERE x IN (SELECT R.x FROM simple_filter R, "
+        "(SELECT x, y FROM simple_filter) S WHERE R.x = S.x AND S.y > 2021);",
+        dt);
+      g_enable_filter_push_down = default_flag;
+    }
   }
 }
 
@@ -17593,21 +18010,6 @@ TEST(Select, Correlated_In) {
   }
 }
 
-TEST(Errors, CtasItas) {
-  SKIP_ALL_ON_AGGREGATOR();
-  SKIP_WITH_TEMP_TABLES();
-
-  auto dt = ExecutorDeviceType::CPU;
-
-  // duplicate table
-  EXPECT_ANY_THROW(
-      run_multiple_agg("CREATE TABLE test AS (SELECT * FROM test_inner);", dt));
-  // select table does not exist
-  EXPECT_ANY_THROW(run_multiple_agg("CREATE TABLE x_new AS (SELECT * FROM x_old);", dt));
-  // itas table does not exist
-  EXPECT_ANY_THROW(run_multiple_agg("INSERT INTO test_itas SELECT * FROM test;", dt));
-}
-
 TEST(Create, QuotedColumnIdentifier) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -19570,10 +19972,9 @@ TEST(Select, ParseIntegerExceptions) {
         EXPECT_TRUE(false) << "Exception expected for query: " << test.query;
       } catch (std::runtime_error const& e) {
         if (g_aggregator) {
-          EXPECT_EQ(
-              e.what(),
-              "TException - service has thrown: TOmniSciException(error_msg=Exception: " +
-                  test.exception + ')');
+          EXPECT_EQ(e.what(),
+                    "TException - service has thrown: TOmniSciException(error_msg=" +
+                        test.exception + ')');
         } else {
           EXPECT_EQ(e.what(), test.exception);
         }
@@ -19653,11 +20054,75 @@ TEST_F(SubqueryTestEnv, SubqueryTest) {
   }
 }
 
+// NOTE: these tests pollute the test table, so run them last
+TEST(Select, UpdatePinnedBuffers) {
+  run_ddl_statement("DROP TABLE IF EXISTS pinned_buffers_test;");
+  run_ddl_statement(
+      "CREATE TABLE pinned_buffers_test(x INT, y INT) WITH (FRAGMENT_SIZE=2);");
+  for (size_t i = 0; i < 10; i++) {
+    run_multiple_agg("INSERT INTO pinned_buffers_test VALUES (5,5);",
+                     ExecutorDeviceType::CPU);
+  }
+  for (size_t i = 0; i < 10; i++) {
+    run_multiple_agg("INSERT INTO pinned_buffers_test VALUES (15,15);",
+                     ExecutorDeviceType::CPU);
+  }
+
+  if (skip_tests(ExecutorDeviceType::GPU)) {
+    return;  // GPU only
+  }
+  SKIP_ALL_ON_AGGREGATOR();  // rowid
+
+  // run a lazy fetch query to pin buffers, retain ownership of the resultset
+  const auto rows = run_multiple_agg(
+      "SELECT rowid, x, y FROM pinned_buffers_test WHERE x < 10 ORDER BY 1;",
+      ExecutorDeviceType::GPU);
+
+  // run an update
+  run_multiple_agg("UPDATE pinned_buffers_test SET y = 10 WHERE rowid = 1;",
+                   ExecutorDeviceType::GPU);
+
+  // re-run select
+  const auto rows_updated = run_multiple_agg(
+      "SELECT rowid, x, y FROM pinned_buffers_test WHERE x < 10 ORDER BY 1;",
+      ExecutorDeviceType::GPU);
+
+  ASSERT_EQ(rows->rowCount(), rows_updated->rowCount());
+  for (size_t i = 0; i < rows->rowCount(); i++) {
+    const auto original_row = rows->getNextRow(false, false);
+    const auto updated_row = rows_updated->getNextRow(false, false);
+    EXPECT_TRUE(original_row.size() == updated_row.size() && original_row.size() == 3);
+    EXPECT_EQ(v<int64_t>(original_row[0]), v<int64_t>(updated_row[0]));
+    EXPECT_EQ(v<int64_t>(original_row[1]), v<int64_t>(updated_row[1]));
+    if (v<int64_t>(original_row[0]) == 1) {
+      EXPECT_EQ(v<int64_t>(updated_row[2]), 10);
+      // EXPECT_EQ(v<int64_t>(original_row[2]), 5);// TODO: this ends up being 10 b/c the
+      // buffer was updated
+    } else {
+      EXPECT_EQ(v<int64_t>(original_row[2]), v<int64_t>(updated_row[2]));
+    }
+  }
+
+  run_multiple_agg("INSERT INTO pinned_buffers_test VALUES (6,6);",
+                   ExecutorDeviceType::CPU);
+
+  // re-run select
+  rows->setCachedRowCount(-1);  // re-do row count
+  const auto rows_inserted = run_multiple_agg(
+      "SELECT rowid, x, y FROM pinned_buffers_test WHERE x < 10 ORDER BY 1;",
+      ExecutorDeviceType::GPU);
+  ASSERT_EQ(rows->rowCount() + 1, rows_inserted->rowCount());
+
+  if (!g_keep_test_data) {
+    run_ddl_statement("DROP TABLE IF EXISTS pinned_buffers_test;");
+  }
+}
+
 namespace {
 int create_sharded_join_table(const std::string& table_name,
                               size_t fragment_size,
                               size_t num_rows,
-                              const ShardInfo& shard_info,
+                              const TestHelpers::ShardInfo& shard_info,
                               bool with_delete_support = true) {
   std::string columns_definition{"i INTEGER, j INTEGER, s TEXT ENCODING DICT(32)"};
 
@@ -20626,7 +21091,7 @@ int create_and_populate_tables(const bool use_temporary_tables,
     // functional or not.
     const size_t single_node_shard_multiplier = 10;
 
-    ShardInfo shard_info{(num_shards) ? "i" : "", num_shards};
+    TestHelpers::ShardInfo shard_info{(num_shards) ? "i" : "", num_shards};
     size_t fragment_size = 2;
     bool delete_support = false;
 
@@ -20988,57 +21453,6 @@ int create_views() {
   return 0;
 }
 
-int create_as_select() {
-  try {
-    const std::string drop_ctas_test{"DROP TABLE IF EXISTS ctas_test;"};
-    run_ddl_statement(drop_ctas_test);
-    g_sqlite_comparator.query(drop_ctas_test);
-    const std::string create_ctas_test{
-        "CREATE TABLE ctas_test AS SELECT x, f, d, str, fixed_str FROM test WHERE x > "
-        "7;"};
-    run_ddl_statement(create_ctas_test);
-    g_sqlite_comparator.query(create_ctas_test);
-  } catch (...) {
-    LOG(ERROR) << "Failed to (re-)create table 'ctas_test'";
-    return -EEXIST;
-  }
-  return 0;
-}
-
-int create_as_select_full() {
-  try {
-    const std::string drop_ctas_test{"DROP TABLE IF EXISTS ctas_test_full;"};
-    run_ddl_statement(drop_ctas_test);
-    g_sqlite_comparator.query(drop_ctas_test);
-    const std::string create_ctas_test{
-        "CREATE TABLE ctas_test_full AS SELECT * FROM test;"};
-    run_ddl_statement(create_ctas_test);
-    g_sqlite_comparator.query(create_ctas_test);
-  } catch (...) {
-    LOG(ERROR) << "Failed to (re-)create table 'ctas_test_full'";
-    return -EEXIST;
-  }
-  return 0;
-}
-
-int create_as_select_empty() {
-  try {
-    const std::string drop_ctas_test{"DROP TABLE IF EXISTS empty_ctas_test;"};
-    run_ddl_statement(drop_ctas_test);
-    g_sqlite_comparator.query(drop_ctas_test);
-    const std::string create_ctas_test{
-        "CREATE TABLE empty_ctas_test AS SELECT x, f, d, str, fixed_str FROM test "
-        "WHERE "
-        "x > 8;"};
-    run_ddl_statement(create_ctas_test);
-    g_sqlite_comparator.query(create_ctas_test);
-  } catch (...) {
-    LOG(ERROR) << "Failed to (re-)create table 'empty_ctas_test'";
-    return -EEXIST;
-  }
-  return 0;
-}
-
 void drop_tables() {
   const std::string drop_vacuum_test_alt("DROP TABLE vacuum_test_alt;");
   g_sqlite_comparator.query(drop_vacuum_test_alt);
@@ -21153,16 +21567,6 @@ void drop_tables() {
   g_sqlite_comparator.query(drop_test_lots_cols);
   run_ddl_statement(drop_test_lots_cols);
 
-  if (!g_aggregator && !g_use_temporary_tables) {
-    const std::string drop_ctas_test{"DROP TABLE ctas_test;"};
-    g_sqlite_comparator.query(drop_ctas_test);
-    run_ddl_statement(drop_ctas_test);
-
-    const std::string drop_empty_ctas_test{"DROP TABLE empty_ctas_test;"};
-    g_sqlite_comparator.query(drop_empty_ctas_test);
-    run_ddl_statement(drop_empty_ctas_test);
-  }
-
   const std::string drop_test_table_rounding{"DROP TABLE test_rounding;"};
   run_ddl_statement(drop_test_table_rounding);
   g_sqlite_comparator.query(drop_test_table_rounding);
@@ -21250,6 +21654,8 @@ int main(int argc, char** argv) {
                          ->default_value(g_use_tbb_pool)
                          ->implicit_value(true),
                      "Use TBB thread pool implementation for query dispatch.");
+  desc.add_options()("use-disk-cache",
+                     "Use the disk cache for all tables with minimum size settings.");
 
   desc.add_options()(
       "test-help",
@@ -21285,7 +21691,14 @@ int main(int argc, char** argv) {
   g_enable_window_functions = true;
   g_enable_interop = false;
 
-  QR::init(BASE_PATH);
+  File_Namespace::DiskCacheConfig disk_cache_config{};
+  if (vm.count("use-disk-cache")) {
+    disk_cache_config = File_Namespace::DiskCacheConfig{
+        File_Namespace::DiskCacheConfig::getDefaultPath(std::string(BASE_PATH)),
+        File_Namespace::DiskCacheLevel::all};
+  }
+
+  QR::init(&disk_cache_config, BASE_PATH);
   if (vm.count("with-sharding")) {
     g_shard_count = choose_shard_count();
   }
@@ -21312,15 +21725,6 @@ int main(int argc, char** argv) {
     err = create_and_populate_tables(g_use_temporary_tables);
     if (!err && !g_use_temporary_tables) {
       err = create_views();
-    }
-    if (!err && !g_use_temporary_tables) {
-      SKIP_ON_AGGREGATOR(err = create_as_select());
-    }
-    if (!err && !g_use_temporary_tables) {
-      SKIP_ON_AGGREGATOR(err = create_as_select_full());
-    }
-    if (!err && !g_use_temporary_tables) {
-      SKIP_ON_AGGREGATOR(err = create_as_select_empty());
     }
   }
   if (err) {

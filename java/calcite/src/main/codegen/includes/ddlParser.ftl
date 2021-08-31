@@ -17,22 +17,24 @@
 
 
 
-SqlNodeList SimpleIdentifierNodeList() :
+SqlNodeList DropColumnNodeList() :
 {
     SqlIdentifier id;
     final List<SqlNode> list = new ArrayList<SqlNode>();
 }
 {
+    [<COLUMN>]
     id = SimpleIdentifier() {list.add(id);}
     (
-        <COMMA> id = SimpleIdentifier() {
+        <COMMA> [<DROP>][<COLUMN>] id = SimpleIdentifier() {
             list.add(id);
         }
     )*
     { return new SqlNodeList(list, SqlParserPos.ZERO); }
 }
 
-SqlNodeList RawTableElementList() :
+// TableElementList without parens
+SqlNodeList NoParenTableElementList() :
 {
     final Span s;
     final List<SqlNode> list = new ArrayList<SqlNode>();
@@ -60,6 +62,24 @@ SqlNodeList TableElementList() :
         <COMMA> TableElement(list)
     )*
     <RPAREN> {
+        return new SqlNodeList(list, s.end(this));
+    }
+}
+
+SqlNodeList idList() :
+{
+    final Span s;
+    SqlIdentifier id;
+    final List<SqlNode> list = new ArrayList<SqlNode>();
+}
+{
+    { s = span(); }
+    id = CompoundIdentifier() { list.add(id); }
+    (
+        <COMMA> 
+        id = CompoundIdentifier() { list.add(id); }
+    )*
+    {
         return new SqlNodeList(list, s.end(this));
     }
 }
@@ -380,10 +400,9 @@ void TableElement(List<SqlNode> list) :
     final OmniSciSqlDataTypeSpec type;
     final boolean nullable;
     Pair<OmniSciEncoding, Integer> encoding = null;
-    final SqlNode e;
+    final SqlNode defval;
     final SqlNode constraint;
     SqlIdentifier name = null;
-    final SqlNodeList columnList;
     final Span s = Span.of();
     final ColumnStrategy strategy;
 }
@@ -399,32 +418,23 @@ void TableElement(List<SqlNode> list) :
             (
                 type = OmniSciDataType()
                 nullable = NullableOptDefaultTrue()
-                [ encoding = OmniSciEncodingOpt() ]
                 (
-                    [ <GENERATED> <ALWAYS> ] <AS> <LPAREN>
-                    e = Expression(ExprContext.ACCEPT_SUB_QUERY) <RPAREN>
-                    (
-                        <VIRTUAL> { strategy = ColumnStrategy.VIRTUAL; }
-                    |
-                        <STORED> { strategy = ColumnStrategy.STORED; }
-                    |
-                        { strategy = ColumnStrategy.VIRTUAL; }
-                    )
-                |
-                    <DEFAULT_> e = Expression(ExprContext.ACCEPT_SUB_QUERY) {
+                    <DEFAULT_> defval = Expression(ExprContext.ACCEPT_SUB_QUERY) {
                         strategy = ColumnStrategy.DEFAULT;
                     }
                 |
                     {
-                        e = null;
+                        defval = null;
                         strategy = nullable ? ColumnStrategy.NULLABLE
                             : ColumnStrategy.NOT_NULLABLE;
                     }
                 )
+                [ encoding = OmniSciEncodingOpt() ]
                 {
                     list.add(
                         SqlDdlNodes.column(s.add(id).end(this), id,
-                            type.withEncoding(encoding).withNullable(nullable), e, strategy));
+                            type.withEncoding(encoding).withNullable(nullable),
+                            defval, strategy));
                 }
             |
                 { list.add(id); }
@@ -440,40 +450,46 @@ void TableElement(List<SqlNode> list) :
  */
 Pair<String, SqlNode> KVOption() :
 {
-    final SqlIdentifier withOption;
-    final String withOptionString;
-    final SqlNode withValue;
+    final SqlIdentifier option;
+    final String optionString;
+    final SqlNode value;
+    final Span s;
 }
 {
     (
       // Special rule required to handle "escape" option, since ESCAPE is a keyword
       <ESCAPE>
       {
-        withOptionString = "escape";
+        optionString = "escape";
       }
     |
-      withOption = CompoundIdentifier()
+      option = CompoundIdentifier()
       {
-        withOptionString = withOption.toString();
+        optionString = option.toString();
       }
     )
     <EQ>
-    withValue = Literal()
-    { return new Pair<String, SqlNode>(withOptionString, withValue); }
+    { s = span(); }
+    (
+        <NULL> {  value = SqlLiteral.createCharString("", s.end(this)); }
+    |
+        value = Literal()
+    )
+    { return new Pair<String, SqlNode>(optionString, value); }
 }
 
 /*
- * Parse one or more WITH clause key-value pair options
+ * Parse one or more key-value pair options
  *
- * WITH ( <option> = <value> [, ... ] )
+ * ( <option> = <value> [, ... ] )
  */
-OmniSciOptionsMap WithOptionsOpt() :
+OmniSciOptionsMap OptionsOpt() :
 {
     OmniSciOptionsMap optionMap = new OmniSciOptionsMap();
     Pair<String, SqlNode> optionPair = null;
 }
 {
-  <WITH> <LPAREN>
+  <LPAREN>
   optionPair = KVOption()
   { OmniSciOptionsMap.add(optionMap, optionPair.getKey(), optionPair.getValue()); }
   (
@@ -485,32 +501,96 @@ OmniSciOptionsMap WithOptionsOpt() :
   { return optionMap; }
 }
 
+/*
+ * Parse the TEMPORARY keyphrase.
+ *
+ * [ TEMPORARY ]
+ */
+boolean TemporaryOpt() :
+{
+}
+{
+    <TEMPORARY> { return true; }
+|
+    { return false; }
+}
+
+/*
+ * Create a table using the following syntax:
+ *
+ * CREATE TABLE [ IF NOT EXISTS ] <table_name> AS <select>
+ */
 SqlCreate SqlCreateTable(Span s, boolean replace) :
 {
-    final boolean ifNotExists;
+    boolean temporary = false;
+    boolean ifNotExists = false;
     final SqlIdentifier id;
     SqlNodeList tableElementList = null;
     OmniSciOptionsMap withOptions = null;
     SqlNode query = null;
 }
 {
-    <TABLE> ifNotExists = IfNotExistsOpt() id = CompoundIdentifier()
-    [ tableElementList = TableElementList() ]
-    [ <AS> query = OrderedQueryOrExpr(ExprContext.ACCEPT_QUERY) ]
-    [ withOptions = WithOptionsOpt() ]
+    [<TEMPORARY> {temporary = true; }]
+    <TABLE> 
+    ifNotExists = IfNotExistsOpt() 
+    id = CompoundIdentifier()
+    ( 
+        tableElementList = TableElementList()
+    |
+        <AS> query = OrderedQueryOrExpr(ExprContext.ACCEPT_QUERY)
+    )
+    [ <WITH> withOptions = OptionsOpt() ]
     {
-        return SqlDdlNodes.createTable(s.end(this), replace, ifNotExists, id,
+        return SqlDdlNodes.createTable(s.end(this), replace, temporary, ifNotExists, id,
             tableElementList, withOptions, query);
     }
 }
 
+/**
+ * Parses a DROP statement.
+ *
+ *  This broke away from the default Calcite implementation because it was
+ *  necessary to use LOOKAHEAD(2) for the USER commands in order for them 
+ *  to parse correctly.
+ *
+ *   "replace" was never used, but appeared in SqlDrop's original signature
+ *
+ */
+SqlDdl SqlCustomDrop(Span s) :
+{
+    boolean replace = false;  
+    final SqlDdl drop;
+}
+{
+    <DROP>
+    (
+        LOOKAHEAD(1) drop = SqlDropDB(s)
+        |
+        LOOKAHEAD(1) drop = SqlDropTable(s)
+        |
+        LOOKAHEAD(1) drop = SqlDropView(s)
+        |
+        LOOKAHEAD(1) drop = SqlDropServer(s)
+        |
+        LOOKAHEAD(1) drop = SqlDropForeignTable(s)
+        |
+        LOOKAHEAD(2) drop = SqlDropUserMapping(s)
+        |
+        LOOKAHEAD(2) drop = SqlDropUser(s)
+        |
+        LOOKAHEAD(2) drop = SqlDropRole(s)
+    )
+    {
+        return drop;
+    }
+}
 
 /*
  * Drop a table using the following syntax:
  *
  * DROP TABLE [ IF EXISTS ] <table_name>
  */
-SqlDrop SqlDropTable(Span s, boolean replace) :
+SqlDdl SqlDropTable(Span s) :
 {
     final boolean ifExists;
     final SqlIdentifier tableName;
@@ -599,8 +679,7 @@ SqlDdl SqlAlterTable(Span s) :
         )
     |
         <DROP>
-        <COLUMN>
-        columnList = SimpleIdentifierNodeList()
+        columnList = DropColumnNodeList()
         {
             sqlAlterTableBuilder.dropColumn(columnList);
         }
@@ -610,7 +689,7 @@ SqlDdl SqlAlterTable(Span s) :
         (
             columnList = TableElementList()
             |
-            columnList = RawTableElementList()
+            columnList = NoParenTableElementList()
         )
         {
             sqlAlterTableBuilder.addColumnList(columnList);
@@ -635,7 +714,53 @@ SqlDdl SqlAlterTable(Span s) :
     }
 }
 
+SqlNode WrappedOrderedQueryOrExpr(ExprContext exprContext) :
+{
+    final SqlNode query;
+}
+{
+        <LPAREN>
+        query = OrderedQueryOrExpr(exprContext)
+        <RPAREN>
+        { return query; }
+    |
+        query = OrderedQueryOrExpr(exprContext)
+        { return query; }
+}
 
+/* 
+ * Insert into table(s) using the following syntax:
+ *
+ * INSERT INTO <table_name> [columns] <select>
+ */
+SqlInsertIntoTable SqlInsertIntoTable(Span s) :
+{
+    final SqlIdentifier table;
+    final SqlNode query;
+    SqlNodeList columnList = null;
+}
+{
+    <INSERT>
+    <INTO>
+    table = CompoundIdentifier()
+    (
+        LOOKAHEAD(3)
+        columnList = ParenthesizedSimpleIdentifierList() 
+        query = WrappedOrderedQueryOrExpr(ExprContext.ACCEPT_QUERY)
+    |
+        query = WrappedOrderedQueryOrExpr(ExprContext.ACCEPT_QUERY)
+    )
+
+    {
+        return new SqlInsertIntoTable(s.end(this), table, query, columnList);
+    }
+}
+
+/*
+ * Create a view using the following syntax:
+ *
+ * CREATE VIEW [ IF NOT EXISTS ] <view_name> [(columns)] AS <query>
+ */
 SqlCreate SqlCreateView(Span s, boolean replace) :
 {
     final boolean ifNotExists;
@@ -660,7 +785,7 @@ SqlCreate SqlCreateView(Span s, boolean replace) :
  *
  * DROP VIEW [ IF EXISTS ] <view_name>
  */
-SqlDrop SqlDropView(Span s, boolean replace) :
+SqlDdl SqlDropView(Span s) :
 {
     final boolean ifExists;
     final SqlIdentifier viewName;
@@ -674,3 +799,427 @@ SqlDrop SqlDropView(Span s, boolean replace) :
     }
 }
 
+/*
+ * Create a database using the following syntax:
+ *
+ * CREATE DATABASE ...
+ *
+ *  "replace" option required by SqlCreate, but unused
+ */
+SqlCreate SqlCreateDB(Span s, boolean replace) :
+{
+    final boolean ifNotExists;
+    final SqlIdentifier dbName;
+    OmniSciOptionsMap dbOptions = null;
+}
+{
+    <DATABASE> ifNotExists = IfNotExistsOpt() dbName = CompoundIdentifier()
+    [ dbOptions = OptionsOpt() ]
+    {
+        return new SqlCreateDB(s.end(this), ifNotExists, dbName.toString(), dbOptions);
+    }
+}
+
+/* 
+ * Drop a database using the following syntax:
+ *
+ * DROP DATABASE [ IF EXISTS ] <db_name>
+ *
+ */
+SqlDdl SqlDropDB(Span s) :
+{
+    final boolean ifExists;
+    final SqlIdentifier dbName;
+}
+{
+    <DATABASE>
+    ifExists = IfExistsOpt()
+    dbName = CompoundIdentifier()
+    {
+        return new SqlDropDB(s.end(this), ifExists, dbName.toString());
+    }
+}
+
+
+/*
+ * Rename database using the following syntax:
+ *
+ * ALTER DATABASE <db_name> RENAME TO <new_db_name>
+ */
+SqlRenameDB SqlRenameDB(Span s) :
+{   
+    SqlIdentifier dbName;
+    SqlIdentifier newDBName;
+}
+{
+    <ALTER>
+    <DATABASE>
+    dbName = CompoundIdentifier()
+    <RENAME>
+    <TO>
+    newDBName = CompoundIdentifier()
+    {
+        return new SqlRenameDB(s.end(this), dbName.toString(), newDBName.toString());
+    }
+}
+
+/*
+ * Create a user using the following syntax:
+ *
+ * CREATE USER ["]<name>["] (<property> = value,...);
+ *
+ *  "replace" option required by SqlCreate, but unused
+ */
+SqlCreate SqlCreateUser(Span s, boolean replace) :
+{
+    final SqlIdentifier userName;
+    OmniSciOptionsMap userOptions = null;
+}
+{
+    <USER> 
+    userName = CompoundIdentifier()
+    [ userOptions = OptionsOpt() ]
+    {
+        return new SqlCreateUser(s.end(this), userName.toString(), userOptions);
+    }
+}
+
+
+/* 
+ * Drop a user using the following syntax:
+ *
+ * DROP USER <user_name>
+ *
+ */
+SqlDdl SqlDropUser(Span s) :
+{
+    final SqlIdentifier userName;
+}
+{
+    <USER>
+    userName = CompoundIdentifier()
+    {
+        return new SqlDropUser(s.end(this), userName.toString());
+    }
+}
+
+
+/*
+ * Alter user using the following syntax:
+ *
+ * ALTER USER <user_name> RENAME TO <new_user_name>
+ * ALTER USER <user_name> dbOptions
+ *
+ */
+SqlDdl SqlAlterUser(Span s) :
+{   
+    SqlIdentifier userName;
+    SqlIdentifier newUserName = null;
+    OmniSciOptionsMap userOptions = null;
+}
+{
+    <ALTER>
+    <USER>
+    userName = CompoundIdentifier()
+    (
+        <RENAME>
+        <TO>
+        newUserName = CompoundIdentifier()
+    |
+        userOptions = OptionsOpt()
+    )
+    {
+        if(userOptions != null){
+            return new SqlAlterUser(s.end(this), userName.toString(), userOptions);           
+        } else {
+            return new SqlRenameUser(s.end(this), userName.toString(), newUserName.toString()); 
+        }
+    }
+}
+
+/*
+ * Create a role using the following syntax:
+ *
+ * CREATE ROLE <role_name>
+ *
+ */
+SqlCreate SqlCreateRole(Span s, boolean replace) :
+{
+    final SqlIdentifier role;
+}
+{
+    <ROLE> role = CompoundIdentifier()
+    {
+        return new SqlCreateRole(s.end(this), role);
+    }
+}
+
+/*
+ * Drop a role using the following syntax:
+ *
+ * DROP ROLE <role_name>
+ *
+ */
+SqlDrop SqlDropRole(Span s) :
+{
+    final SqlIdentifier role;
+}
+{
+    <ROLE> role = CompoundIdentifier()
+    {
+        return new SqlDropRole(s.end(this), role.toString());
+    }
+}
+
+/*
+ * Base class for:
+ *
+ * Grant using the following syntax:
+ *
+ * GRANT <nodeList> ...
+ *
+ */
+SqlDdl SqlGrant(Span si) :
+{
+    Span s;
+    SqlNodeList nodeList;
+    final SqlDdl grant;
+}
+{
+    <GRANT> { s = span(); }
+    (
+        nodeList = privilegeList()
+        grant = SqlGrantPrivilege(s, nodeList)
+        |
+        nodeList = idList()
+        grant = SqlGrantRole(s, nodeList)
+    )
+    {
+        return grant;
+    }
+}
+
+/*
+ * Base class for:
+ *
+ * Revoke using the following syntax:
+ *
+ * REVOKE <nodeList> ...
+ *
+ */
+SqlDdl SqlRevoke(Span si) :
+{
+    Span s;
+    SqlNodeList nodeList;
+    final SqlDdl revoke;
+}
+{
+    <REVOKE> { s = span(); }
+    (
+        nodeList = privilegeList()
+        revoke = SqlRevokePrivilege(s, nodeList)
+        |
+        nodeList = idList()
+        revoke = SqlRevokeRole(s, nodeList)
+    )
+    {
+        return revoke;
+    }
+}
+
+/*
+ * Grant a role using the following syntax:
+ *
+ * (GRANT <rolenames>) TO <grantees>
+ *
+ */
+SqlDdl SqlGrantRole(Span s, SqlNodeList roleList) :
+{
+    SqlNodeList granteeList;
+}
+{
+    <TO>
+    granteeList = idList()
+
+    { return new SqlGrantRole(s.end(this), roleList, granteeList); }
+}
+
+/*
+ * Revoke a role using the following syntax:
+ *
+ * (REVOKE <rolenames>) FROM <grantees>
+ *
+ */
+SqlDdl SqlRevokeRole(Span s, SqlNodeList roleList) :
+{
+    SqlNodeList granteeList;
+}
+{
+    <FROM>
+    granteeList = idList()
+
+    { return new SqlRevokeRole(s.end(this), roleList, granteeList); }
+}
+
+SqlNode Privilege(Span s) :
+{
+    String type;
+}
+{
+    (
+        LOOKAHEAD(2) <SERVER> <USAGE> { type = "SERVER USAGE"; }
+    |   LOOKAHEAD(2) <ALTER> <SERVER> { type = "ALTER SERVER"; }
+    |   LOOKAHEAD(2) <CREATE> <SERVER> { type = "CREATE SERVER"; }
+    |   LOOKAHEAD(2) <CREATE> <TABLE> { type = "CREATE TABLE"; }
+    |   LOOKAHEAD(2) <CREATE> <VIEW> { type = "CREATE VIEW"; }
+    |   LOOKAHEAD(2) <SELECT> <VIEW> { type = "SELECT VIEW"; }
+    |   LOOKAHEAD(2) <DROP> <VIEW> { type = "DROP VIEW"; }
+    |   LOOKAHEAD(2) <DROP> <SERVER> { type = "DROP SERVER"; }
+    |   LOOKAHEAD(2) <CREATE> <DASHBOARD> { type = "CREATE DASHBOARD"; }
+    |   LOOKAHEAD(2) <EDIT> <DASHBOARD> { type = "EDIT DASHBOARD"; }
+    |   LOOKAHEAD(2) <VIEW> <DASHBOARD> { type = "VIEW DASHBOARD"; }
+    |   LOOKAHEAD(2) <DELETE> <DASHBOARD> { type = "DELETE DASHBOARD"; }
+    |   LOOKAHEAD(2) <VIEW> <SQL> <EDITOR> { type = "VIEW SQL EDITOR"; }
+    |   LOOKAHEAD(2) <ALL> [<PRIVILEGES>] { type = "ALL"; }
+    |   <ACCESS> { type = "ACCESS"; }
+    |   <ALTER> { type = "ALTER"; }
+    |   <CREATE> { type = "CREATE"; }
+    |   <DELETE> { type = "DELETE"; }
+    |   <DROP> { type = "DROP"; }
+    |   <EDIT> { type = "EDIT"; }
+    |   <INSERT> { type = "INSERT"; }
+    |   <SELECT> { type = "SELECT"; }
+    |   <TRUNCATE> { type = "TRUNCATE"; }
+    |   <UPDATE> { type = "UPDATE"; }
+    |   <USAGE> { type = "USAGE"; }
+    |   <VIEW> { type = "VIEW"; }
+    )
+    { return SqlLiteral.createCharString(type, s.end(this)); }
+}
+
+SqlNodeList privilegeList() :
+{
+    Span s;
+    SqlNode privilege;
+    final List<SqlNode> list = new ArrayList<SqlNode>();
+}
+{
+    { s = span(); }
+    privilege = Privilege(s) { list.add(privilege); }
+    (
+        <COMMA> 
+        privilege = Privilege(s) { list.add(privilege); }
+    )*
+    {
+        return new SqlNodeList(list, s.end(this));
+    }
+}
+
+String PrivilegeType() :
+{
+    String type;
+}
+{
+    (
+        <DATABASE> { type = "DATABASE"; }
+    |   <TABLE> { type = "TABLE"; }
+    |   <DASHBOARD> { type = "DASHBOARD"; }
+    |   <VIEW> { type = "VIEW"; }
+    |   <SERVER> { type = "SERVER"; }
+    )
+    { return type; }
+}
+
+String PrivilegeTarget() :
+{
+    final SqlIdentifier target;
+    final Integer iTarget;
+    final String result;
+}
+{
+    (
+        target = CompoundIdentifier() { result = target.toString(); }
+    |   
+        iTarget = IntLiteral() { result = iTarget.toString(); }
+    )
+    { return result; }
+}
+
+/*
+ * Grant privileges using the following syntax:
+ *
+ * (GRANT privileges) ON privileges_target_type privileges_target TO grantees
+ *
+ */
+SqlDdl SqlGrantPrivilege(Span s, SqlNodeList privileges) :
+{
+    final String type;
+    final String target;
+    final SqlNodeList grantees;
+}
+{
+    <ON>
+    type = PrivilegeType()
+    target = PrivilegeTarget()
+    <TO>
+    grantees = idList()
+    {
+        return new SqlGrantPrivilege(s.end(this), privileges, type, target, grantees);
+    }
+}
+
+/*
+ * Revoke privileges using the following syntax:
+ *
+ * (REVOKE <privileges>) ON <type> <target> FROM <entityList>;
+ *
+ */
+SqlDdl SqlRevokePrivilege(Span s, SqlNodeList privileges) :
+{
+    final String type;
+    final String target;
+    final SqlNodeList grantees;
+}
+{
+    <ON>
+    type = PrivilegeType()
+    target = PrivilegeTarget()
+    <FROM>
+    grantees = idList()
+    {
+        return new SqlRevokePrivilege(s.end(this), privileges, type, target, grantees);
+    }
+}
+
+
+
+/*
+ * Reassign owned database objects using the following syntax:
+ *
+ * REASSIGN OWNED BY <old_owner>, <old_owner>, ... TO <new_owner>
+ */
+SqlDdl SqlReassignOwned(Span s) :
+{
+    SqlIdentifier userName = null;
+    List<String> oldOwners = null;
+}
+{
+    <REASSIGN> <OWNED> <BY>
+    userName = CompoundIdentifier()
+    {
+        oldOwners = new ArrayList<String>();
+        oldOwners.add(userName.toString());
+    }
+    (
+        <COMMA>
+        userName = CompoundIdentifier()
+        {
+            oldOwners.add(userName.toString());
+        }
+    )*
+    <TO>
+    userName = CompoundIdentifier()
+    {
+        return new SqlReassignOwned(s.end(this), oldOwners, userName.toString());
+    }
+}

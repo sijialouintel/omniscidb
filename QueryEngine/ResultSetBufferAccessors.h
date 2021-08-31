@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2021 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,15 +18,14 @@
  * @file    ResultSetBufferAccessors.h
  * @author  Alex Suhan <alex@mapd.com>
  * @brief   Utility functions for easy access to the result set buffers.
- *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
  */
 
 #ifndef QUERYENGINE_RESULTSETBUFFERACCESSORS_H
 #define QUERYENGINE_RESULTSETBUFFERACCESSORS_H
 
-#include "../Shared/SqlTypesLayout.h"
 #include "BufferCompaction.h"
+#include "Shared/SqlTypesLayout.h"
+#include "Shared/misc.h"
 #include "TypePunning.h"
 
 #ifndef __CUDACC__
@@ -47,7 +46,8 @@ inline size_t get_slots_for_geo_target(const TargetInfo& target_info,
   // Aggregates on geospatial types are serialized directly by rewriting the underlying
   // buffer. Even if separate varlen storage is valid, treat aggregates the same on
   // distributed and single node
-  if (separate_varlen_storage && !target_info.is_agg) {
+  if (target_info.is_varlen_projection ||
+      (separate_varlen_storage && !target_info.is_agg)) {
     return 1;
   } else {
     return 2 * target_info.sql_type.get_physical_coord_cols();
@@ -158,8 +158,9 @@ inline T advance_target_ptr_row_wise(T target_ptr,
        is_real_str_or_array(target_info))) {
     return result + query_mem_desc.getPaddedSlotWidthBytes(slot_idx + 1);
   }
+  const bool is_varlen_output_slot = query_mem_desc.slotIsVarlenOutput(slot_idx);
   if (target_info.sql_type.is_geometry() &&
-      (!separate_varlen_storage || target_info.is_agg)) {
+      (!separate_varlen_storage || target_info.is_agg) && !is_varlen_output_slot) {
     for (auto i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); ++i) {
       result += query_mem_desc.getPaddedSlotWidthBytes(slot_idx + i);
     }
@@ -179,6 +180,7 @@ inline T advance_target_ptr_col_wise(T target_ptr,
       (is_real_str_or_array(target_info) && !separate_varlen_storage)) {
     return advance_to_next_columnar_target_buff(result, query_mem_desc, slot_idx + 1);
   } else if (target_info.sql_type.is_geometry() && !separate_varlen_storage) {
+    // TODO: handle varlen projection
     for (auto i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); ++i) {
       result = advance_to_next_columnar_target_buff(result, query_mem_desc, slot_idx + i);
     }
@@ -197,27 +199,20 @@ inline size_t get_slot_off_quad(const QueryMemoryDescriptor& query_mem_desc) {
 inline double pair_to_double(const std::pair<int64_t, int64_t>& fp_pair,
                              const SQLTypeInfo& ti,
                              const bool float_argument_input) {
+  if (fp_pair.second == 0) {
+    return NULL_DOUBLE;
+  }
   double dividend{0.0};
-  int64_t null_val{0};
   switch (ti.get_type()) {
-    case kFLOAT: {
+    case kFLOAT:
       if (float_argument_input) {
-        dividend = static_cast<double>(
-            *reinterpret_cast<const float*>(may_alias_ptr(&fp_pair.first)));
-      } else {
-        dividend = *reinterpret_cast<const double*>(may_alias_ptr(&fp_pair.first));
+        dividend = shared::reinterpret_bits<float>(fp_pair.first);
+        break;
       }
-      double null_float = inline_fp_null_val(ti);
-      null_val = *reinterpret_cast<const int64_t*>(may_alias_ptr(&null_float));
+    case kDOUBLE:
+      dividend = shared::reinterpret_bits<double>(fp_pair.first);
       break;
-    }
-    case kDOUBLE: {
-      dividend = *reinterpret_cast<const double*>(may_alias_ptr(&fp_pair.first));
-      double null_double = inline_fp_null_val(ti);
-      null_val = *reinterpret_cast<const int64_t*>(may_alias_ptr(&null_double));
-      break;
-    }
-    default: {
+    default:
 #ifndef __CUDACC__
       LOG_IF(FATAL, !(ti.is_integer() || ti.is_decimal()))
           << "Unsupported type for pair to double conversion: " << ti.get_type_name();
@@ -225,17 +220,11 @@ inline double pair_to_double(const std::pair<int64_t, int64_t>& fp_pair,
       CHECK(ti.is_integer() || ti.is_decimal());
 #endif
       dividend = static_cast<double>(fp_pair.first);
-      null_val = inline_int_null_val(ti);
       break;
-    }
   }
-  if (!ti.get_notnull() && null_val == fp_pair.first) {
-    return inline_fp_null_val(SQLTypeInfo(kDOUBLE, false));
-  }
-
-  return ti.is_integer() || ti.is_decimal()
-             ? (dividend / exp_to_scale(ti.is_decimal() ? ti.get_scale() : 0)) /
-                   static_cast<double>(fp_pair.second)
+  return ti.is_decimal() && ti.get_scale()
+             ? dividend /
+                   (static_cast<double>(fp_pair.second) * exp_to_scale(ti.get_scale()))
              : dividend / static_cast<double>(fp_pair.second);
 }
 
@@ -243,13 +232,10 @@ inline int64_t null_val_bit_pattern(const SQLTypeInfo& ti,
                                     const bool float_argument_input) {
   if (ti.is_fp()) {
     if (float_argument_input && ti.get_type() == kFLOAT) {
-      int64_t float_null_val = 0;
-      *reinterpret_cast<float*>(may_alias_ptr(&float_null_val)) =
-          static_cast<float>(inline_fp_null_val(ti));
-      return float_null_val;
+      return shared::reinterpret_bits<int64_t>(NULL_FLOAT);  // 1<<23
     }
     const auto double_null_val = inline_fp_null_val(ti);
-    return *reinterpret_cast<const int64_t*>(may_alias_ptr(&double_null_val));
+    return shared::reinterpret_bits<int64_t>(double_null_val);  // 0x381<<52 or 1<<52
   }
   if ((ti.is_string() && ti.get_compression() == kENCODING_NONE) || ti.is_array() ||
       ti.is_geometry()) {

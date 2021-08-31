@@ -674,6 +674,7 @@ declare void @agg_min_double_skip_val_shared(i64*, double, double);
 declare void @agg_min_float_shared(i32*, float);
 declare void @agg_min_float_skip_val_shared(i32*, float, float);
 declare void @agg_id_shared(i64*, i64);
+declare i8* @agg_id_varlen_shared(i8*, i64, i8*, i64);
 declare void @agg_id_int32_shared(i32*, i32);
 declare void @agg_id_int16_shared(i16*, i16);
 declare void @agg_id_int8_shared(i8*, i8);
@@ -806,6 +807,10 @@ declare i64* @get_bin_from_k_heap_int32_t(i64*, i32, i32, i32, i1, i1, i1, i32, 
 declare i64* @get_bin_from_k_heap_int64_t(i64*, i32, i32, i32, i1, i1, i1, i64, i64);
 declare i64* @get_bin_from_k_heap_float(i64*, i32, i32, i32, i1, i1, i1, float, float);
 declare i64* @get_bin_from_k_heap_double(i64*, i32, i32, i32, i1, i1, i1, double, double);
+declare double @decompress_x_coord_geoint(i32);
+declare double @decompress_y_coord_geoint(i32);
+declare i32 @compress_x_coord_geoint(double);
+declare i32 @compress_y_coord_geoint(double);
 )" + gen_array_any_all_sigs() +
     gen_translate_null_key_sigs();
 
@@ -825,6 +830,7 @@ void legalize_nvvm_ir(llvm::Function* query_func) {
 
   std::vector<llvm::Instruction*> stackrestore_intrinsics;
   std::vector<llvm::Instruction*> stacksave_intrinsics;
+  std::vector<llvm::Instruction*> lifetime;
   for (auto& BB : *query_func) {
     for (llvm::Instruction& I : BB) {
       if (const llvm::IntrinsicInst* II = llvm::dyn_cast<llvm::IntrinsicInst>(&I)) {
@@ -832,6 +838,9 @@ void legalize_nvvm_ir(llvm::Function* query_func) {
           stacksave_intrinsics.push_back(&I);
         } else if (II->getIntrinsicID() == llvm::Intrinsic::stackrestore) {
           stackrestore_intrinsics.push_back(&I);
+        } else if (II->getIntrinsicID() == llvm::Intrinsic::lifetime_start ||
+                   II->getIntrinsicID() == llvm::Intrinsic::lifetime_end) {
+          lifetime.push_back(&I);
         }
       }
     }
@@ -844,6 +853,10 @@ void legalize_nvvm_ir(llvm::Function* query_func) {
     II->eraseFromParent();
   }
   for (auto& II : stacksave_intrinsics) {
+    II->eraseFromParent();
+  }
+  // Remove lifetime intrinsics as well. NVPTX don't like them
+  for (auto& II : lifetime) {
     II->eraseFromParent();
   }
 }
@@ -972,6 +985,14 @@ std::map<std::string, std::string> get_device_parameters(bool cpu_only) {
   return result;
 }
 
+namespace {
+
+bool is_udf_module_present(bool cpu_only = false) {
+  return (cpu_only || udf_gpu_module != nullptr) && (udf_cpu_module != nullptr);
+}
+
+}  // namespace
+
 std::shared_ptr<GpuCompilationContext> CodeGenerator::generateNativeGPUCode(
     llvm::Function* func,
     llvm::Function* wrapper_func,
@@ -1061,6 +1082,22 @@ std::shared_ptr<GpuCompilationContext> CodeGenerator::generateNativeGPUCode(
   // prevent helper functions from being removed
   for (auto f : gpu_target.cgen_state->helper_functions_) {
     roots.insert(f);
+  }
+
+  if (requires_libdevice) {
+    for (llvm::Function& F : *module) {
+      // Some libdevice functions calls another functions that starts with "__internal_"
+      // prefix.
+      // __internal_trig_reduction_slowpathd
+      // __internal_accurate_pow
+      // __internal_lgamma_pos
+      // Those functions have a "noinline" attribute which prevents the optimizer from
+      // inlining them into the body of @query_func
+      if (F.hasName() && F.getName().startswith("__internal") && !F.isDeclaration()) {
+        roots.insert(&F);
+      }
+      legalize_nvvm_ir(&F);
+    }
   }
 
   // Prevent the udf function(s) from being removed the way the runtime functions are
@@ -1321,10 +1358,7 @@ void Executor::initializeNVPTXBackend() const {
   if (nvptx_target_machine_) {
     return;
   }
-  const auto cuda_mgr = catalog_->getDataMgr().getCudaMgr();
-  LOG_IF(FATAL, cuda_mgr == nullptr) << "No CudaMgr instantiated, unable to check device "
-                                        "architecture or generate code for nvidia GPUs.";
-  const auto arch = cuda_mgr->getDeviceArch();
+  const auto arch = cudaMgr()->getDeviceArch();
   nvptx_target_machine_ = CodeGenerator::initializeNVPTXBackend(arch);
 }
 
@@ -1453,6 +1487,8 @@ void set_row_func_argnames(llvm::Function* row_func,
   } else {
     arg_it->setName("group_by_buff");
     ++arg_it;
+    arg_it->setName("varlen_output_buff");
+    ++arg_it;
     arg_it->setName("crt_matched");
     ++arg_it;
     arg_it->setName("total_matched");
@@ -1502,6 +1538,8 @@ llvm::Function* create_row_function(const size_t in_col_count,
     }
   } else {
     // group by buffer
+    row_process_arg_types.push_back(llvm::Type::getInt64PtrTy(context));
+    // varlen output buffer
     row_process_arg_types.push_back(llvm::Type::getInt64PtrTy(context));
     // current match count
     row_process_arg_types.push_back(llvm::Type::getInt32PtrTy(context));
@@ -1669,8 +1707,8 @@ std::vector<std::string> get_agg_fnames(const std::vector<Analyzer::Expr*>& targ
       case kAPPROX_COUNT_DISTINCT:
         result.emplace_back("agg_approximate_count_distinct");
         break;
-      case kAPPROX_MEDIAN:
-        result.emplace_back("agg_approx_median");
+      case kAPPROX_QUANTILE:
+        result.emplace_back("agg_approx_quantile");
         break;
       default:
         CHECK(false);
@@ -1692,13 +1730,11 @@ std::unique_ptr<llvm::Module> g_rt_libdevice_module(
     read_libdevice_module(getGlobalLLVMContext()));
 #endif
 
-bool is_udf_module_present(bool cpu_only) {
-  return (cpu_only || udf_gpu_module != nullptr) && (udf_cpu_module != nullptr);
-}
-
 bool is_rt_udf_module_present(bool cpu_only) {
   return (cpu_only || rt_udf_gpu_module != nullptr) && (rt_udf_cpu_module != nullptr);
 }
+
+namespace {
 
 void read_udf_gpu_module(const std::string& udf_ir_filename) {
   llvm::SMDiagnostic parse_error;
@@ -1727,6 +1763,17 @@ void read_udf_cpu_module(const std::string& udf_ir_filename) {
   udf_cpu_module = llvm::parseIRFile(file_name_arg, parse_error, getGlobalLLVMContext());
   if (!udf_cpu_module) {
     throw_parseIR_error(parse_error, udf_ir_filename);
+  }
+}
+
+}  // namespace
+
+void Executor::addUdfIrToModule(const std::string& udf_ir_filename,
+                                const bool is_cuda_ir) {
+  if (is_cuda_ir) {
+    read_udf_gpu_module(udf_ir_filename);
+  } else {
+    read_udf_cpu_module(udf_ir_filename);
   }
 }
 
@@ -2492,7 +2539,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   auto timer = DEBUG_TIMER(__func__);
 
   if (co.device_type == ExecutorDeviceType::GPU) {
-    const auto cuda_mgr = catalog_->getDataMgr().getCudaMgr();
+    const auto cuda_mgr = data_mgr_->getCudaMgr();
     if (!cuda_mgr) {
       throw QueryMustRunOnCpu();
     }
@@ -2508,6 +2555,8 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 #endif
 
   nukeOldState(allow_lazy_fetch, query_infos, deleted_cols_map, &ra_exe_unit);
+
+  addTransientStringLiterals(ra_exe_unit, row_set_mem_owner);
 
   GroupByAndAggregate group_by_and_aggregate(
       this,

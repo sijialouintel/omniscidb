@@ -895,6 +895,8 @@ endif()
 
 add_subdirectory(ThirdParty/generate_cert)
 
+add_subdirectory(java/ciderJNI/src/main/native)
+
 # systemd
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
   if("${MAPD_EDITION_LOWER}" STREQUAL "ee")

@@ -142,7 +142,7 @@ install_geos
 install_awscpp -j $(nproc)
 
 VERS=0.15.0
-wget --continue http://apache.claz.org/thrift/$VERS/thrift-$VERS.tar.gz
+wget --continue https://dlcdn.apache.org/thrift/$VERS/thrift-$VERS.tar.gz
 tar xvf thrift-$VERS.tar.gz
 pushd thrift-$VERS
 CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
@@ -154,6 +154,7 @@ CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
     --with-qt5=no \
     --with-java=no \
     --prefix=$PREFIX
+sed -i 's/-mod=mod //g' ./lib/go/Makefile
 make -j $(nproc)
 make install
 popd

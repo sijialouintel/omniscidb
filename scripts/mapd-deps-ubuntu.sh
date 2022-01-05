@@ -29,7 +29,7 @@ done
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
 
 SUFFIX=${SUFFIX:=$(date +%Y%m%d)}
-PREFIX=/usr/local
+PREFIX=/usr/local/mapd-deps
 
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source $SCRIPTS_DIR/common-functions.sh

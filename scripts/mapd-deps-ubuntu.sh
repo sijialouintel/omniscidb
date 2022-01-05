@@ -29,7 +29,7 @@ done
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
 
 SUFFIX=${SUFFIX:=$(date +%Y%m%d)}
-PREFIX=/usr/local/mapd-deps
+PREFIX=/usr/local
 
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source $SCRIPTS_DIR/common-functions.sh
@@ -153,6 +153,7 @@ CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
     --with-qt4=no \
     --with-qt5=no \
     --with-java=no \
+    --with-go=no \
     --prefix=$PREFIX
 sed -i 's/-mod=mod //g' ./lib/go/Makefile
 make -j $(nproc)

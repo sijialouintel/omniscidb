@@ -29,7 +29,7 @@ done
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
 
 SUFFIX=${SUFFIX:=$(date +%Y%m%d)}
-PREFIX=/usr/local/mapd-deps
+PREFIX=/usr/local
 
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source $SCRIPTS_DIR/common-functions.sh
@@ -142,7 +142,7 @@ install_geos
 install_awscpp -j $(nproc)
 
 VERS=0.15.0
-wget --continue http://apache.claz.org/thrift/$VERS/thrift-$VERS.tar.gz
+wget --continue https://dlcdn.apache.org/thrift/$VERS/thrift-$VERS.tar.gz
 tar xvf thrift-$VERS.tar.gz
 pushd thrift-$VERS
 CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
@@ -153,6 +153,7 @@ CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
     --with-qt4=no \
     --with-qt5=no \
     --with-java=no \
+    --with-go=no \
     --prefix=$PREFIX
 make -j $(nproc)
 make install

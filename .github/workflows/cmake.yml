@@ -19,11 +19,13 @@ jobs:
     - uses: actions/checkout@v2
 
     - name: Common tools
-      run: apt-get update
-      apt-get install sudo
+      run: | 
+      sudo apt-get update
+      sudo apt-get install sudo
     
     - name: Prebuilt
-      run: ${PATH_SCRIPTS}/mapd-deps-prebuilt.sh
+      run: | 
+      ${PATH_SCRIPTS}/mapd-deps-prebuilt.sh
       source ${PREFIX_OMNISCIDB}/mapd-deps.sh
 
     - name: Dpendency for ubuntu
@@ -41,7 +43,8 @@ jobs:
     - uses: actions/checkout@v2
 
     - name: Environment variables 
-      run: sed -i 's/PREFIX=\/usr\/local//g'
+      run: |
+      sed -i 's/PREFIX=\/usr\/local//g'
       source ${PATH_SCRIPTS}/omnisci-env.sh
 
     - name: CMake build

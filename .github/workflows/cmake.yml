@@ -44,9 +44,9 @@ jobs:
     - uses: actions/checkout@v2
 
     - name: Environment variables 
-      run: |
-      sed -i 's/PREFIX=\/usr\/local//g'
-      source ${{PATH_SCRIPTS}}/omnisci-env.sh
+      run: source ${{PATH_SCRIPTS}}/omnisci-env.sh
+    
+    - run: PREFIX=${{PREFIX_OMNISCIDB}}
 
     - name: CMake build
       run: ./build-omnisci-debug.sh

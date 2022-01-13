@@ -9,7 +9,7 @@ on:
 env:
   BUILD_TYPE: Debug
   PREFIX_OMNISCIDB: /usr/local/mapd-deps
-  PATH_SCRIPTS: ./scripts
+  PATH_SCRIPTS: ${{github.workspace}}/scripts
 
 jobs:
   setup:

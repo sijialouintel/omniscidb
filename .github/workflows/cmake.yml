@@ -24,9 +24,10 @@ jobs:
     #   sudo apt-get install sudo
     
     - name: Prebuilt
-      run: | 
-      ${{PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
-      source ${{PREFIX_OMNISCIDB}}/mapd-deps.sh
+      run: ${{PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
+      shell: bash
+
+    - run: source ${{PREFIX_OMNISCIDB}}/mapd-deps.sh
 
     - name: Dpendency for ubuntu
       run: ${{PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda

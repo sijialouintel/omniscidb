@@ -25,11 +25,11 @@ jobs:
     
     - name: Prebuilt
       run: | 
-      ${PATH_SCRIPTS}/mapd-deps-prebuilt.sh
-      source ${PREFIX_OMNISCIDB}/mapd-deps.sh
+      ${{PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
+      source ${{PREFIX_OMNISCIDB}}/mapd-deps.sh
 
     - name: Dpendency for ubuntu
-      run: ${PATH_SCRIPTS}/mapd-deps-ubuntu.sh --compress --nocuda
+      run: ${{PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
       shell: bash
 
     - name: Clean up
@@ -45,7 +45,7 @@ jobs:
     - name: Environment variables 
       run: |
       sed -i 's/PREFIX=\/usr\/local//g'
-      source ${PATH_SCRIPTS}/omnisci-env.sh
+      source ${{PATH_SCRIPTS}}/omnisci-env.sh
 
     - name: CMake build
       run: ./build-omnisci-debug.sh

@@ -1,0 +1,61 @@
+name: CMake
+
+on:
+  push:
+    branches: [ cicd ]
+  pull_request:
+    branches: [ cider ]
+
+env:
+  BUILD_TYPE: Debug
+  PREFIX_OMNISCIDB: /usr/local/mapd-deps
+  PATH_SCRIPTS: ./scripts
+
+jobs:
+  setup:
+    runs-on: ubuntu-20.04
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Common tools
+      run: apt-get update
+      apt-get install -y --no-install-recommends vim \
+      sudo
+    
+    - name: Prebuilt
+      run: ${PATH_SCRIPTS}/mapd-deps-prebuilt.sh
+      source ${PREFIX_OMNISCIDB}/mapd-deps.sh
+
+    - name: Dpendency for ubuntu
+      run: ${PATH_SCRIPTS}/mapd-deps-ubuntu.sh --compress --nocuda
+      shell: bash
+
+    - name: Clean up
+      run: rm -rf /var/lib/apt/lists/*
+
+  build:
+    needs: setup
+    runs-on: ubuntu-20.04
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Environment variables 
+      run: sed -i 's/PREFIX=\/usr\/local//g'
+      source ${PATH_SCRIPTS}/omnisci-env.sh
+
+    - name: CMake build
+      run: ./build-omnisci-debug.sh
+      shell: bash
+  
+  test:
+    needs: build
+    runs-on: ubuntu-20.04
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Test
+      working-directory: ${{github.workspace}}/build
+      run: ctest -C ${{env.BUILD_TYPE}}

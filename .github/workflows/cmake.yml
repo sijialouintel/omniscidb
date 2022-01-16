@@ -18,30 +18,21 @@ jobs:
     steps:
     - uses: actions/checkout@v2
 
-    - name: Common tools
-      run: sudo apt-get update
-    
     - name: Prebuilt
-      run: ${{env.PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
-      shell: bash
-
-    - run: source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
+      run: |
+        sudo apt-get update
+        bash ${{env.PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
 
     - name: Dpendency for ubuntu
-      run: ${{env.PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
-      shell: bash
+      run: |
+        source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
+        bash ${{env.PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
 
-    # - name: Clean up
-    #   run: rm -rf /var/lib/apt/lists/*
-
-    - name: Environment variables 
-      run: source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
-    
-    - run: PREFIX=${{env.PREFIX_OMNISCIDB}}
-
-    - name: CMake build
-      run: ./build-omnisci-debug.sh
-      shell: bash
+    - name: Build 
+      run: |
+        source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
+        PREFIX=${{env.PREFIX_OMNISCIDB}}
+        bash ./build-omnisci-debug.sh
 
     - name: Test
       working-directory: ${{github.workspace}}/build

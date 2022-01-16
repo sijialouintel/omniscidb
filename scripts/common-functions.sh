@@ -223,7 +223,7 @@ function install_gdal() {
     unzip -u libkml-master.zip
     pushd libkml-master
     ./autogen.sh || true
-    CXXFLAGS="-std=c++03" ./configure --with-expat-include-dir=$PREFIX/include/ --with-expat-lib-dir=$PREFIX/lib --prefix=$PREFIX --enable-static --disable-java --disable-python --disable-swig
+    CXXFLAGS="-std=c++03" CFLAGS="-DSQLITE_ENABLE_COLUMN_METADATA=1" ./configure --with-expat-include-dir=$PREFIX/include/ --with-expat-lib-dir=$PREFIX/lib --prefix=$PREFIX --enable-static --disable-java --disable-python --disable-swig
     makej
     make install
     popd

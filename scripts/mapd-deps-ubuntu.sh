@@ -155,7 +155,6 @@ CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
     --with-java=no \
     --with-go=no \
     --prefix=$PREFIX
-sed -i 's/-mod=mod //g' ./lib/go/Makefile
 make -j $(nproc)
 make install
 popd

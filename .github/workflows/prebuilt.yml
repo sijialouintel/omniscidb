@@ -24,7 +24,6 @@ jobs:
         bash ${{env.PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
         echo "**original env start********************************\n"
         env
-        env > original.txt
         echo "**original env end********************************\n"
 
     - name: Dpendency for ubuntu
@@ -32,5 +31,4 @@ jobs:
         source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
         echo "**mapd-deps env start********************************\n"
         env
-        env > mapd-deps.txt
         echo "**mapd-deps env end********************************\n"

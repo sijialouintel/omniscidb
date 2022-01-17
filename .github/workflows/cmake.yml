@@ -32,7 +32,7 @@ jobs:
       run: |
         source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
         PREFIX=${{env.PREFIX_OMNISCIDB}}
-        bash ./build-omnisci-debug.sh
+        bash  ${{github.workspace}}/build-omnisci-debug.sh
 
     - name: Test
       working-directory: ${{github.workspace}}/build

@@ -57,6 +57,7 @@ fi
 export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DBoost_NO_BOOST_CMAKE=on"
 
 this_dir=`dirname $(readlink -f $0)`/scripts/conda
+echo $this_dir
 RECIPE_DIR=${RECIPE_DIR:-${this_dir}}
 
 # Omnisci UDF support uses CLangTool for parsing Load-time UDF C++

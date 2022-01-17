@@ -2,9 +2,9 @@ name: CMake
 
 on:
   push:
-    branches: [ cicd ]
+    branches: [ master ]
   pull_request:
-    branches: [ cider ]
+    branches: [ master ]
 
 env:
   BUILD_TYPE: Debug

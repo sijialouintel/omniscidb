@@ -2,7 +2,7 @@ name: CMake
 
 on:
   push:
-    branches: [ master ]
+    branches: [ cicd ]
   pull_request:
     branches: [ master ]
 
@@ -22,17 +22,16 @@ jobs:
       run: |
         sudo apt-get update
         bash ${{env.PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
-
-    - name: Dpendency for ubuntu
-      run: |
         source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
-        bash ${{env.PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
 
+    # - name: Dpendency for ubuntu
+    #   run: 
+        # bash ${{env.PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
+
+# source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
+# PREFIX=${{env.PREFIX_OMNISCIDB}}
     - name: Build 
-      run: |
-        source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
-        PREFIX=${{env.PREFIX_OMNISCIDB}}
-        bash ./build-omnisci-debug.sh
+      run: bash ./build-omnisci-debug.sh
 
     - name: Test
       working-directory: ${{github.workspace}}/build

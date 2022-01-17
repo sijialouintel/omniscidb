@@ -26,6 +26,12 @@ jobs:
         env
         echo "**original env end********************************\n"
 
+    - name: Cat env file
+      run: |
+        echo "**file env start********************************\n"
+        cat ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
+        echo "**file env end********************************\n"
+
     - name: Dpendency for ubuntu
       run: |
         source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh

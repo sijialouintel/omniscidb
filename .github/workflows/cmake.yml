@@ -28,10 +28,11 @@ jobs:
     #   run: 
         # bash ${{env.PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
 
-# source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
-# PREFIX=${{env.PREFIX_OMNISCIDB}}
     - name: Build 
-      run: bash ./build-omnisci-debug.sh
+      run: |
+        source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
+        PREFIX=${{env.PREFIX_OMNISCIDB}}
+        bash ./build-omnisci-debug.sh
 
     - name: Test
       working-directory: ${{github.workspace}}/build

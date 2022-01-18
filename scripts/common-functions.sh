@@ -213,7 +213,15 @@ GDAL_VERSION=3.2.2
 
 function install_gdal() {
     # sqlite3
-    download_make_install https://sqlite.org/2021/sqlite-autoconf-3350500.tar.gz
+    # download_make_install https://sqlite.org/2021/sqlite-autoconf-3350500.tar.gz
+    name=sqlite-autoconf-3350500.tar.gz
+    download https://sqlite.org/2021/$name
+    extract $name
+    pushd ${name%%.tar*}
+    CFLAGS="-DSQLITE_ENABLE_COLUMN_METADATA=1" ./configure --prefix=$PREFIX
+    makej
+    make_install
+    popd
 
     # expat
     download_make_install https://github.com/libexpat/libexpat/releases/download/R_2_2_5/expat-2.2.5.tar.bz2
@@ -223,7 +231,7 @@ function install_gdal() {
     unzip -u libkml-master.zip
     pushd libkml-master
     ./autogen.sh || true
-    CXXFLAGS="-std=c++03" CFLAGS="-DSQLITE_ENABLE_COLUMN_METADATA=1" ./configure --with-expat-include-dir=$PREFIX/include/ --with-expat-lib-dir=$PREFIX/lib --prefix=$PREFIX --enable-static --disable-java --disable-python --disable-swig
+    CXXFLAGS="-std=c++03" ./configure --with-expat-include-dir=$PREFIX/include/ --with-expat-lib-dir=$PREFIX/lib --prefix=$PREFIX --enable-static --disable-java --disable-python --disable-swig
     makej
     make install
     popd

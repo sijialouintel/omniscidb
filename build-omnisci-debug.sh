@@ -70,8 +70,7 @@ export CPLUS_INCLUDE_PATH=$(get_cxx_include_path):$CPLUS_INCLUDE_PATH
 [ -f ~/.m2/settings.xml -o -z "$http_proxy" ] || python ${RECIPE_DIR}/make-m2-proxy.py
 
 rm -rf build-$BUILD_TYPE
-mkdir -p build-$BUILD_TYPE
-cd build-$BUILD_TYPE
+mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
 
 cmake -Wno-dev \
     -DCMAKE_PREFIX_PATH=$PREFIX \

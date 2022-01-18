@@ -17,33 +17,24 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
-
-    - name: Prebuilt
-      run: |
-        sudo apt-get update
-        bash ${{env.PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
-        source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
-    
+        
     - name: Dpendency for ubuntu
-      run: |
-        source ${{env.PATH_SCRIPTS}}/common-functions.sh
-        install_geos
+      run:  |
+        sudo apt-get update
+        bash ${{env.PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
+        source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
 
-    - name: Build
-      run: |
-        mkdir build && cd build
-        cmake -DCMAKE_BUILD_TYPE=debug -DENABLE_CUDA=OFF -DENABLE_DBE=ON ..
-        make -j 8
-
-    # - name: Dpendency for ubuntu
-    #   run: 
-        # bash ${{env.PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
-
-    # - name: Build 
+    # - name: Build
     #   run: |
-    #     source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
-    #     PREFIX=${{env.PREFIX_OMNISCIDB}}
-    #     bash  ${{github.workspace}}/build-omnisci-debug.sh
+    #     mkdir build && cd build
+    #     cmake -DCMAKE_BUILD_TYPE=debug -DENABLE_CUDA=OFF -DENABLE_DBE=ON ..
+    #     make -j 8
+
+    - name: Build 
+      run: |
+        source ${{env.PATH_SCRIPTS}}/omnisci-env.sh
+        PREFIX=${{env.PREFIX_OMNISCIDB}}
+        bash  ${{github.workspace}}/build-omnisci-debug.sh
 
     - name: Test
       working-directory: ${{github.workspace}}/build

@@ -103,6 +103,7 @@ if [ "$ID" == "ubuntu" ] ; then
       g++-9 \
       libboost-all-dev \
       libgoogle-glog-dev \
+      golang \
       libssl-dev \
       libevent-dev \
       default-jre \

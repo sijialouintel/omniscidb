@@ -17,18 +17,18 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
-        
+    
+    - name: Prebuilt
+      run: |
+        sudo apt-get update
+        ${PATH_SCRIPTS}/mapd-deps-prebuilt.sh
+        source ${PREFIX_OMNISCIDB}/mapd-deps.sh
+
     - name: Dpendency for ubuntu
       run:  |
         sudo apt-get update
         bash ${{env.PATH_SCRIPTS}}/mapd-deps-ubuntu.sh --compress --nocuda
         source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
-
-    # - name: Build
-    #   run: |
-    #     mkdir build && cd build
-    #     cmake -DCMAKE_BUILD_TYPE=debug -DENABLE_CUDA=OFF -DENABLE_DBE=ON ..
-    #     make -j 8
 
     - name: Build 
       run: |

@@ -24,6 +24,11 @@ jobs:
         bash ${{env.PATH_SCRIPTS}}/mapd-deps-prebuilt.sh
         source ${{env.PREFIX_OMNISCIDB}}/mapd-deps.sh
     
+    - name: Dpendency for ubuntu
+      run: |
+        source ${{env.PATH_SCRIPTS}}/common-functions.sh
+        install_geos
+
     - name: Build
       run: |
         mkdir build && cd build

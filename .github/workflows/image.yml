@@ -15,9 +15,8 @@ jobs:
       run: |
         docker run -d --name cicd --privileged=true dockerfile-all:1.0 /usr/sbin/init
         docker exec -i cicd /bin/bash
+        hostname
 
-    - name: Check
-      run: hostname
 
 
   #   steps:

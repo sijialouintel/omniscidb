@@ -5,11 +5,7 @@ WORKDIR /
 
 SHELL ["/bin/bash", "-c"]
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    http_proxy="http://child-prc.intel.com:913/" \
-    https_proxy="http://child-prc.intel.com:913/" \
-    HTTP_PROXY="http://child-prc.intel.com:913/" \
-    HTTPS_PROXY="http://child-prc.intel.com:913/"
+ENV DEBIAN_FRONTEND=noninteractive
 
 COPY ./scripts /scripts-omniscidb
 # Only 4 files in omniscidb/scripts are needed:

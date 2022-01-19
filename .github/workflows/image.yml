@@ -1,0 +1,18 @@
+name: image
+
+on:
+  push:
+    branches: [ cicd ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: self-hosted
+    container: dockerfile-cicd
+    steps:
+        - name: Checkout Project
+          uses: actions/checkout@v1
+
+        - name: Check
+          run: ls

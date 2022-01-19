@@ -18,8 +18,8 @@ RUN cd /scripts-omniscidb && \
     sed -i 's/sudo //g' common-functions.sh && \
     sed -i 's/PREFIX=\/usr\/local\/mapd-deps/PREFIX=\/usr\/local/g' mapd-deps-ubuntu.sh && \
     apt-get update && \
-    source /usr/local/mapd-deps.sh && \
     ./mapd-deps-ubuntu.sh --compress --nocuda && \
+    source /usr/local/mapd-deps.sh && \
     rm -rf /var/lib/apt/lists/* && \
     cd / && \
     rm -rf scripts-omniscidb

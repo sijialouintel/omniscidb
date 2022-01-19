@@ -16,10 +16,10 @@ jobs:
         username: "vsr493"
         password: "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"
 
-    container: dockerfile-all:1.0
-    steps:
-    - name: Checkout Project
-      uses: actions/checkout@v2
+    # container: dockerfile-all:1.0
+    # steps:
+    # - name: Checkout Project
+    #   uses: actions/checkout@v2
 
-    - name: Check
-      run: ls
+    # - name: Check
+    #   run: ls

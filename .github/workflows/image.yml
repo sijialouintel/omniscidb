@@ -20,6 +20,7 @@ jobs:
     steps:
     - name: Checkout Project
       run: |
+        docker rm cicd
         docker run -d --name cicd --privileged=true dockerfile-all:1.0 /usr/sbin/init
         docker exec -t cicd /bin/bash
 

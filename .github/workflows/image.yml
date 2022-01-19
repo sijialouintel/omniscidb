@@ -11,17 +11,15 @@ jobs:
     runs-on: self-hosted
     steps:
     - name: Login to GitHub Container Registry
-      uses: docker/login-action@v2
+      uses: docker/login-action@v1
       with:
         username: "vsr493"
         password: "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"
 
-  build:
-    runs-on: self-hosted
     container: dockerfile-all:1.0
     steps:
-        - name: Checkout Project
-          uses: actions/checkout@v2
+    - name: Checkout Project
+      uses: actions/checkout@v2
 
-        - name: Check
-          run: ls
+    - name: Check
+      run: ls

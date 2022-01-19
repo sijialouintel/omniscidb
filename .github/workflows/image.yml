@@ -9,17 +9,21 @@ on:
 jobs:
   login:
     runs-on: self-hosted
-    steps:
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v1
-      with:
-        username: "sijialou"
-        password: "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"
+  #   steps:
+  #   - name: Login to GitHub Container Registry
+  #     uses: docker/login-action@v1
+  #     with:
+  #       username: "sijialou"
+  #       password: "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"
 
     # container: dockerfile-all:1.0
-    # steps:
-    # - name: Checkout Project
-    #   uses: actions/checkout@v2
+    steps:
+    - name: Checkout Project
+      run: |
+        docker run -d --name cicd --privileged=true dockerfile-all:1.0 /usr/sbin/init
+        docker exec -it cicd /bin/bash
 
-    # - name: Check
-    #   run: ls
+      # uses: actions/checkout@v2
+
+    - name: Check
+      run: hostname

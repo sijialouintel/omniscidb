@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     runs-on: self-hosted
-    container: dockerfile-cicd
+    container: dockerfile-all:1.0
     steps:
         - name: Checkout Project
           uses: actions/checkout@v1

@@ -1,0 +1,6 @@
+# action.yml
+name: 'build'
+description: 'build omnisci'
+runs:
+  using: 'docker'
+  image: 'Dockerfile'

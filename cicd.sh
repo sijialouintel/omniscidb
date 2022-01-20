@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+
+echo "here is the info: "
 mkdir build
 pwd
 cd build

@@ -81,9 +81,10 @@ mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
 
 echo "mkdir finished ***********************************************************************"
 pwd
+ls
 echo "ls finished ***********************************************************************"
 
-cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON ..
+cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON $PATH_REPO
 # cmake -Wno-dev \
 #     -DCMAKE_PREFIX_PATH=$PREFIX \
 #     -DCMAKE_INSTALL_PREFIX=$PREFIX/$INSTALL_BASE \
@@ -105,7 +106,8 @@ cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON ..
 #     ..
 
 echo "cmake finished ********************************************************************"
-
+ls
+echo "ls finished ********************************************************************"
 
 # VERBOSE=1 
 make -j ${CPU_COUNT:-`nproc`} || make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/4))

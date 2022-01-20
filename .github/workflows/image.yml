@@ -7,14 +7,30 @@ on:
     branches: [ master ]
 
 jobs:
-  login:
-    runs-on: ubuntu-20.04
+  test:
+    runs-on: self-hosted
 
     steps:
-    - name: Checkout Project
+    - uses: actions/checkout@v2
+    
+    - name: Build
       run: |
-        pwd
-        bash ${{github.workspace}}/sijia.sh
+        docker run -d --name cicd --privileged=true -v ${{github.workspace}}:/workspace/omniscidb dockerfile-all:1.0 ${{github.workspace}}/cicd.sh --rm
+
+    # - name: Test
+    #   working-directory: ${{github.workspace}}/build
+    #   run: ctest -C ${{env.BUILD_TYPE}}
+
+
+# jobs:
+#   login:
+#     runs-on: ubuntu-20.04
+
+#     steps:
+#     - name: Checkout Project
+#       run: |
+#         pwd
+#         bash ${{github.workspace}}/sijia.sh
 
 # docker rm cicd
 # docker run -d --name cicd --privileged=true dockerfile-all:1.0 /usr/sbin/init

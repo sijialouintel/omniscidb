@@ -77,12 +77,10 @@ echo "source finished **********************************************************
 # echo "export finished ***********************************************************************"
 
 # rm -rf build-$BUILD_TYPE
-mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
+# mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
 
 echo "mkdir finished ***********************************************************************"
 pwd
-cmake --build build --target all --config Release -- -j4 
-
 echo "ls finished ***********************************************************************"
 
 cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON ..

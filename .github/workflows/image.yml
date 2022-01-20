@@ -21,6 +21,7 @@ jobs:
       run: |
         docker stop cicd
         docker rm cicd
+        rm -rf ${{github.workspace}}.m2
         mkdir -p ${{github.workspace}}.m2/repository
         docker run -d --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -v ${{github.workspace}}/.m2/repository:/root/.m2/repository -w /${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 bash cicd.sh
         docker logs cicd

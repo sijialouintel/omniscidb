@@ -82,15 +82,14 @@ cmake -Wno-dev \
     -DENABLE_JAVA_REMOTE_DEBUG=off \
     -DENABLE_PROFILER=off \
     -DPREFER_STATIC_LIBS=off \
-    -DENABLE_CUDA=off \  #
-    -DENABLE_DBE=ON \   #
+    -DENABLE_CUDA=off \
+    -DENABLE_DBE=ON \
     -DENABLE_FSI=ON \
     -DENABLE_ITT=OFF \
     -DENABLE_JIT_DEBUG=OFF \
     -DENABLE_INTEL_JIT_LISTENER=OFF \
     -DPREFER_STATIC_LIBS=OFF \
-    $EXTRA_CMAKE_OPTIONS \
-    ..
+    $EXTRA_CMAKE_OPTIONS ..
 
 # VERBOSE=1 
 make -j ${CPU_COUNT:-`nproc`} || make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/4))

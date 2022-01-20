@@ -4,7 +4,7 @@
 # pwd
 # cd build
 # pwd
-
+cmake --version
 export PATH_REPO=/workspace/omniscidb
 
 source ./scripts/omnisci-env.sh

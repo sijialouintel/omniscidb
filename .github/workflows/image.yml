@@ -19,22 +19,23 @@ jobs:
     
     - name: Build
       run: |
-# docker rm cicd
         docker run -d --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -w /${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 bash cicd.sh
         docker logs cicd
         echo "******************************************************************"
         echo "outside info:"
         ls ${{github.workspace}}
+
+    - name: Cleanup
+      run: |
+        docker stop cicd
+        docker rm cicd
+        
 # ls ${{github.workspace}}/build-${{env.BUILD_TYPE}}
         
 # - name: Test
 #   working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
 #   run: ctest -C ${{env.BUILD_TYPE}}
     
-    - name: Cleanup
-      run: |
-        docker stop cicd
-        docker rm cicd
 # jobs:
 #   login:
 #     runs-on: ubuntu-20.04

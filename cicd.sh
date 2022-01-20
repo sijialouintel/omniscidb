@@ -83,25 +83,26 @@ echo "mkdir finished ***********************************************************
 pwd
 echo "ls finished ***********************************************************************"
 
-cmake -Wno-dev \
-    -DCMAKE_PREFIX_PATH=$PREFIX \
-    -DCMAKE_INSTALL_PREFIX=$PREFIX/$INSTALL_BASE \
-    -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
-    -DMAPD_DOCS_DOWNLOAD=off \
-    -DENABLE_AWS_S3=off \
-    -DENABLE_FOLLY=off \
-    -DENABLE_JAVA_REMOTE_DEBUG=off \
-    -DENABLE_PROFILER=off \
-    -DPREFER_STATIC_LIBS=off \
-    -DENABLE_CUDA=off \
-    -DENABLE_DBE=ON \
-    -DENABLE_FSI=ON \
-    -DENABLE_ITT=OFF \
-    -DENABLE_JIT_DEBUG=OFF \
-    -DENABLE_INTEL_JIT_LISTENER=OFF \
-    -DPREFER_STATIC_LIBS=OFF \
-    $EXTRA_CMAKE_OPTIONS \
-    ..
+cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON ..
+# cmake -Wno-dev \
+#     -DCMAKE_PREFIX_PATH=$PREFIX \
+#     -DCMAKE_INSTALL_PREFIX=$PREFIX/$INSTALL_BASE \
+#     -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+#     -DMAPD_DOCS_DOWNLOAD=off \
+#     -DENABLE_AWS_S3=off \
+#     -DENABLE_FOLLY=off \
+#     -DENABLE_JAVA_REMOTE_DEBUG=off \
+#     -DENABLE_PROFILER=off \
+#     -DPREFER_STATIC_LIBS=off \
+#     -DENABLE_CUDA=off \
+#     -DENABLE_DBE=ON \
+#     -DENABLE_FSI=ON \
+#     -DENABLE_ITT=OFF \
+#     -DENABLE_JIT_DEBUG=OFF \
+#     -DENABLE_INTEL_JIT_LISTENER=OFF \
+#     -DPREFER_STATIC_LIBS=OFF \
+#     $EXTRA_CMAKE_OPTIONS \
+#     ..
 
 echo "cmake finished ********************************************************************"
 

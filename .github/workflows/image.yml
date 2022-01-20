@@ -26,12 +26,12 @@ jobs:
         docker stop cicd
         docker rm cicd
         docker run -d -t --name cicd --privileged=true -v ${{github.workspace}}:/omniscidb dockerfile-all:1.0 /omniscidb/cicd.sh
-        pwd
-        ls
+    # pwd
+    # ls
 
-    - name: Test
-      working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
-      run: ctest -C ${{env.BUILD_TYPE}}
+    # - name: Test
+    #   working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
+    #   run: ctest -C ${{env.BUILD_TYPE}}
 
 
 # jobs:

@@ -81,11 +81,11 @@ mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
 
 echo "mkdir finished ***********************************************************************"
 pwd
-cmake ..
+cmake --build build --target all --config Release -- -j4 
 
 echo "ls finished ***********************************************************************"
 
-cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON $PATH_REPO
+cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON ..
 # cmake -Wno-dev \
 #     -DCMAKE_PREFIX_PATH=$PREFIX \
 #     -DCMAKE_INSTALL_PREFIX=$PREFIX/$INSTALL_BASE \

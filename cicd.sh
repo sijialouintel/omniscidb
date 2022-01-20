@@ -80,7 +80,7 @@ echo "export finished **********************************************************
 mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
 
 echo "mkdir finished ***********************************************************************"
-ls
+pwd
 echo "ls finished ***********************************************************************"
 
 cmake -Wno-dev \

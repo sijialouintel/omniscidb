@@ -13,7 +13,7 @@ jobs:
     steps:
     - name: Checkout Project
       run: |
-        ls
+        pwd
         bash ${{github.workspace}}/sijia.sh
 
 # docker rm cicd

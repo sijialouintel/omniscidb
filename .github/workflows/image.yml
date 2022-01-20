@@ -12,14 +12,7 @@ jobs:
 
     steps:
     - name: Checkout Project
-      run: |
-        pwd
-        mkdir sijia-test1
-        pwd
-        cd sijia-test1
-        pwd
-        mkdir sijia-test2 && cd sijia-test2 && pwd
-        pwd
+      run: bash sijia.sh
 
 # docker rm cicd
 # docker run -d --name cicd --privileged=true dockerfile-all:1.0 /usr/sbin/init

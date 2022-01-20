@@ -8,7 +8,6 @@ cmake --version
 export PATH_REPO=/workspace/omniscidb
 
 source ./scripts/omnisci-env.sh
-ls
 echo "source finished ***********************************************************************"
 
 # export EXTRA_CMAKE_OPTIONS=""
@@ -83,7 +82,7 @@ echo "mkdir finished ***********************************************************
 pwd
 echo "ls finished ***********************************************************************"
 
-cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON ..
+cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON .
 # cmake -Wno-dev \
 #     -DCMAKE_PREFIX_PATH=$PREFIX \
 #     -DCMAKE_INSTALL_PREFIX=$PREFIX/$INSTALL_BASE \

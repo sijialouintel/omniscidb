@@ -12,16 +12,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
-    - name: Checkout Project
-      run: |
-        pwd
-        ls
-        bash ${{github.workspace}}/sijia.sh
+    # - name: Checkout Project
+    #   run: |
+    #     pwd
+    #     ls
+    #     bash ${{github.workspace}}/sijia.sh
 
     
-    # - name: Build
-    #   run: |
-    #     docker run -d --name cicd --privileged=true -v ${{github.workspace}}:/workspace/omniscidb dockerfile-all:1.0 /workspace/cicd.sh --rm
+    - name: Build
+      run: |
+        docker run -d --name cicd --privileged=true -v ${{github.workspace}}:/workspace/omniscidb dockerfile-all:1.0 /workspace/omniscidb/cicd.sh --rm
 
     # - name: Test
     #   working-directory: ${{github.workspace}}/build

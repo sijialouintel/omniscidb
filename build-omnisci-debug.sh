@@ -67,7 +67,7 @@ RECIPE_DIR=${RECIPE_DIR:-${this_dir}}
 export CPLUS_INCLUDE_PATH=$(get_cxx_include_path):$CPLUS_INCLUDE_PATH
 
 # generate ~/.m2/settings.xml if proxy are set and there are no settings
-[ -f ~/.m2/settings.xml -o -z "$http_proxy" ] || python ${RECIPE_DIR}/make-m2-proxy.py
+[ -f ~/.m2/settings.xml -o -z "$http_proxy" ] || python3 ${RECIPE_DIR}/make-m2-proxy.py
 
 rm -rf build-$BUILD_TYPE
 mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE

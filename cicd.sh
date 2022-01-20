@@ -1,4 +1,4 @@
-export PATH_REPO=/workspace/omniscidb
+export PATH_REPO=/omniscidb
 export PATH_SCRIPTS=$PATH_REPO/scripts
 source $PATH_SCRIPTS/omnisci-env.sh
 bash  $PATH_REPO/build-omnisci-debug.sh

@@ -29,7 +29,7 @@ jobs:
         ls
 
     - name: Test
-      working-directory: ${{github.workspace}}/build-${{env.BBUILD_TYPE}}
+      working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
       run: ctest -C ${{env.BUILD_TYPE}}
 
 

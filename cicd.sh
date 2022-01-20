@@ -76,13 +76,14 @@ echo "source finished **********************************************************
 # echo "export finished ***********************************************************************"
 
 # rm -rf build-$BUILD_TYPE
-# mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
+mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
 
 echo "mkdir finished ***********************************************************************"
 pwd
+ls
 echo "ls finished ***********************************************************************"
 
-cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON .
+cmake -DENABLE_CUDA=OFF -DENABLE_DBE=ON ..
 # cmake -Wno-dev \
 #     -DCMAKE_PREFIX_PATH=$PREFIX \
 #     -DCMAKE_INSTALL_PREFIX=$PREFIX/$INSTALL_BASE \

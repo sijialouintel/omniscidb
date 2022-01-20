@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ master ]
 
+env:
+  BUILD_TYPE: Debug
+
 jobs:
   test:
     runs-on: self-hosted
@@ -22,8 +25,11 @@ jobs:
       run: |
         docker rm cicd
         docker run -d --name cicd --privileged=true -v ${{github.workspace}}:/omniscidb dockerfile-all:1.0 /omniscidb/cicd.sh
+        pwd
+        ls
+
     - name: Test
-      working-directory: ${{github.workspace}}/build-$BUILD_TYPE
+      working-directory: ${{github.workspace}}/build-${{env.BBUILD_TYPE}}
       run: ctest -C ${{env.BUILD_TYPE}}
 
 

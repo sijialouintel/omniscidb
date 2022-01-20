@@ -70,5 +70,4 @@ jobs:
     # container: dockerfile-all:1.0
 
 # uses: actions/checkout@v2
-
 # docker run -it --name cicd --privileged=true -v /test_cicd/omniscidb:/workspace/omniscidb -v /test_cicd/.m2/repository:/root/.m2/repository -w /workspace/omniscidb dockerfile-all:1.0 bash

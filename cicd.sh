@@ -9,6 +9,8 @@ export PATH_REPO=/workspace/omniscidb
 
 source ./scripts/omnisci-env.sh
 
+echo "source finished ***********************************************************************"
+
 export EXTRA_CMAKE_OPTIONS=""
 
 # Make sure -fPIC is not in CXXFLAGS (that some conda packages may
@@ -72,8 +74,14 @@ export CPLUS_INCLUDE_PATH=$(get_cxx_include_path):$CPLUS_INCLUDE_PATH
 # generate ~/.m2/settings.xml if proxy are set and there are no settings
 [ -f ~/.m2/settings.xml -o -z "$http_proxy" ] || python ${RECIPE_DIR}/make-m2-proxy.py
 
-rm -rf build-$BUILD_TYPE
+echo "export finished ***********************************************************************"
+
+# rm -rf build-$BUILD_TYPE
 mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
+
+echo "mkdir finished ***********************************************************************"
+ls
+echo "ls finished ***********************************************************************"
 
 cmake -Wno-dev \
     -DCMAKE_PREFIX_PATH=$PREFIX \

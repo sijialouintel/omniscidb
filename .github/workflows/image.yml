@@ -26,7 +26,7 @@ jobs:
         docker stop cicd
         docker rm cicd
         echo ${{github.workspace}}
-        docker run -d -t --name cicd --privileged=true -v ${{github.workspace}}:/omniscidb dockerfile-all:1.0 /omniscidb/cicd.sh
+        docker run -d -t --name cicd --privileged=true -v ${{github.workspace}}:/omniscidb dockerfile-all:1.0  bash /omniscidb/cicd.sh
         echo "outside info: "
         pwd
         ls

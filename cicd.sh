@@ -8,73 +8,73 @@
 export PATH_REPO=/workspace/omniscidb
 
 source ./scripts/omnisci-env.sh
-
+env
 echo "source finished ***********************************************************************"
 
-export EXTRA_CMAKE_OPTIONS=""
+# export EXTRA_CMAKE_OPTIONS=""
 
-# Make sure -fPIC is not in CXXFLAGS (that some conda packages may
-# add), otherwise omniscidb server will crash when executing generated
-# machine code:
-export CXXFLAGS="`echo $CXXFLAGS | sed 's/-fPIC//'`"
+# # Make sure -fPIC is not in CXXFLAGS (that some conda packages may
+# # add), otherwise omniscidb server will crash when executing generated
+# # machine code:
+# export CXXFLAGS="`echo $CXXFLAGS | sed 's/-fPIC//'`"
 
-# Fixes https://github.com/Quansight/pearu-sandbox/issues/7
-#       https://github.com/omnisci/omniscidb/issues/374
-export CXXFLAGS="$CXXFLAGS -Dsecure_getenv=getenv"
+# # Fixes https://github.com/Quansight/pearu-sandbox/issues/7
+# #       https://github.com/omnisci/omniscidb/issues/374
+# export CXXFLAGS="$CXXFLAGS -Dsecure_getenv=getenv"
 
-# Fixes `error: expected ')' before 'PRIxPTR'`
-export CXXFLAGS="$CXXFLAGS -D__STDC_FORMAT_MACROS"
+# # Fixes `error: expected ')' before 'PRIxPTR'`
+# export CXXFLAGS="$CXXFLAGS -D__STDC_FORMAT_MACROS"
 
-# Remove --as-needed to resolve undefined reference to `__vdso_clock_gettime@GLIBC_PRIVATE'
-export LDFLAGS="`echo $LDFLAGS | sed 's/-Wl,--as-needed//'`"
+# # Remove --as-needed to resolve undefined reference to `__vdso_clock_gettime@GLIBC_PRIVATE'
+# export LDFLAGS="`echo $LDFLAGS | sed 's/-Wl,--as-needed//'`"
 
-export CC=gcc
-export CXX=g++
-export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX}"
+# export CC=gcc
+# export CXX=g++
+# export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX}"
 
-# Run tests labels:
-#   0 - disable building and running sanity tests
-#   1 - build and run the sanity tests
-#   2 - detect if sanity tests can be run, then set 1, otherwise set 0
-#
-# Ideally, this should 2, but to save disk space, running sanity tests
-# will be disabled:
-export RUN_TESTS=${RUN_TESTS:-2}
+# # Run tests labels:
+# #   0 - disable building and running sanity tests
+# #   1 - build and run the sanity tests
+# #   2 - detect if sanity tests can be run, then set 1, otherwise set 0
+# #
+# # Ideally, this should 2, but to save disk space, running sanity tests
+# # will be disabled:
+# export RUN_TESTS=${RUN_TESTS:-2}
 
-export INSTALL_BASE=. # was opt/omnisci-cpu
+# export INSTALL_BASE=. # was opt/omnisci-cpu
 
-if [[ "$RUN_TESTS" == "0" ]]
-then
-   export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DENABLE_TESTS=off"
-else
-   export RUN_TESTS=1
-   export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DENABLE_TESTS=on"
-fi
+# if [[ "$RUN_TESTS" == "0" ]]
+# then
+#    export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DENABLE_TESTS=off"
+# else
+#    export RUN_TESTS=1
+#    export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DENABLE_TESTS=on"
+# fi
 
-export CMAKE_BUILD_TYPE=Debug
-if [[ "$CMAKE_BUILD_TYPE" ]]
-then
-    export BUILD_TYPE="$CMAKE_BUILD_TYPE"
-else
-    export BUILD_TYPE="Release"
-fi
+# export CMAKE_BUILD_TYPE=Debug
+# if [[ "$CMAKE_BUILD_TYPE" ]]
+# then
+#     export BUILD_TYPE="$CMAKE_BUILD_TYPE"
+# else
+#     export BUILD_TYPE="Release"
+# fi
 
-export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DBoost_NO_BOOST_CMAKE=on"
+# export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DBoost_NO_BOOST_CMAKE=on"
 
-this_dir=`dirname $(readlink -f $0)`/scripts/conda
-echo $this_dir
-RECIPE_DIR=${RECIPE_DIR:-${this_dir}}
+# this_dir=`dirname $(readlink -f $0)`/scripts/conda
+# echo $this_dir
+# RECIPE_DIR=${RECIPE_DIR:-${this_dir}}
 
-# Omnisci UDF support uses CLangTool for parsing Load-time UDF C++
-# code to AST. If the C++ code uses C++ std headers, we need to
-# specify the locations of include directories:
-. ${RECIPE_DIR}/get_cxx_include_path.sh
-export CPLUS_INCLUDE_PATH=$(get_cxx_include_path):$CPLUS_INCLUDE_PATH
+# # Omnisci UDF support uses CLangTool for parsing Load-time UDF C++
+# # code to AST. If the C++ code uses C++ std headers, we need to
+# # specify the locations of include directories:
+# . ${RECIPE_DIR}/get_cxx_include_path.sh
+# export CPLUS_INCLUDE_PATH=$(get_cxx_include_path):$CPLUS_INCLUDE_PATH
 
-# generate ~/.m2/settings.xml if proxy are set and there are no settings
-[ -f ~/.m2/settings.xml -o -z "$http_proxy" ] || python ${RECIPE_DIR}/make-m2-proxy.py
+# # generate ~/.m2/settings.xml if proxy are set and there are no settings
+# [ -f ~/.m2/settings.xml -o -z "$http_proxy" ] || python ${RECIPE_DIR}/make-m2-proxy.py
 
-echo "export finished ***********************************************************************"
+# echo "export finished ***********************************************************************"
 
 # rm -rf build-$BUILD_TYPE
 mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE

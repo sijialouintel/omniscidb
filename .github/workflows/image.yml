@@ -20,7 +20,6 @@ jobs:
     #     pwd
     #     ls
     #     bash ${{github.workspace}}/sijia.sh
-
     - name: Build
       run: |
         docker run -d --name cicd --privileged=true -v ${{github.workspace}}:/omniscidb -w /omniscidb dockerfile-all:1.0 bash cicd.sh

@@ -12,7 +12,9 @@ jobs:
 
     steps:
     - name: Checkout Project
-      run: bash ${{github.workspace}}/sijia.sh
+      run: |
+        ls
+        bash ${{github.workspace}}/sijia.sh
 
 # docker rm cicd
 # docker run -d --name cicd --privileged=true dockerfile-all:1.0 /usr/sbin/init

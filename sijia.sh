@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+ls
 pwd
 mkdir sijia-test1
 pwd

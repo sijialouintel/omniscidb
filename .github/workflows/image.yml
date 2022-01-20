@@ -20,7 +20,7 @@ jobs:
     - name: Build
       run: |
         docker rm cicd
-        docker run -d --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -w / dockerfile-all:1.0 bash ${{env.OMNISCIDB_PATH_DOCKER}}/cicd.sh
+        docker run -d --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -w /${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 bash cicd.sh
         docker logs cicd
         echo "******************************************************************"
         echo "outside info: "

@@ -23,7 +23,7 @@ jobs:
         docker rm cicd
         rm -rf ${{github.workspace}}.m2
         mkdir -p ${{github.workspace}}.m2/repository
-        docker run -it --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -v ${{github.workspace}}/.m2/repository:/root/.m2/repository -w ${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 bash cicd.sh
+        docker run -d --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -v ${{github.workspace}}/.m2/repository:/root/.m2/repository -w ${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 bash cicd.sh
         docker logs cicd
 #         bash ./scripts/omnisci-env.sh && bash ./build-omnisci-debug.sh
     # - name: Cleanup

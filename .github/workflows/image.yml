@@ -20,11 +20,10 @@ jobs:
 
     - name: Build
       run: |
-        docker run -d --name cicd --privileged=true -v ${{github.workspace}}:/workspace/omniscidb dockerfile-all:1.0 /workspace/omniscidb/cicd.sh --rm
-
-    # - name: Test
-    #   working-directory: ${{github.workspace}}/build
-    #   run: ctest -C ${{env.BUILD_TYPE}}
+        docker run -d --name cicd --privileged=true -v ${{github.workspace}}:/omniscidb dockerfile-all:1.0 /omniscidb/cicd.sh
+    - name: Test
+      working-directory: ${{github.workspace}}/build-$BUILD_TYPE
+      run: ctest -C ${{env.BUILD_TYPE}}
 
 
 # jobs:

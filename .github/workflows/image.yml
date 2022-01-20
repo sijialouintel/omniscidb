@@ -22,6 +22,7 @@ jobs:
     #     bash ${{github.workspace}}/sijia.sh
     - name: Build
       run: |
+        docker rm cicd
         docker run -d --name cicd --privileged=true -v ${{github.workspace}}:/workspace/omniscidb -w / dockerfile-all:1.0 bash cicd.sh
         docker logs cicd
         echo "******************************************************************"

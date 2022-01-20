@@ -28,14 +28,15 @@ jobs:
         echo "******************************************************************"
         echo "outside info: "
         ls ${{github.workspace}}/build-${{env.BUILD_TYPE}}
-        docker stop cicd
-        docker rm cicd
-
+        
     - name: Test
       working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
       run: ctest -C ${{env.BUILD_TYPE}}
-
-
+    
+    - name: Cleanup
+      run: |
+        docker stop cicd
+        docker rm cicd
 # jobs:
 #   login:
 #     runs-on: ubuntu-20.04

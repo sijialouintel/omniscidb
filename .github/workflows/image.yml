@@ -16,11 +16,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
-    # - name: Checkout Project
-    #   run: |
-    #     pwd
-    #     ls
-    #     bash ${{github.workspace}}/sijia.sh
+    
     - name: Build
       run: |
         docker rm cicd

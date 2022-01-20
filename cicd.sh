@@ -81,7 +81,8 @@ mkdir -p build-$BUILD_TYPE && cd build-$BUILD_TYPE
 
 echo "mkdir finished ***********************************************************************"
 pwd
-ls
+cmake ..
+
 echo "ls finished ***********************************************************************"
 
 cmake -DENABLE_CUDA=ON -DENABLE_DBE=ON $PATH_REPO

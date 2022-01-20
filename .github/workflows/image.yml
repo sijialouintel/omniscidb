@@ -52,6 +52,5 @@ jobs:
   #       password: "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"
 
     # container: dockerfile-all:1.0
-    
-# 
+
 # uses: actions/checkout@v2

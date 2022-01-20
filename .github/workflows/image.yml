@@ -8,16 +8,23 @@ on:
 
 jobs:
   login:
-    runs-on: self-hosted
+    runs-on: ubuntu-20.04
 
     steps:
     - name: Checkout Project
       run: |
-        docker stop cicd
-        docker rm cicd
-        docker run -d --name cicd --privileged=true dockerfile-all:1.0 /usr/sbin/init
-        docker exec -i cicd /bin/bash
-        hostname
+        pwd
+        mkdir sijia-test1
+        pwd
+        cd sijia-test1
+        pwd
+        mkdir sijia-test2 && cd sijia-test2 && pwd
+        pwd
+
+# docker rm cicd
+# docker run -d --name cicd --privileged=true dockerfile-all:1.0 /usr/sbin/init
+# docker exec -i cicd /bin/bash
+# hostname
 
 
 

@@ -24,11 +24,12 @@ jobs:
         docker logs cicd
         echo "******************************************************************"
         echo "outside info: "
-        ls ${{github.workspace}}/build-${{env.BUILD_TYPE}}
+        ls ${{github.workspace}}/AAA
+    # ls ${{github.workspace}}/build-${{env.BUILD_TYPE}}
         
-    - name: Test
-      working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
-      run: ctest -C ${{env.BUILD_TYPE}}
+    # - name: Test
+    #   working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
+    #   run: ctest -C ${{env.BUILD_TYPE}}
     
     - name: Cleanup
       run: |

@@ -8,7 +8,7 @@ cmake --version
 export PATH_REPO=/workspace/omniscidb
 
 source ./scripts/omnisci-env.sh
-env
+ls
 echo "source finished ***********************************************************************"
 
 # export EXTRA_CMAKE_OPTIONS=""

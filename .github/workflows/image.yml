@@ -27,7 +27,7 @@ jobs:
         mkdir -p ${{env.REPOSITORY_PATH}}
         docker run -d -t --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -v ${{env.REPOSITORY_PATH}}:${{env.REPOSITORY_PATH_DOCKER}} -w ${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 /bin/bash
         docker logs cicd
-        source ./scripts/omnisci-env.sh
+        bash ./scripts/omnisci-env.sh
         bash ./build-omnisci-debug.sh
 
     - name: Test

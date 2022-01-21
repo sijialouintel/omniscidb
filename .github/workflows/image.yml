@@ -25,14 +25,14 @@ jobs:
         docker rm cicd
         rm -rf ${{env.REPOSITORY_PATH}}
         mkdir -p ${{env.REPOSITORY_PATH}}
-        docker run -t --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -v ${{env.REPOSITORY_PATH}}:${{env.REPOSITORY_PATH_DOCKER}} -w ${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 bash cicd.sh
-        docker logs cicd
+        docker run -t --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -v ${{env.REPOSITORY_PATH}}:${{env.REPOSITORY_PATH_DOCKER}} -w ${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 /bin/bash
+# docker logs cicd
 
-    - name: Test
-      working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
-      run: ctest -C ${{env.BUILD_TYPE}}    
+    # - name: Test
+    #   working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
+    #   run: ctest -C ${{env.BUILD_TYPE}}    
 
-
+# cicd.sh
 
     #     docker stop cicd
     #     docker rm cicd

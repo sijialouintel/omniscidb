@@ -19,6 +19,7 @@ jobs:
     
     - name: Build
       run: |
+        docker stop cicd
         docker rm cicd
         hostname
         docker ps

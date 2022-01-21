@@ -28,6 +28,8 @@ jobs:
         ls
         docker ps
         hostname
+        echo ${{github.workspace}}
+        ls ${{github.workspace}}
 
 
 

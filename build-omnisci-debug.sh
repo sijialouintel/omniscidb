@@ -92,10 +92,10 @@ cmake -Wno-dev \
     -DPREFER_STATIC_LIBS=OFF \
     $EXTRA_CMAKE_OPTIONS ..
 
-# VERBOSE=1 
 # make -j ${CPU_COUNT:-`nproc`} || 
-make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/4))
+VERBOSE=1 make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/4))
 return_value=echo $?
+echo $return_value
 if return_value
 then
     exit -1

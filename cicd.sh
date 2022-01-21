@@ -1,5 +1,7 @@
 #!/bin/sh
 set -x
-bash ./scripts/omnisci-env.sh
+source ./scripts/omnisci-env.sh
 bash ./build-omnisci-debug.sh
+
+echo "inside********************************************************************"
 ctest -C Debug

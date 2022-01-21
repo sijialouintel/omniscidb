@@ -19,6 +19,7 @@ jobs:
     
     - name: Build
       run: |
+        docker rm cicd
         hostname
         docker ps
         docker run -d -t --name cicd --privileged=true dockerfile-all:1.0 /bin/bash 

@@ -104,7 +104,7 @@ cmake -Wno-dev \
     ..
 
 # VERBOSE=1 
-make -j ${CPU_COUNT:-`nproc`} || make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/4))
+make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/2))
 
 if [[ "$RUN_TESTS" == "2" ]]
 then

@@ -21,12 +21,12 @@ jobs:
     
     - name: Build
       run: |
-        docker stop cicd
-        docker rm cicd
         rm -rf ${{env.REPOSITORY_PATH}}
         mkdir -p ${{env.REPOSITORY_PATH}}
         docker run -d -t -p 9901:22 --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -v ${{env.REPOSITORY_PATH}}:${{env.REPOSITORY_PATH_DOCKER}} -v /workspace/authorized_keys:/root/.ssh/authorized_keys -v /root/.vscode-server:/root/.vscode-server dockerfile-all:1.0 /usr/sbin/init 
 
+# docker stop cicd
+# docker rm cicd
 # docker run -d -t -p 9901:22 --name cicd --privileged=true -v ${{github.workspace}}:${{env.OMNISCIDB_PATH_DOCKER}} -v ${{env.REPOSITORY_PATH}}:${{env.REPOSITORY_PATH_DOCKER}} -w ${{env.OMNISCIDB_PATH_DOCKER}} dockerfile-all:1.0 /bin/bash
 # docker logs cicd
 

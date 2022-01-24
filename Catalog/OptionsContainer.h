@@ -80,7 +80,7 @@ struct OptionsContainer {
   void populateOptionsMap(const std::string& options_json, bool clear = false) {
     CHECK(!options_json.empty());
     rapidjson::Document options;
-    options.Parse(options_json);
+    options.Parse(options_json.c_str());
     populateOptionsMap(options);
   }
 

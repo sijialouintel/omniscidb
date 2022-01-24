@@ -33,7 +33,6 @@ add_executable(CachingFileMgrTest CachingFileMgrTest.cpp)
 add_executable(JSONTest JSONTest.cpp)
 add_executable(DataRecyclerTest DataRecyclerTest.cpp)
 add_executable(DataMgrTest DataMgrTest.cpp)
-add_executable(VeloxFunctionTest VeloxFunctionTest.cpp)
 
 if(ENABLE_CUDA)
   message(DEBUG "Tests CUDA_COMPILATION_ARCH: ${CUDA_COMPILATION_ARCH}")
@@ -153,7 +152,6 @@ target_link_libraries(UpdateMetadataTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(StoragePerfTest gtest ${EXECUTE_TEST_LIBS})
 target_link_libraries(TopKTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(OmniSQLCommandTest gtest ${Boost_LIBRARIES} mapd_thrift)
-target_link_libraries(VeloxFunctionTest ${EXECUTE_TEST_LIBS})
 
 if(ENABLE_SYSTEM_TFS)
   target_link_libraries(SystemTableFunctionsTest ${EXECUTE_TEST_LIBS})
@@ -309,7 +307,6 @@ add_test(DataRecyclerTest DataRecyclerTest ${TEST_ARGS})
 add_test(LoadTableTest LoadTableTest ${TEST_ARGS})
 add_test(JSONTest JSONTest ${TEST_ARGS})
 add_test(DataMgrTest DataMgrTest ${TEST_ARGS})
-add_test(VeloxFunctionTest VeloxFunctionTest ${TEST_ARGS})
 
 if(ENABLE_SYSTEM_TFS)
   add_test(SystemTableFunctionsTest SystemTableFunctionsTest ${TEST_ARGS})
@@ -419,7 +416,6 @@ set(TEST_PROGRAMS
   DataMgrTest
   CodeGenIRTest
   CompileWorkUnitTest
-  VeloxFunctionTest
 )
 
 if (ENABLE_SYSTEM_TFS)

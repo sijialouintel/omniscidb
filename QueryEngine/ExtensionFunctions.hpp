@@ -13,9 +13,6 @@
 
 #include "OmniSciTypes.h"
 
-#include "velox/functions/Registerer.h"
-#include "velox/functions/prestosql/Arithmetic.h"
-
 /* Example extension functions:
  *
  * EXTENSION_NOINLINE
@@ -1125,15 +1122,6 @@ EXTENSION_NOINLINE bool is_point_size_in_merc_view(const double lon,
   const double londiff = (2.0 * asinf(t1 / t2)) / const1;
   return !(lon + londiff < min_lon || lon - londiff > max_lon ||
            lat + latdiff < min_lat || lat - latdiff > max_lat);
-}
-
-EXTENSION_INLINE
-double Cbrt(const double x) {
-  using funcClass = typename facebook::velox::functions::udf_cbrt::template udf<facebook::velox::exec::VectorExec>;
-  funcClass instance;
-  double r = 0.0;
-  instance.call(r, x);
-  return r;
 }
 
 #include "ExtensionFunctionsArray.hpp"

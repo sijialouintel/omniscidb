@@ -532,7 +532,7 @@ endif()
 
 
 # Boost
-find_package(Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale iostreams context REQUIRED)
+find_package(Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale iostreams REQUIRED)
 include_directories(${Boost_INCLUDE_DIR})
 
 # Allow explicit include statements to access third party headers directly.

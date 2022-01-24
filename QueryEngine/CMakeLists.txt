@@ -308,18 +308,7 @@ set(QUERY_ENGINE_LIBS
   ${Arrow_LIBRARIES}
 )
 
-find_library(GLOG glog)
-find_package(gflags COMPONENTS shared)
-find_library(FMT fmt)
-find_library(EVENT event)
-find_package(folly REQUIRED)
-set(FOLLY_WITH_DEPENDENCIES
-    ${FOLLY_LIBRARIES}
-    ${FMT}
-    ${GFLAGS_LIBRARIES}
-    ${GLOG_LIBRARIES}
-    ${EVENT})
-list(APPEND QUERY_ENGINE_LIBS ${llvm_libs} ${ZLIB_LIBRARIES} ${FOLLY_WITH_DEPENDENCIES})
+list(APPEND QUERY_ENGINE_LIBS ${llvm_libs} ${ZLIB_LIBRARIES})
 
 target_link_libraries(QueryEngine ${QUERY_ENGINE_LIBS})
 

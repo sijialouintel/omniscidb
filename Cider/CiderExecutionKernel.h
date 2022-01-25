@@ -48,7 +48,8 @@ class CiderExecutionKernel {
 
  protected:
   CiderExecutionKernel(){};
-  CiderExecutionKernel(const CiderExecutionKernel&) = delete;
+  CiderExecutionKernel(const 
+   CiderExecutionKernel&) = delete;
   CiderExecutionKernel& operator=(const CiderExecutionKernel&) = delete;
 };
 

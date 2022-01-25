@@ -1,4 +1,8 @@
-on: [ pull_request ]
+on:
+  push:
+    branches: [ cider-pr ]
+  pull_request:
+    branches: [ cider-pr ]
 
 jobs:
   cpp_style_check:

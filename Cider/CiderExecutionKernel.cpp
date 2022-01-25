@@ -128,7 +128,7 @@ void CiderExecutionKernelImpl::runWithData(const int8_t** col_buffers,
   const int8_t*** multi_col_buffers = (const int8_t***)std::malloc(sizeof(int8_t**) * 1);
   multi_col_buffers[0] = col_buffers;
   runWithDataMultiFrag((const int8_t***)multi_col_buffers,
-                       num_rows,
+  num_rows,
                        out,
                        matched_num,
                        err_code,
@@ -144,14 +144,14 @@ void CiderExecutionKernelImpl::compileWorkUnit(
   ExecutionOptions eo = ExecutionOptions::defaults();
   // TODO: remove.
   eo.output_columnar_hint = 0;
-  CudaMgr_Namespace::CudaMgr* cuda_mgr = nullptr;
+   CudaMgr_Namespace::CudaMgr* cuda_mgr = nullptr;
   bool allow_lazy_fetch{false};
   std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner = nullptr;
   size_t max_groups_buffer_entry_guess{0};
   int8_t crt_min_byte_width{MAX_BYTE_WIDTH_SUPPORTED};
   bool has_cardinality_estimation{false};
   ColumnCacheMap column_cache;
-  RenderInfo* render_info = nullptr;
+  RenderInfo* render_info  = nullptr;
 
   CompilationResult compilation_result;
   std::unique_ptr<QueryMemoryDescriptor> query_mem_desc;
@@ -162,7 +162,7 @@ void CiderExecutionKernelImpl::compileWorkUnit(
                                  ra_exe_unit,
                                  co,
                                  eo,
-                                 cuda_mgr,
+                                cuda_mgr,
                                  allow_lazy_fetch,
                                  row_set_mem_owner,
                                  max_groups_buffer_entry_guess,
@@ -217,6 +217,7 @@ std::shared_ptr<CiderExecutionKernel> CiderExecutionKernel::create() {
 }
 
 std::string CiderExecutionKernel::getLlvmIR() {
-  CiderExecutionKernelImpl* kernel = getImpl(this);
-  return kernel->getLlvmIR();
+  CiderExecutionKernelImpl* kernel = getImpl(this) ;
+  return 
+  kernel->getLlvmIR();
 }

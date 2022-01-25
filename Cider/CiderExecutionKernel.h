@@ -14,7 +14,7 @@
  */
 
 #ifndef OMNISCI_CIDEREXECUTIONKERNEL_H
-#define OMNISCI_CIDEREXECUTIONKERNEL_H
+#define  OMNISCI_CIDEREXECUTIONKERNEL_H
 
 #include <memory>
 #include <vector>
@@ -24,7 +24,7 @@
 
 class CiderExecutionKernel {
  public:
-  virtual ~CiderExecutionKernel(){};
+      virtual ~CiderExecutionKernel(){};
   void runWithDataMultiFrag(const int8_t*** multi_col_buffers,
                             const int64_t* num_rows,
                             int64_t** out,
@@ -34,7 +34,7 @@ class CiderExecutionKernel {
 
   void runWithData(const int8_t** col_buffers,
                    const int64_t* num_rows,
-                   int64_t** out,
+                   int64_t** out ,
                    int32_t* matched_num,
                    int32_t* err_code,
                    int64_t* init_agg_vals);
@@ -49,7 +49,7 @@ class CiderExecutionKernel {
  protected:
   CiderExecutionKernel(){};
   CiderExecutionKernel(const CiderExecutionKernel&) = delete;
-  CiderExecutionKernel& operator=(const CiderExecutionKernel&) = delete;
+  CiderExecutionKernel& operator= (const CiderExecutionKernel&) = delete;
 };
 
 #endif  // OMNISCI_CIDEREXECUTIONKERNEL_H

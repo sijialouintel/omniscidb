@@ -7,5 +7,6 @@ jobs:
     steps:
     - name: Checkout this commit
       uses: actions/checkout@v2
+      run: git branch
     - name: Run style checks
       uses: coleaeason/actions-uncrustify@v1

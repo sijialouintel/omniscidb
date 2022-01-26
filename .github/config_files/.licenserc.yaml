@@ -15,22 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: "PR Title Checker"
-on:
-  pull_request_target:
-    types:
-      - opened
-      - edited
-      - synchronize
-      - labeled
-      - unlabeled
+header:
+  license:
+    spdx-id: Apache-2.0
+    copyright-owner: Apache Software Foundation
 
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: thehanimo/pr-title-checker@v1.3.4
-        with:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          pass_on_octokit_error: false
-          configuration_path: ".github/config_files/pr-title-checker-config.json"
+  paths-ignore:
+    - '.clang-format'
+    - '.gitignore'
+    - 'dist'
+    - 'licenses'
+    - '**/*.MD'
+    - 'LICENSE'
+    - 'NOTICE'
+
+  comment: on-failure

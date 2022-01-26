@@ -293,7 +293,8 @@ TEST(APITest, case2) {
 
 int main(int argc, char** argv) {
   int err = 0;
-
+  TestHelpers::init_logger_stderr_only(argc, argv);
+  testing::InitGoogleTest(&argc, argv);
   namespace po = boost::program_options;
 
   po::options_description desc("Options");

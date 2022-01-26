@@ -1,0 +1,14 @@
+name: "PR Code Style Checker"
+on: [pull_request]
+
+jobs:
+  code-style-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Run clang-format style check for C++ programs
+        uses: jidicula/clang-format-action@v4.5.0
+        with:
+          clang-format-version: '13'
+          check-path: './'

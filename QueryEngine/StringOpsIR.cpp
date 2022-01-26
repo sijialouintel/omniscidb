@@ -20,6 +20,9 @@
 #include "../Shared/funcannotations.h"
 #include "../Shared/sqldefs.h"
 #include "Parser/ParserNode.h"
+#include "../Cider/VeloxTypeConvertUtil.h"
+#include "velox/functions/lib/string/StringImpl.h"
+#include "velox/type/StringView.h"
 
 #include <boost/locale/conversion.hpp>
 
@@ -61,7 +64,10 @@ extern "C" RUNTIME_EXPORT int32_t lower_encoded(int32_t string_id,
   StringDictionaryProxy* string_dict_proxy =
       reinterpret_cast<StringDictionaryProxy*>(string_dict_proxy_address);
   auto str = string_dict_proxy->getString(string_id);
-  return string_dict_proxy->getOrAddTransient(boost::locale::to_lower(str));
+  omnisci::cider::CiderUDFOutputString result;
+  facebook::velox::StringView sv(str.data(), str.size());
+  facebook::velox::functions::stringImpl::lower<true>(result, sv);
+  return string_dict_proxy->getOrAddTransient(result.data());
 }
 
 llvm::Value* CodeGenerator::codegen(const Analyzer::CharLengthExpr* expr,

@@ -147,11 +147,20 @@ class VeloxFunctionTest : public testing::Test {
     ASSERT_NO_THROW(sql("insert into test_table values(1, 100000000, 1.1, 1.11111111, 'CN');"));
     ASSERT_NO_THROW(sql("insert into test_table values(2, 200000000, 8.0, 2.22222222, 'USs');"));
     ASSERT_NO_THROW(sql("insert into test_table values(3, 300000000, 3.1, 3.33333333, 'UKkk');"));
+    ASSERT_NO_THROW(multi_sql(R"(
+        drop table if exists lower_function_test;
+        create table lower_function_test(first_name text, last_name text encoding none, age integer, country_code text);
+        insert into lower_function_test values('JOHN', 'SMITH', 25, 'us');
+        insert into lower_function_test values('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'Banks', 30, 'Us');
+        insert into lower_function_test values('JOHN', 'Wilson', 20, 'cA');
+        insert into lower_function_test values('Sue', 'Smith', 25, 'CA');
+      )"););
   }
 
   void TearDown() override {
     ASSERT_NO_THROW(multi_sql(R"(
         drop table test_table;
+        drop table lower_function_test;
       )"););
   }
 };
@@ -160,6 +169,13 @@ TEST_F(VeloxFunctionTest, Cbrt) {
   ASSERT_EQ(2.0,
       TestHelpers::v<double>(run_simple_agg(
           "SELECT cbrt(d) FROM test_table where i32 = 2")));
+}
+
+TEST_F(VeloxFunctionTest, Lower) {
+  auto result_set = sql("select lower(first_name) from lower_function_test;");
+  std::vector<std::vector<ScalarTargetValue>> expected_result_set{
+      {"john"}, {"abcdefghijklmnopqrstuvwxyz"}, {"john"}, {"sue"}};
+  compare_result_set(expected_result_set, result_set);
 }
 
 int main(int argc, char** argv) {

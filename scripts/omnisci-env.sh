@@ -31,6 +31,6 @@ BUILD_TYPE=Debug
 OMNISCI_DIR=/workspace/omniscidb
 VELOX_DIR=/workspace/presto_cpp/velox
 export C_INCLUDE_PATH=$OMNISCI_DIR/ThirdParty/rapidjson/:$OMNISCI_DIR:$VELOX_DIR:$C_INCLUDE_PATH
-export CPLUS_INCLUDE_PATH=$OMNISCI_DIR/Catalog/os/:$OMNISCI_DIR/build-$BUILD_TYPE:$OMNISCI_DIR/Distributed/os/:$OMNISCI_DIR/Shared/:$OMNISCI_DIR/ThirdParty/rapidjson/:$OMNISCI_DIR:$VELOX_DIR:$CPLUS_INCLUDE_PATH
+export CPLUS_INCLUDE_PATH=$OMNISCI_DIR/Catalog/os/:$OMNISCI_DIR/Distributed/os/:$OMNISCI_DIR/Shared/:$OMNISCI_DIR/ThirdParty/rapidjson/:$OMNISCI_DIR:$VELOX_DIR:$CPLUS_INCLUDE_PATH
 export LIBRARY_PATH=$OMNISCI_DIR/ThirdParty/rapidjson/rapidjson/:$OMNISCI_DIR/build-$BUILD_TYPE/Embedded:$LIBRARY_PATH
 export LD_LIBRARY_PATH=$OMNISCI_DIR/build-$BUILD_TYPE/Embedded:$LD_LIBRARY_PATH

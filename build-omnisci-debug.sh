@@ -73,8 +73,8 @@ RECIPE_DIR=${RECIPE_DIR:-${this_dir}}
 # Omnisci UDF support uses CLangTool for parsing Load-time UDF C++
 # code to AST. If the C++ code uses C++ std headers, we need to
 # specify the locations of include directories:
-. ${RECIPE_DIR}/get_cxx_include_path.sh
-export CPLUS_INCLUDE_PATH=$(get_cxx_include_path):$CPLUS_INCLUDE_PATH
+# . ${RECIPE_DIR}/get_cxx_include_path.sh
+# export CPLUS_INCLUDE_PATH=$(get_cxx_include_path):$CPLUS_INCLUDE_PATH
 
 # generate ~/.m2/settings.xml if proxy are set and there are no settings
 [ -f ~/.m2/settings.xml -o -z "$http_proxy" ] || python ${RECIPE_DIR}/make-m2-proxy.py
@@ -104,7 +104,7 @@ cmake -Wno-dev \
     ..
 
 # VERBOSE=1 
-make -j ${CPU_COUNT:-`nproc`} || make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/4))
+make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/2)) || make -j $((${CPU_COUNT:-`nproc`}/2))
 
 if [[ "$RUN_TESTS" == "2" ]]
 then

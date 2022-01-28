@@ -1,0 +1,59 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: pre-commit checker
+
+on:
+  push:
+    branches: [ cider ]
+  pull_request:
+    branches: [ cider ]
+
+env:
+  BUILD_TYPE: Debug
+  PRESTO_CPP_PATH: ${{github.workspace}}/../presto_cpp
+
+jobs:
+  uts_and_coverage_check:
+    runs-on: self-hosted
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Preparation
+      run: |
+        mkdir -p /root/.m2/repository
+        mkdir -p ${{env.PRESTO_CPP_PATH}}
+        cd ${{env.PRESTO_CPP_PATH}}
+        git clone -b Modular_SQL https://github.com/Intel-bigdata/velox.git
+        sed -i '/^enum class ContextScope { GLOBAL,.*/i #ifdef GLOBAL\n#undef GLOBAL\n#endif\n' ${{env.PRESTO_CPP_PATH}}/velox/velox/core/Context.h
+
+    - name: Build
+      working-directory: ${{github.workspace}}
+      run: |
+        sed -i 's|/workspace|${{github.workspace}}/..|g' scripts/omnisci-env.sh
+        source scripts/omnisci-env.sh
+        bash build-omnisci-debug.sh
+        
+    - name: UTs
+      working-directory: ${{github.workspace}}/build-${{env.BUILD_TYPE}}
+      run: ctest -C ${{env.BUILD_TYPE}}
+
+    - name: Clean up
+      if: always()
+      run: |
+        rm -rf /root/.m2/repository
+        rm -rf ${{env.PRESTO_CPP_PATH}}

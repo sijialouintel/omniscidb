@@ -1,0 +1,15 @@
+{
+    "LABEL": {
+      "name": "title needs formatting",
+      "color": "EEEEEE"
+    },
+    "CHECKS": {
+      "regexp": "^\\[POAE[0-9]{1,}-[0-9]{4,}\\]",
+      "ignoreLabels": ["dont-check-pr-title"]
+    },
+    "MESSAGES": {
+      "success": "Passed title check",
+      "failure": "Failing title check",
+      "notice": "Please add JIRA tag before the pr title"
+    }
+}

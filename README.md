@@ -331,3 +331,5 @@ The `cuda` package should set up the environment variables required to use CUDA.
 
     PATH=/opt/cuda/bin:$PATH
     export PATH
+
+
